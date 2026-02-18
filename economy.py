@@ -1,4 +1,4 @@
-"""
+﻿"""
 economy.py - Экономическая система
 Налоги, кредиты, зарплаты и финансовые операции
 """
@@ -6,11 +6,15 @@ economy.py - Экономическая система
 import logging
 import asyncio
 from datetime import datetime, timedelta
+import random
+from zoneinfo import ZoneInfo
+import aiosqlite
 from aiogram import Bot
 
 from database import db
 
 logger = logging.getLogger(__name__)
+UZBEKISTAN_TZ = ZoneInfo("Asia/Tashkent")
 
 # Экономические параметры (дневные ставки)
 DAILY_CITIZEN_TAX_RATE = 0.0035  # 0.35% дневного налога
@@ -31,12 +35,19 @@ async def apply_daily_taxes(bot: Bot = None):
     try:
         logger.info("=== ЗАПУСК ДНЕВНОГО НАЛОГОВОГО ЦИКЛА ===")
         summary = await db.run_advanced_tax_cycle()
+        business_summary = await db.generate_business_tax_reports()
         logger.info(
             "Налоговый цикл завершен: users=%s debtors=%s collected=$%.2f new_debt=$%.2f",
             summary.get("processed_users", 0),
             summary.get("debtors", 0),
             float(summary.get("total_collected", 0)),
             float(summary.get("total_new_debt", 0)),
+        )
+        logger.info(
+            "Business tax reports: created=%s paid=$%.2f unpaid=%s",
+            business_summary.get("reports_created", 0),
+            float(business_summary.get("total_tax_paid", 0)),
+            business_summary.get("unpaid_count", 0),
         )
         
     except Exception as e:
@@ -66,10 +77,23 @@ async def calculate_business_tax(business_id: int) -> float:
     Формула: daily_income * DAILY_BUSINESS_TAX_RATE
     """
     try:
-        # business = await db.get_business(business_id)
-        daily_income = 1000.0  # Заглушка
-        
-        tax = daily_income * DAILY_BUSINESS_TAX_RATE
+        query = """
+            SELECT income_daily, expense_daily
+            FROM businesses
+            WHERE id = ?
+            LIMIT 1
+        """
+        async with aiosqlite.connect(db.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute(query, (int(business_id),)) as cur:
+                business = await cur.fetchone()
+        if not business:
+            return 0.0
+
+        daily_income = float(business["income_daily"] or 0)
+        expense_daily = float(business["expense_daily"] or 0)
+        taxable_base = max(0.0, daily_income - expense_daily * 0.25)
+        tax = taxable_base * DAILY_BUSINESS_TAX_RATE
         return round(tax, 2)
         
     except Exception as e:
@@ -125,15 +149,88 @@ async def process_loan_payments(user_id: int) -> dict:
     Применяется ежедневно с штрафом за просрочку.
     """
     try:
-        user = await db.get_user(user_id)
-        # loans = await db.get_user_loans(user_id)
-        
-        # Для каждого кредита:
-        #   1. Считаем процент за день
-        #   2. Если не оплачен ежемесячный платёж, применяем штраф
-        #   3. Уменьшаем репутацию при просрочке
-        
-        return {'user_id': user_id, 'loans_processed': 0}
+        user = await db.get_user(user_id) or {}
+        if not user:
+            return {'user_id': user_id, 'loans_processed': 0}
+
+        now = datetime.now().isoformat()
+        paid_count = 0
+        penalty_count = 0
+        total_paid = 0.0
+        total_penalty = 0.0
+
+        async with aiosqlite.connect(db.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await conn.execute("BEGIN IMMEDIATE")
+            async with conn.execute(
+                """
+                SELECT *
+                FROM loans
+                WHERE applicant_id = ?
+                  AND status IN ('approved', 'active')
+                  AND COALESCE(remaining_balance, 0) > 0
+                ORDER BY application_date ASC
+                """,
+                (int(user_id),),
+            ) as cur:
+                loans = await cur.fetchall()
+
+            balance = float(user.get("balance") or 0)
+            reputation = float(user.get("reputation") or 50)
+
+            for loan in loans:
+                remaining = float(loan["remaining_balance"] or 0)
+                if remaining <= 0:
+                    continue
+                daily_payment = float(loan["daily_payment"] or 0)
+                if daily_payment <= 0:
+                    term_days = max(30, int(loan["term_months"] or 1) * 30)
+                    daily_payment = round(remaining / term_days, 2)
+
+                amount_to_pay = round(min(remaining, daily_payment), 2)
+                if amount_to_pay > 0 and balance >= amount_to_pay:
+                    balance = round(balance - amount_to_pay, 2)
+                    remaining = round(max(0.0, remaining - amount_to_pay), 2)
+                    paid_count += 1
+                    total_paid += amount_to_pay
+                    new_status = "paid" if remaining <= 0 else str(loan["status"] or "active")
+                    await conn.execute(
+                        """
+                        UPDATE loans
+                        SET remaining_balance = ?, status = ?, last_payment_date = ?
+                        WHERE id = ?
+                        """,
+                        (remaining, new_status, now, int(loan["id"])),
+                    )
+                else:
+                    penalty = round(remaining * DAILY_LOAN_PENALTY_RATE, 2)
+                    remaining = round(remaining + penalty, 2)
+                    penalty_count += 1
+                    total_penalty += penalty
+                    reputation = max(0.0, reputation - 0.2)
+                    await conn.execute(
+                        """
+                        UPDATE loans
+                        SET remaining_balance = ?, status = 'active'
+                        WHERE id = ?
+                        """,
+                        (remaining, int(loan["id"])),
+                    )
+
+            await conn.execute(
+                "UPDATE users SET balance = ?, reputation = ? WHERE user_id = ?",
+                (balance, round(reputation, 2), int(user_id)),
+            )
+            await conn.commit()
+
+        return {
+            'user_id': user_id,
+            'loans_processed': len(loans),
+            'paid_count': paid_count,
+            'penalty_count': penalty_count,
+            'total_paid': round(total_paid, 2),
+            'total_penalty': round(total_penalty, 2),
+        }
         
     except Exception as e:
         logger.error(f"Error processing loans for user {user_id}: {e}")
@@ -146,42 +243,58 @@ async def distribute_government_salaries(org_id: int) -> dict:
     Вычитается из бюджета организации.
     """
     try:
-        org = await db.get_organization_by_id(org_id)
-        organization_budget = org.get('budget', 0)
-        
-        # Получаем всех сотрудников организации
-        # members = await db.get_organization_members(org_id)
-        
-        # total_salaries = sum(member.get('salary', 0) for member in members)
-        total_salaries = 0  # Заглушка
-        
-        if organization_budget < total_salaries:
-            # Недостаточно средств
-            logger.warning(f"Insufficient budget for org {org_id} salaries")
+        org = await db.get_organization_by_id(org_id) or {}
+        if not org:
+            return {'org_id': org_id, 'status': 'not_found'}
+
+        members = await db.get_organization_members(org_id, limit=500)
+        total_salaries = round(sum(float(m.get('salary') or 0) for m in members if float(m.get('salary') or 0) > 0), 2)
+        organization_budget = float(org.get('budget') or 0)
+
+        if total_salaries <= 0:
             return {
                 'org_id': org_id,
-                'status': 'insufficient_funds',
-                'needed': total_salaries,
-                'available': organization_budget
+                'status': 'nothing_to_pay',
+                'total_salaries': 0.0,
+                'remaining_budget': organization_budget,
             }
-        
-        # Выплачиваем зарплаты каждому сотруднику
-        # for member in members:
-        #     salary = member.get('salary', 0)
-        #     if salary > 0:
-        #         await db.update_user(
-        #             member['user_id'],
-        #             balance=member.get('balance', 0) + salary
-        #         )
-        
-        # Вычитаем из бюджета
-        new_budget = organization_budget - total_salaries
-        # await db.update_organization(org_id, budget=new_budget)
-        
+
+        pay_ratio = 1.0 if organization_budget >= total_salaries else max(0.0, organization_budget / total_salaries)
+        paid_total = 0.0
+        paid_members = 0
+
+        async with aiosqlite.connect(db.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await conn.execute("BEGIN IMMEDIATE")
+            for member in members:
+                salary = float(member.get('salary') or 0)
+                if salary <= 0:
+                    continue
+                payment = round(salary * pay_ratio, 2)
+                if payment <= 0:
+                    continue
+                async with conn.execute("SELECT balance FROM users WHERE user_id = ?", (int(member["user_id"]),)) as cur:
+                    row = await cur.fetchone()
+                if not row:
+                    continue
+                new_balance = round(float(row["balance"] or 0) + payment, 2)
+                await conn.execute(
+                    "UPDATE users SET balance = ? WHERE user_id = ?",
+                    (new_balance, int(member["user_id"])),
+                )
+                paid_total = round(paid_total + payment, 2)
+                paid_members += 1
+
+            new_budget = round(max(0.0, organization_budget - paid_total), 2)
+            await conn.execute("UPDATE organizations SET budget = ? WHERE id = ?", (new_budget, int(org_id)))
+            await conn.commit()
+
         return {
             'org_id': org_id,
-            'status': 'paid',
+            'status': 'paid_full' if pay_ratio >= 0.999 else 'paid_partial',
+            'paid_members': paid_members,
             'total_salaries': total_salaries,
+            'paid_total': paid_total,
             'remaining_budget': new_budget
         }
         
@@ -231,21 +344,45 @@ async def apply_business_income(business_id: int) -> dict:
     Зависит от оборудования и эффективности.
     """
     try:
-        # business = await db.get_business(business_id)
-        owner_id = 1  # Заглушка
-        daily_income = 1000.0  # Заглушка
-        
-        # Применяем налог
+        query = """
+            SELECT id, owner_id, income_daily, expense_daily, budget, status
+            FROM businesses
+            WHERE id = ?
+            LIMIT 1
+        """
+        async with aiosqlite.connect(db.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute(query, (int(business_id),)) as cur:
+                business = await cur.fetchone()
+        if not business:
+            return {'error': f'business {business_id} not found'}
+        if str(business["status"] or "active") == "frozen":
+            return {'business_id': business_id, 'status': 'frozen', 'net_income': 0.0}
+
+        owner_id = int(business["owner_id"] or 0)
+        gross_base = float(business["income_daily"] or 0)
+        expense = float(business["expense_daily"] or 0)
+        variation = random.uniform(0.88, 1.17)
+        gross_income = round(max(0.0, gross_base * variation), 2)
         tax = await calculate_business_tax(business_id)
-        net_income = daily_income - tax
-        
-        # Зачисляем доход владельцу
-        owner = await db.get_user(owner_id)
-        # await db.update_user(owner_id, balance=owner.get('balance', 0) + net_income)
-        
+        net_income = round(gross_income - expense - tax, 2)
+
+        owner = await db.get_user(owner_id) or {}
+        owner_balance = round(float(owner.get("balance") or 0) + net_income, 2)
+        business_budget = round(float(business["budget"] or 0) + net_income, 2)
+        await db.update_user(owner_id, balance=max(0.0, owner_balance))
+
+        async with aiosqlite.connect(db.db_path) as conn:
+            await conn.execute(
+                "UPDATE businesses SET budget = ?, last_income_date = ? WHERE id = ?",
+                (business_budget, datetime.now().isoformat(), int(business_id)),
+            )
+            await conn.commit()
+
         return {
             'business_id': business_id,
-            'gross_income': daily_income,
+            'gross_income': gross_income,
+            'expense': expense,
             'tax': tax,
             'net_income': net_income,
             'owner_id': owner_id
@@ -263,15 +400,33 @@ async def check_and_freeze_businesses():
     """
     try:
         logger.info("Checking businesses for freezing...")
-        
-        # businesses = await db.get_all_businesses()
-        # for business in businesses:
-        #     owner = await db.get_user(business['owner_id'])
-        #     if owner.get('balance', 0) < business.get('daily_expenses', 0):
-        #         await db.update_business(business['id'], frozen=True)
-        #         logger.info(f"Business {business['id']} frozen due to insufficient funds")
-        
-        pass
+        active = await db.list_all_businesses(limit=1000)
+        frozen_count = 0
+        unfrozen_count = 0
+
+        async with aiosqlite.connect(db.db_path) as conn:
+            await conn.execute("BEGIN IMMEDIATE")
+            for business in active:
+                bid = int(business.get("id") or 0)
+                owner_id = int(business.get("owner_id") or 0)
+                expense = float(business.get("expense_daily") or 0)
+                status = str(business.get("status") or "active")
+                biz_budget = float(business.get("budget") or 0)
+                owner = await db.get_user(owner_id) or {}
+                owner_balance = float(owner.get("balance") or 0)
+                runway = owner_balance + biz_budget
+                need = max(300.0, expense * 2)
+
+                if runway < need and status != "frozen":
+                    await conn.execute("UPDATE businesses SET status = 'frozen' WHERE id = ?", (bid,))
+                    frozen_count += 1
+                elif runway >= need * 2 and status == "frozen":
+                    await conn.execute("UPDATE businesses SET status = 'active' WHERE id = ?", (bid,))
+                    unfrozen_count += 1
+            await conn.commit()
+
+        logger.info("Business freeze check completed: frozen=%s unfrozen=%s", frozen_count, unfrozen_count)
+        return {"frozen": frozen_count, "unfrozen": unfrozen_count}
         
     except Exception as e:
         logger.error(f"Error checking businesses: {e}")
@@ -284,20 +439,55 @@ async def process_loan_defaults():
     """
     try:
         logger.info("Processing loan defaults...")
-        
-        # loans = await db.get_overdue_loans(days=30)
-        # for loan in loans:
-        #     borrower = await db.get_user(loan['borrower_id'])
-        #     # Применяем штраф и понижающую репутацию
-        #     await db.update_user(
-        #         loan['borrower_id'],
-        #         reputation=max(0, borrower.get('reputation', 50) - 10),
-        #         loan_defaults=borrower.get('loan_defaults', 0) + 1
-        #     )
-        #     # Список должников может использоваться для розыска
-        #     logger.info(f"User {loan['borrower_id']} defaulted on loan {loan['id']}")
-        
-        pass
+        now = datetime.now()
+        defaults = 0
+
+        async with aiosqlite.connect(db.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            await conn.execute("BEGIN IMMEDIATE")
+            async with conn.execute(
+                """
+                SELECT id, applicant_id, remaining_balance, due_date
+                FROM loans
+                WHERE status IN ('approved', 'active')
+                  AND COALESCE(remaining_balance, 0) > 0
+                  AND due_date IS NOT NULL
+                """
+            ) as cur:
+                loans = await cur.fetchall()
+
+            for loan in loans:
+                due_raw = str(loan["due_date"] or "").strip()
+                try:
+                    due = datetime.fromisoformat(due_raw)
+                except Exception:
+                    continue
+                if (now - due).days < 30:
+                    continue
+
+                borrower_id = int(loan["applicant_id"] or 0)
+                remaining = float(loan["remaining_balance"] or 0)
+                penalty_debt = round(remaining * 0.05, 2)
+
+                await conn.execute(
+                    "UPDATE loans SET status = 'defaulted' WHERE id = ?",
+                    (int(loan["id"]),),
+                )
+                await conn.execute(
+                    """
+                    UPDATE users
+                    SET reputation = MAX(0, COALESCE(reputation, 50) - 10),
+                        loan_defaults = COALESCE(loan_defaults, 0) + 1,
+                        tax_debt = COALESCE(tax_debt, 0) + ?
+                    WHERE user_id = ?
+                    """,
+                    (penalty_debt, borrower_id),
+                )
+                defaults += 1
+            await conn.commit()
+
+        logger.info("Loan defaults processed: %s", defaults)
+        return {"defaults": defaults}
         
     except Exception as e:
         logger.error(f"Error processing loan defaults: {e}")
@@ -310,18 +500,41 @@ async def update_government_budget(org_id: int = None):
     """
     try:
         logger.info("Updating government budget from taxes...")
-        
-        # Получаем государственную организацию
-        # gov_org = await db.get_organization("Правительство")
-        # 
-        # Считаем налоговые поступления за день
-        # tax_revenue = 0  # await db.calculate_daily_tax_revenue()
-        # 
-        # Добавляем в бюджет
-        # new_budget = gov_org.get('budget', 0) + tax_revenue
-        # await db.update_organization(gov_org['id'], budget=new_budget)
-        
-        pass
+        target_date = datetime.now(UZBEKISTAN_TZ).date().isoformat()
+        checkpoint_key = "economy_budget_update_date"
+        already_done = await db.get_system_state(checkpoint_key)
+        if already_done == target_date:
+            return {"status": "already_updated", "date": target_date, "added": 0.0}
+
+        gov_org = await db.get_organization("Правительство")
+        if not gov_org:
+            return {"status": "no_government_org", "added": 0.0}
+
+        async with aiosqlite.connect(db.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute(
+                """
+                SELECT COALESCE(SUM(paid_total), 0) AS revenue
+                FROM tax_logs
+                WHERE cycle_date = ?
+                """,
+                (target_date,),
+            ) as cur:
+                row = await cur.fetchone()
+                revenue = round(float(row["revenue"] or 0), 2) if row else 0.0
+
+            if revenue > 0:
+                new_budget = round(float(gov_org.get("budget") or 0) + revenue, 2)
+                await conn.execute(
+                    "UPDATE organizations SET budget = ? WHERE id = ?",
+                    (new_budget, int(gov_org["id"])),
+                )
+                await conn.commit()
+            else:
+                new_budget = float(gov_org.get("budget") or 0)
+
+        await db.set_system_state(checkpoint_key, target_date)
+        return {"status": "updated", "date": target_date, "added": revenue, "new_budget": new_budget}
         
     except Exception as e:
         logger.error(f"Error updating government budget: {e}")
@@ -353,18 +566,24 @@ async def calculate_government_stability(org_id: int = None) -> float:
 
 
 async def run_daily_economy_cycle(bot: Bot = None):
-    """
-    Главная функция ежедневного экономического цикла.
-    Вызывается один раз в день в 00:00.
-    """
+    """Run economy cycle once per calendar day (Asia/Tashkent)."""
     while True:
-        logger.info("=" * 50)
-        logger.info("ЗАПУСК ЕЖЕДНЕВНОГО ЭКОНОМИЧЕСКОГО ЦИКЛА")
-        logger.info("=" * 50)
-
         try:
+            now_uz = datetime.now(UZBEKISTAN_TZ)
+            cycle_date = now_uz.date().isoformat()
+            last_cycle_date = await db.get_system_state("economy_last_cycle_date")
+            if last_cycle_date == cycle_date:
+                await asyncio.sleep(60)
+                continue
+
+            logger.info("=" * 50)
+            logger.info("ЗАПУСК ЕЖЕДНЕВНОГО ЭКОНОМИЧЕСКОГО ЦИКЛА")
+            logger.info("=" * 50)
+
             summary = await db.run_advanced_tax_cycle()
+            business_summary = await db.generate_business_tax_reports()
             stability = await calculate_government_stability()
+
             logger.info(
                 "Налоговый цикл: users=%s debtors=%s collected=$%.2f new_debt=$%.2f stability=%.2f",
                 summary.get("processed_users", 0),
@@ -373,14 +592,38 @@ async def run_daily_economy_cycle(bot: Bot = None):
                 float(summary.get("total_new_debt", 0)),
                 stability,
             )
+            logger.info(
+                "Business tax reports: created=%s paid=$%.2f unpaid=%s",
+                business_summary.get("reports_created", 0),
+                float(business_summary.get("total_tax_paid", 0)),
+                business_summary.get("unpaid_count", 0),
+            )
+
+            if bot:
+                tax_users = await db.get_tax_service_user_ids()
+                if tax_users:
+                    tax_text = (
+                        "🧾 Налоговая сводка за цикл\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        f"Бизнес-отчетов: {business_summary.get('reports_created', 0)}\n"
+                        f"Оплачено бизнес-налогов: ${float(business_summary.get('total_tax_paid', 0)):,.2f}\n"
+                        f"Неоплаченных: {business_summary.get('unpaid_count', 0)}\n"
+                        f"Дата цикла: {business_summary.get('cycle_date')}"
+                    )
+                    for uid in tax_users:
+                        try:
+                            await bot.send_message(uid, tax_text, parse_mode=None)
+                        except Exception:
+                            logger.warning("Could not send tax summary to user %s", uid)
+
+            await db.set_system_state("economy_last_cycle_date", cycle_date)
             logger.info("ЭКОНОМИЧЕСКИЙ ЦИКЛ ЗАВЕРШЕН")
         except Exception as e:
             logger.error(f"Critical error in economy cycle: {e}")
 
-        await asyncio.sleep(24 * 60 * 60)
+        await asyncio.sleep(60)
 
 
-# Готовые функции для быстрого использования
 async def give_daily_bonus(user_id: int, amount: float = 1000) -> bool:
     """Выдать ежедневный бонус игроку"""
     try:

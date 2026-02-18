@@ -24,6 +24,23 @@ from keyboards import (
 router = Router()
 
 
+def _escape_markdown(text: str) -> str:
+    value = str(text or "")
+    for token in ("\\", "_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"):
+        value = value.replace(token, f"\\{token}")
+    return value
+
+
+async def _main_flag_block() -> str:
+    flag = await db.get_state_flag()
+    flag_text = (flag.get("state_flag_text") or "").strip()
+    if flag_text:
+        return f"🏳️ **Госфлаг:** {_escape_markdown(flag_text)}\n\n"
+    if flag.get("state_flag_file_id"):
+        return "🏳️ **Госфлаг:** загружен президентом\n\n"
+    return ""
+
+
 async def _dispatch_menu_action(callback: CallbackQuery, state: FSMContext, action: str):
     """Совместимость со старым callback_data формата menu:<action>."""
     action_aliases = {
@@ -47,28 +64,28 @@ async def _dispatch_menu_action(callback: CallbackQuery, state: FSMContext, acti
         return
 
     if target == "biz_menu":
-        from handlers_part2 import business_menu
-        await business_menu(callback, state)
+        from feature_pack import feature_business_menu
+        await feature_business_menu(callback, state)
         return
 
     if target == "work_menu":
-        from handlers_part2 import citizen_work_menu
-        await citizen_work_menu(callback, state)
+        from feature_pack import feature_work_menu
+        await feature_work_menu(callback, state)
         return
 
     if target == "edu_menu":
-        from handlers_part2 import education_menu
-        await education_menu(callback, state)
+        from feature_pack import feature_education_menu
+        await feature_education_menu(callback, state)
         return
 
     if target == "prop_menu":
-        from handlers_part2 import property_menu
-        await property_menu(callback, state)
+        from feature_pack import feature_property_menu
+        await feature_property_menu(callback, state)
         return
 
     if target == "market_menu":
-        from handlers_part2 import market_menu
-        await market_menu(callback, state)
+        from feature_pack import feature_market_menu
+        await feature_market_menu(callback, state)
         return
 
     if target == "court_menu":
@@ -113,11 +130,13 @@ async def _dispatch_menu_action(callback: CallbackQuery, state: FSMContext, acti
         return
 
     if target == "private_org_list":
-        await private_org_placeholder(callback)
+        from feature_pack import feature_private_org_list
+        await feature_private_org_list(callback, state)
         return
 
     if target == "gang_list":
-        await gang_placeholder(callback)
+        from feature_pack import feature_gang_menu
+        await feature_gang_menu(callback, state)
         return
 
     await callback.answer("❌ Раздел пока недоступен.", show_alert=True)
@@ -132,44 +151,89 @@ async def legacy_menu_router(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "tutorial_menu")
 async def tutorial_menu(callback: CallbackQuery):
-    """Кнопка обучения (временный экран)."""
+    """Краткое пошаговое обучение по основным разделам."""
     await callback.answer()
+    user = await db.get_user(callback.from_user.id) or {}
+    done = bool(user.get("tutorial_completed"))
     text = (
         "🎓 **ОБУЧЕНИЕ**\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Пошаговый интерактивный туториал сейчас обновляется.\n"
-        "Пока можно начать с команд:\n"
-        "• /start\n"
-        "• /help\n"
-        "• /work\n"
+        "Быстрый маршрут для старта:\n\n"
+        "1. Откройте профиль и проверьте стартовый баланс.\n"
+        "2. Возьмите первую работу и заберите выплату.\n"
+        "3. Зайдите в организации и подайте заявку.\n"
+        "4. Откройте банк и переведите часть средств на счет.\n"
+        "5. После этого можно идти в бизнес/политику.\n\n"
+        f"Статус обучения: {'✅ пройдено' if done else '🕒 не завершено'}\n"
+        "Команда для повторного открытия: `/tutorial`"
+    )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="👤 Шаг 1: Профиль", callback_data="profile_menu")],
+            [InlineKeyboardButton(text="💼 Шаг 2: Работа", callback_data="work_menu")],
+            [InlineKeyboardButton(text="🏛️ Шаг 3: Организации", callback_data="orgs_main")],
+            [InlineKeyboardButton(text="🏦 Шаг 4: Банк", callback_data="bank_menu")],
+            [InlineKeyboardButton(text="✅ Завершить обучение", callback_data="tutorial_complete")],
+            [InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_main")],
+        ]
     )
     await callback.message.edit_text(
         text,
-        reply_markup=get_back_button(),
+        reply_markup=keyboard,
+        parse_mode='Markdown',
+    )
+
+
+@router.message(Command("tutorial"))
+async def tutorial_command(message: Message):
+    """Команда повторного открытия обучения."""
+    user = await db.get_user(message.from_user.id) or {}
+    done = bool(user.get("tutorial_completed"))
+    text = (
+        "🎓 **ОБУЧЕНИЕ**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Быстрый маршрут для старта:\n\n"
+        "1. /profile — посмотреть профиль и стартовые данные.\n"
+        "2. /work — выбрать и выполнить работу.\n"
+        "3. /orgs — подать заявку в организацию.\n"
+        "4. /bank — пополнить банковский счет.\n"
+        "5. /biz и /revolution — перейти к продвинутым механикам.\n\n"
+        f"Статус обучения: {'✅ пройдено' if done else '🕒 не завершено'}"
+    )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Отметить пройденным", callback_data="tutorial_complete")],
+            [InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_main")],
+        ]
+    )
+    await message.answer(text, reply_markup=keyboard, parse_mode='Markdown')
+
+
+@router.callback_query(F.data == "tutorial_complete")
+async def tutorial_complete(callback: CallbackQuery):
+    """Отметить обучение пройденным."""
+    await db.update_user(callback.from_user.id, tutorial_completed=1)
+    await callback.answer("Обучение отмечено как пройденное.")
+    await callback.message.edit_text(
+        "✅ **Обучение завершено**\n\nТеперь кнопка обучения в меню будет скрыта.\n"
+        "Вы можете открыть разделы игры через главное меню.",
+        reply_markup=get_back_button(callback="back_to_main"),
         parse_mode='Markdown',
     )
 
 
 @router.callback_query(F.data == "private_org_list")
-async def private_org_placeholder(callback: CallbackQuery):
-    """Временная заглушка для раздела частных организаций."""
-    await callback.answer()
-    await callback.message.edit_text(
-        "🏢 **ЧАСТНЫЕ ОРГАНИЗАЦИИ**\n━━━━━━━━━━━━━━━━━━━━\n\nРаздел в разработке.",
-        reply_markup=get_back_button(),
-        parse_mode='Markdown',
-    )
+async def private_org_menu_proxy(callback: CallbackQuery, state: FSMContext):
+    """Прокси на рабочий раздел частных организаций."""
+    from feature_pack import feature_private_org_list
+    await feature_private_org_list(callback, state)
 
 
 @router.callback_query(F.data == "gang_list")
-async def gang_placeholder(callback: CallbackQuery):
-    """Временная заглушка для раздела банд."""
-    await callback.answer()
-    await callback.message.edit_text(
-        "🕶️ **БАНДЫ**\n━━━━━━━━━━━━━━━━━━━━\n\nРаздел в разработке.",
-        reply_markup=get_back_button(),
-        parse_mode='Markdown',
-    )
+async def gang_menu_proxy(callback: CallbackQuery, state: FSMContext):
+    """Прокси на рабочий раздел банд."""
+    from feature_pack import feature_gang_menu
+    await feature_gang_menu(callback, state)
 
 
 # ==================== BACK_TO_MAIN - ПРИОРИТЕТНЫЙ ОБРАБОТЧИК ====================
@@ -217,10 +281,12 @@ async def back_to_main(callback: CallbackQuery, state: FSMContext):
                 return
 
         await state.set_state(MainStates.main_menu)
+        flag_block = await _main_flag_block()
 
         text = (
             "🏛️ **Государство Онлайн**\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{flag_block}"
             "Добро пожаловать! Выберите раздел для работы:\n"
         )
         
@@ -285,10 +351,12 @@ async def start_command(message: Message, state: FSMContext):
     else:
         # Нормальное начало
         await state.set_state(MainStates.main_menu)
-        
+        flag_block = await _main_flag_block()
+
         greeting = (
             "🏛️ **Государство Онлайн**\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{flag_block}"
         )
         
         if is_new:
@@ -611,13 +679,76 @@ async def profile_stats(callback: CallbackQuery):
 
 @router.callback_query(F.data == "profile_messages")
 async def profile_messages(callback: CallbackQuery):
-    """Раздел писем (пока базовая заглушка)."""
+    """Центр личных сообщений."""
     await callback.answer()
-    text = (
-        "💌 **ЛИЧНЫЕ СООБЩЕНИЯ**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Функция центра сообщений находится в разработке."
-    )
+    user_id = callback.from_user.id
+
+    query = """
+        SELECT m.id,
+               m.sender_id,
+               m.recipient_id,
+               m.subject,
+               m.content,
+               m.created_date,
+               m.read_date,
+               COALESCE(NULLIF(su.full_name, ''), NULLIF(su.username, ''), CAST(m.sender_id AS TEXT)) AS sender_name,
+               COALESCE(NULLIF(ru.full_name, ''), NULLIF(ru.username, ''), CAST(m.recipient_id AS TEXT)) AS recipient_name
+        FROM messages m
+        LEFT JOIN users su ON su.user_id = m.sender_id
+        LEFT JOIN users ru ON ru.user_id = m.recipient_id
+        WHERE (m.sender_id = ? AND COALESCE(m.deleted_by_sender, 0) = 0)
+           OR (m.recipient_id = ? AND COALESCE(m.deleted_by_recipient, 0) = 0)
+        ORDER BY m.created_date DESC
+        LIMIT 12
+    """
+    unread_query = """
+        SELECT COUNT(*)
+        FROM messages
+        WHERE recipient_id = ?
+          AND read_date IS NULL
+          AND COALESCE(deleted_by_recipient, 0) = 0
+    """
+
+    rows = []
+    unread = 0
+    try:
+        async with aiosqlite.connect(db.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute(query, (int(user_id), int(user_id))) as cur:
+                rows = await cur.fetchall()
+            async with conn.execute(unread_query, (int(user_id),)) as cur:
+                unread_row = await cur.fetchone()
+                unread = int((unread_row[0] if unread_row else 0) or 0)
+    except Exception:
+        rows = []
+        unread = 0
+
+    lines = [
+        "💌 **ЛИЧНЫЕ СООБЩЕНИЯ**",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Непрочитанных: {unread}",
+        "",
+    ]
+    if not rows:
+        lines.append("Диалогов пока нет.")
+    else:
+        for row in rows:
+            incoming = int(row["recipient_id"] or 0) == int(user_id)
+            icon = "📥" if incoming else "📤"
+            peer_name = str(row["sender_name"] if incoming else row["recipient_name"])
+            created = str(row["created_date"] or "")[:16]
+            subject = str(row["subject"] or "Без темы")
+            content = str(row["content"] or "")
+            if len(content) > 72:
+                content = content[:69] + "..."
+            unread_mark = " • NEW" if incoming and not row["read_date"] else ""
+            lines.append(f"{icon} [{created}] {peer_name}{unread_mark}")
+            lines.append(f"Тема: {_escape_markdown(subject)}")
+            if content:
+                lines.append(_escape_markdown(content))
+            lines.append("")
+
+    text = "\n".join(lines)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton("🔙 В профиль", callback_data="profile_menu")],
         [InlineKeyboardButton("🏠 В меню", callback_data="back_to_main")],

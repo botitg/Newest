@@ -94,6 +94,11 @@ async def _render_admin_panel(callback: CallbackQuery, state: FSMContext):
     if has_full_admin:
         keyboard.append([InlineKeyboardButton("👤 Назначение должностей", callback_data="pres_appoint")])
         keyboard.append([InlineKeyboardButton("🏛️ Форма правления", callback_data="pres_change_government")])
+        keyboard.append([
+            InlineKeyboardButton("📜 Законы", callback_data="pres_laws"),
+            InlineKeyboardButton("🏳️ Флаг", callback_data="pres_flag_menu"),
+        ])
+        keyboard.append([InlineKeyboardButton("🧾 Налог. каникулы", callback_data="pres_tax_holiday_menu")])
 
     keyboard.append([InlineKeyboardButton("💸 Гос. перевод", callback_data="pres_transfer_start")])
     keyboard.append([
@@ -705,7 +710,8 @@ async def president_help(callback: CallbackQuery, state: FSMContext):
         "1. Президент может назначать любых игроков в любые организации.\n"
         "2. Президент, вице-президент и министры могут проводить гос.переводы.\n"
         "3. Режим 'Подпольная схема' отправляет средства в теневой баланс и увеличивает коррупционные риски.\n"
-        "4. Все операции логируются в разделе 'Логи переводов' и 'Коррупция'."
+        "4. Президент может редактировать законы, обновлять флаг и давать налоговые каникулы бизнесам.\n"
+        "5. Все операции логируются в разделе 'Логи переводов' и 'Коррупция'."
     )
     await callback.message.edit_text(
         text,

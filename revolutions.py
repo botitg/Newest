@@ -1,10 +1,11 @@
-"""
+﻿"""
 revolutions.py - Система революций и свержения правительства
 Смена власти через народное волеизъявление
 """
 
 import logging
 from datetime import datetime, timedelta
+import random
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, Message, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.fsm.context import FSMContext
@@ -24,6 +25,26 @@ class RevolutionStates(StatesGroup):
     sponsoring_revolution = State()
     joining_revolution = State()
     creating_manifesto = State()
+
+
+async def _resolve_revolution_for_user(user_id: int, state: FSMContext) -> dict | None:
+    data = await state.get_data()
+    selected_id = int(data.get("selected_revolution_id") or 0)
+    if selected_id > 0:
+        rev = await db.get_revolution_by_id(selected_id)
+        if rev and str(rev.get("status") or "") == "active":
+            return rev
+
+    revolutions = await db.get_active_revolutions(limit=50)
+    organizer_rev = next((r for r in revolutions if int(r.get("organizer_id") or 0) == int(user_id)), None)
+    if organizer_rev:
+        await state.update_data(selected_revolution_id=int(organizer_rev.get("id") or 0))
+        return organizer_rev
+    if revolutions:
+        first = revolutions[0]
+        await state.update_data(selected_revolution_id=int(first.get("id") or 0))
+        return first
+    return None
 
 
 # ============================================================================
@@ -134,40 +155,44 @@ async def process_revolution_manifesto(message: Message, state: FSMContext):
     """Обработка манифеста революции"""
     data = await state.get_data()
     user_id = data.get('user_id')
-    manifesto = message.text[:500]
-    
-    user = await db.get_user(user_id) or {} or {}
-    
-    # Создаём революцию в БД
-    # await db.create_revolution(
-    #     organizer_id=user_id,
-    #     manifesto=manifesto,
-    #     supporters_needed=50,
-    #     budget_spent=100000
-    # )
-    
-    # Списываем средства
-    # await db.update_user(user_id, balance=user.get('balance', 0) - 100000)
-    
+    manifesto = (message.text or "").strip()[:500]
+    if len(manifesto) < 20:
+        await message.answer("❌ Манифест слишком короткий. Минимум 20 символов.")
+        return
+
+    user = await db.get_user(user_id) or {}
+    ok, msg, payload = await db.create_revolution(
+        organizer_id=int(user_id),
+        manifesto=manifesto,
+        supporters_needed=50,
+        budget_spent=100000,
+    )
+    if not ok:
+        await state.set_state(RevolutionStates.revolution_menu)
+        await message.answer(f"❌ {msg}", reply_markup=get_back_button(callback="revolution_menu"))
+        return
+
+    payload = payload or {}
+    rev_id = int(payload.get("revolution_id") or 0)
+    await state.update_data(selected_revolution_id=rev_id)
     text = (
         "🔴 **РЕВОЛЮЦИЯ ОБЪЯВЛЕНА!**\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"**Организатор:** {user.get('full_name')}\n"
-        f"**Затраты:** $100,000\n"
-        f"**Манифест:**\n"
-        f"\"{manifesto}\"\n\n"
-        f"**Статус:** Ожидание поддержки\n"
-        f"**Нужно сторонников:** 50\n"
-        f"**Текущей:** 1 (организатор)\n\n"
-        "Игроки могут присоединиться к революции и голосовать за изменения!"
+        f"Организатор: {user.get('full_name') or user.get('username') or user_id}\n"
+        f"ID революции: #{rev_id}\n"
+        f"Нужно сторонников: {int(payload.get('supporters_needed') or 50)}\n"
+        f"Текущий счет: {int(payload.get('supporters_count') or 1)}\n"
+        f"Бюджет запуска: ${float(payload.get('budget_spent') or 0):,.2f}\n\n"
+        f"Манифест:\n{manifesto}"
     )
-    
+
     keyboard = [
         [InlineKeyboardButton("📣 Агитация", callback_data="revolution_campaign")],
         [InlineKeyboardButton("👥 Сторонники", callback_data="revolution_supporters")],
+        [InlineKeyboardButton("🔍 Активные революции", callback_data="view_active_revolutions")],
         [InlineKeyboardButton("🔙 В меню", callback_data="revolution_menu")]
     ]
-    
+
     await state.set_state(RevolutionStates.joining_revolution)
     await message.answer(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -179,34 +204,42 @@ async def process_revolution_manifesto(message: Message, state: FSMContext):
 @router.callback_query(F.data == "view_active_revolutions")
 async def view_active_revolutions(callback: CallbackQuery, state: FSMContext):
     """Просмотр активных революций"""
-    text = (
-        "🔴 **АКТИВНЫЕ РЕВОЛЮЦИИ**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-    )
-    
-    # Получаем активные революции из БД
-    # revolutions = await db.get_active_revolutions()
-    
-    revolutions = []  # Заглушка
-    
-    if not revolutions:
-        text += "Активные революции отсутствуют.\n"
-        text += "\nНачните революцию, чтобы изменить власть!"
-    else:
-        for i, rev in enumerate(revolutions[:10]):
-            text += (
-                f"\n{i+1}. **Революция #{rev.get('id')}**\n"
-                f"   Организатор: {rev.get('organizer_name')}\n"
-                f"   Сторонников: {rev.get('supporters_count', 0)}/50\n"
-                f"   Прогресс: {rev.get('supporters_count', 0) * 2}%\n"
-            )
-    
-    keyboard = [
-        [InlineKeyboardButton("⚡ Новая революция", callback_data="start_revolution")],
-        [InlineKeyboardButton("🔙 Назад", callback_data="revolution_menu")]
+    revolutions = await db.get_active_revolutions(limit=20)
+    lines = [
+        "🔴 **АКТИВНЫЕ РЕВОЛЮЦИИ**",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
     ]
-    
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    keyboard = []
+
+    if not revolutions:
+        lines.append("Активные революции отсутствуют.")
+        lines.append("Запустите новую революцию, чтобы начать движение.")
+    else:
+        for idx, rev in enumerate(revolutions[:10], start=1):
+            rid = int(rev.get("id") or 0)
+            supporters = int(rev.get("supporters_count") or 0)
+            needed = max(1, int(rev.get("supporters_needed") or 50))
+            progress = min(100, round((supporters / needed) * 100))
+            started = str(rev.get("started_date") or "")[:16]
+            lines.append(
+                f"{idx}. Революция #{rid}\n"
+                f"Организатор: {rev.get('organizer_name')}\n"
+                f"Сторонники: {supporters}/{needed} ({progress}%)\n"
+                f"Старт: {started}"
+            )
+            lines.append("")
+            keyboard.append([
+                InlineKeyboardButton(f"✅ Вступить #{rid}", callback_data=f"confirm_join_revolution_{rid}"),
+                InlineKeyboardButton(f"📖 Манифест #{rid}", callback_data=f"view_manifesto_{rid}"),
+            ])
+
+        await state.update_data(selected_revolution_id=int(revolutions[0].get("id") or 0))
+
+    keyboard.append([InlineKeyboardButton("⚡ Новая революция", callback_data="start_revolution")])
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="revolution_menu")])
+
+    await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     await callback.answer()
 
 
@@ -217,27 +250,34 @@ async def view_active_revolutions(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "join_revolution")
 async def join_revolution(callback: CallbackQuery, state: FSMContext):
     """Присоединение к революции"""
-    user_id = callback.from_user.id
-    user = await db.get_user(user_id) or {}
-    
-    text = (
-        "👥 **ПРИСОЕДИНИСЬ К РЕВОЛЮЦИИ**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Выберите, к какой революции присоединиться:\n\n"
-        "1. 🔴 Революция против коррупции\n"
-        "   Сторонников: 23/50\n"
-        "   Прогресс: 46%\n\n"
-        "Нажмите кнопку ниже для присоединения:\n"
-    )
-    
-    keyboard = [
-        [InlineKeyboardButton("✅ Присоединиться", callback_data="confirm_join_revolution_1")],
-        [InlineKeyboardButton("📖 Манифест", callback_data="view_manifesto_1")],
-        [InlineKeyboardButton("🔙 Назад", callback_data="revolution_menu")]
+    revolutions = await db.get_active_revolutions(limit=15)
+    lines = [
+        "👥 **ПРИСОЕДИНЕНИЕ К РЕВОЛЮЦИИ**",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
     ]
-    
+    keyboard = []
+    if not revolutions:
+        lines.append("Сейчас нет активных революций.")
+    else:
+        for rev in revolutions[:8]:
+            rid = int(rev.get("id") or 0)
+            supporters = int(rev.get("supporters_count") or 0)
+            needed = max(1, int(rev.get("supporters_needed") or 50))
+            lines.append(
+                f"#{rid} | {rev.get('organizer_name')}\n"
+                f"Сторонники: {supporters}/{needed}"
+            )
+            lines.append("")
+            keyboard.append([
+                InlineKeyboardButton(f"✅ Вступить #{rid}", callback_data=f"confirm_join_revolution_{rid}"),
+                InlineKeyboardButton(f"📖 Манифест #{rid}", callback_data=f"view_manifesto_{rid}"),
+            ])
+        await state.update_data(selected_revolution_id=int(revolutions[0].get("id") or 0))
+
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="revolution_menu")])
     await state.set_state(RevolutionStates.joining_revolution)
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     await callback.answer()
 
 
@@ -246,25 +286,31 @@ async def confirm_join_revolution(callback: CallbackQuery, state: FSMContext):
     """Подтверждение присоединения к революции"""
     revolution_id = callback.data.replace("confirm_join_revolution_", "")
     user_id = callback.from_user.id
-    
-    # await db.add_revolution_supporter(user_id, int(revolution_id))
-    
+    if not revolution_id.isdigit():
+        await callback.answer("Некорректная революция.", show_alert=True)
+        return
+
+    ok, msg = await db.add_revolution_supporter(user_id, int(revolution_id))
+    rev = await db.get_revolution_by_id(int(revolution_id))
+    supporters = int((rev or {}).get("supporters_count") or 0)
+    needed = int((rev or {}).get("supporters_needed") or 50)
+    status = str((rev or {}).get("status") or "active")
+
     text = (
-        "✅ **ВЫ ПРИСОЕДИНИЛИСЬ!**\n"
+        f"{'✅' if ok else '❌'} **ПОДДЕРЖКА РЕВОЛЮЦИИ**\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Поздравляем! Вы- официальный сторонник революции.\n\n"
-        "**ВАША РОЛЬ:**\n"
-        "🗣️ Вы можете агитировать других игроков\n"
-        "📢 Публиковать революционные материалы\n"
-        "👥 Собирать подписи в поддержку\n"
-        "🎯 Участвовать в голосовании при завершении\n"
+        f"{msg}\n\n"
+        f"Революция #{revolution_id}\n"
+        f"Сторонники: {supporters}/{needed}\n"
+        f"Статус: {status}"
     )
-    
+    await state.update_data(selected_revolution_id=int(revolution_id))
     keyboard = [
+        [InlineKeyboardButton("📣 Агитация", callback_data="revolution_campaign")],
+        [InlineKeyboardButton("👥 Сторонники", callback_data="revolution_supporters")],
         [InlineKeyboardButton("🔙 В меню", callback_data="revolution_menu")]
     ]
-    
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     await callback.answer()
 
 
@@ -272,16 +318,31 @@ async def confirm_join_revolution(callback: CallbackQuery, state: FSMContext):
 async def view_manifesto(callback: CallbackQuery, state: FSMContext):
     """Просмотр манифеста выбранной революции."""
     revolution_id = callback.data.replace("view_manifesto_", "")
+    if not revolution_id.isdigit():
+        await callback.answer("Некорректная революция.", show_alert=True)
+        return
+    rev = await db.get_revolution_by_id(int(revolution_id))
+    if not rev:
+        await callback.answer("Революция не найдена.", show_alert=True)
+        return
+    supporters = int(rev.get("supporters_count") or 0)
+    needed = int(rev.get("supporters_needed") or 50)
+    await state.update_data(selected_revolution_id=int(revolution_id))
     text = (
         f"📖 **МАНИФЕСТ РЕВОЛЮЦИИ #{revolution_id}**\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Раздел манифестов находится в разработке."
+        f"Организатор: {rev.get('organizer_name')}\n"
+        f"Старт: {str(rev.get('started_date') or '')[:16]}\n"
+        f"Сторонники: {supporters}/{needed}\n"
+        f"Статус: {rev.get('status')}\n\n"
+        f"{rev.get('reason') or 'Манифест отсутствует.'}"
     )
     keyboard = [
+        [InlineKeyboardButton("✅ Поддержать", callback_data=f"confirm_join_revolution_{int(revolution_id)}")],
         [InlineKeyboardButton("🔙 Назад", callback_data="join_revolution")],
         [InlineKeyboardButton("🏠 В меню", callback_data="revolution_menu")],
     ]
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     await callback.answer()
 
 
@@ -342,29 +403,42 @@ async def make_propaganda_call(callback: CallbackQuery, state: FSMContext):
 async def send_propaganda(callback: CallbackQuery, state: FSMContext):
     """Отправка пропагандистского материала"""
     propaganda_type = callback.data.replace("propaganda_", "")
-    
+
+    rev = await _resolve_revolution_for_user(callback.from_user.id, state)
+    if not rev:
+        await callback.answer("Нет активной революции для агитации.", show_alert=True)
+        return
+
     messages = {
         "emotional": "Друзья! Пора менять власть! Вместе мы сильнее! ⚡",
-        "analytical": "Данные показывают рост коррупции на 30%. Нужны изменения.",
+        "analytical": "Данные показывают рост коррупции. Нужны системные изменения.",
         "targeted": "Если вам надоела текущая система, присоединяйтесь к революции!"
     }
-    
+    delta_map = {"emotional": (1, 2), "analytical": (1, 3), "targeted": (1, 2)}
+    low, high = delta_map.get(propaganda_type, (1, 2))
+    gained = random.randint(low, high)
+    ok, msg, payload = await db.boost_revolution_support(int(rev["id"]), gained)
+    payload = payload or {}
+
+    supporters = int(payload.get("supporters_count") or rev.get("supporters_count") or 0)
+    needed = int(payload.get("supporters_needed") or rev.get("supporters_needed") or 50)
+    progress = min(100, round((supporters / max(1, needed)) * 100))
+
     text = (
-        f"✅ **ПРИЗЫВ ОТПРАВЛЕН**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"**Сообщение:**\n"
-        f"\"{messages.get(propaganda_type, 'Голосуйте за перемены!')}\"\n\n"
-        f"**Результат:**\n"
-        f"+1 сторонник\n"
-        f"Текущей: 24/50\n"
-        f"Прогресс: 48%\n"
+        "✅ **ПРИЗЫВ ОТПРАВЛЕН**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Сообщение:\n\"{messages.get(propaganda_type, 'Голосуйте за перемены!')}\"\n\n"
+        f"{msg}\n"
+        f"Прирост поддержки: +{gained if ok else 0}\n"
+        f"Текущие сторонники: {supporters}/{needed}\n"
+        f"Прогресс: {progress}%"
     )
-    
+
     keyboard = [
         [InlineKeyboardButton("🔙 Назад", callback_data="revolution_campaign")]
     ]
     
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
     await callback.answer()
 
 
@@ -374,82 +448,169 @@ async def send_propaganda(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "revolution_stats")
 async def revolution_stats(callback: CallbackQuery, state: FSMContext):
-    """Статистика революции"""
+    """Статистика по выбранной/активной революции."""
+    rev = await _resolve_revolution_for_user(callback.from_user.id, state)
+    if not rev:
+        text = (
+            "📊 СТАТИСТИКА РЕВОЛЮЦИИ\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Сейчас нет активной революции.\n"
+            "Запустите новую кампанию или поддержите существующую."
+        )
+        keyboard = [
+            [InlineKeyboardButton("⚡ Новая революция", callback_data="start_revolution")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="revolution_campaign")],
+        ]
+        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await callback.answer()
+        return
+
+    supporters = int(rev.get("supporters_count") or 0)
+    needed = max(1, int(rev.get("supporters_needed") or 50))
+    progress = min(100, round((supporters / needed) * 100))
+
+    started_raw = str(rev.get("started_date") or "")
+    started_date = started_raw[:16].replace("T", " ") if started_raw else "неизвестно"
+    days_active = 1
+    try:
+        started_dt = datetime.fromisoformat(started_raw)
+        diff = datetime.now() - started_dt
+        days_active = max(1, diff.days + 1)
+    except Exception:
+        days_active = 1
+
+    avg_per_day = round(supporters / max(1, days_active), 2)
+    missing = max(0, needed - supporters)
+    eta_days = int((missing + max(1, int(avg_per_day)) - 1) / max(1, int(avg_per_day))) if missing > 0 else 0
+    trend = "растет" if avg_per_day >= 1 else "медленно"
+
+    top_supporters = await db.get_revolution_supporters(int(rev.get("id") or 0), limit=3)
+    top_lines = []
+    for idx, s in enumerate(top_supporters, start=1):
+        name = s.get("supporter_name") or s.get("supporter_username") or f"ID {s.get('supporter_id')}"
+        role = s.get("role") or "Сторонник"
+        top_lines.append(f"{idx}. {name} ({role})")
+    if not top_lines:
+        top_lines.append("Пока нет данных.")
+
     text = (
-        "📊 **СТАТИСТИКА РЕВОЛЮЦИИ**\n"
+        f"📊 СТАТИСТИКА РЕВОЛЮЦИИ #{int(rev.get('id') or 0)}\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "**Сторонников:** 24/50 (48%)\n"
-        "**Дней осталось:** 7\n"
-        "**Среднее в день:** 3.4 сторонника\n"
-        "**Тренд:** ↗️ Растет\n\n"
-        "**ТОП АГИТАТОРОВ:**\n"
-        "1. Вы - 4 призыва\n"
-        "2. @username2 - 2 призыва\n"
-        "3. @username3 - 1 призыв\n\n"
-        "При достижении 50 сторонников произойдёт голосование!\n"
+        f"Организатор: {rev.get('organizer_name')}\n"
+        f"Старт: {started_date}\n"
+        f"Статус: {rev.get('status')}\n\n"
+        f"Сторонников: {supporters}/{needed} ({progress}%)\n"
+        f"В кампании: {days_active} дн.\n"
+        f"Средний прирост: {avg_per_day} в день\n"
+        f"Тренд: {trend}\n"
+        f"До цели: {missing} (оценка {eta_days} дн.)\n\n"
+        "Ядро движения:\n"
+        + "\n".join(top_lines)
     )
-    
+
     keyboard = [
-        [InlineKeyboardButton("🔙 Назад", callback_data="revolution_campaign")]
+        [InlineKeyboardButton("👥 Сторонники", callback_data="revolution_supporters")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="revolution_campaign")],
     ]
-    
+
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     await callback.answer()
 
 
 @router.callback_query(F.data == "revolution_supporters")
 async def revolution_supporters(callback: CallbackQuery, state: FSMContext):
-    """Список сторонников революции"""
-    text = (
-        "👥 **СТОРОННИКИ РЕВОЛЮЦИИ**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Всего: 24 сторонника\n\n"
-    )
-    
-    supporters = [
-        ("username1", "Организатор"),
-        ("username2", "Активист"),
-        ("username3", "Участник"),
-        ("username4", "Участник"),
-        ("username5", "Участник"),
+    """Список сторонников выбранной/активной революции."""
+    rev = await _resolve_revolution_for_user(callback.from_user.id, state)
+    if not rev:
+        text = (
+            "👥 СТОРОННИКИ РЕВОЛЮЦИИ\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Нет активной революции для просмотра."
+        )
+        keyboard = [
+            [InlineKeyboardButton("⚡ Новая революция", callback_data="start_revolution")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="revolution_campaign")],
+        ]
+        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await callback.answer()
+        return
+
+    rev_id = int(rev.get("id") or 0)
+    supporters = await db.get_revolution_supporters(rev_id, limit=25)
+    total = int(rev.get("supporters_count") or len(supporters))
+
+    lines = [
+        f"👥 СТОРОННИКИ РЕВОЛЮЦИИ #{rev_id}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        f"Всего: {total}",
+        "",
     ]
-    
-    for i, (username, role) in enumerate(supporters[:10]):
-        text += f"{i+1}. @{username} - **{role}**\n"
-    
-    text += "\n... и ещё 19 человек"
-    
+
+    if not supporters:
+        lines.append("Пока никто не присоединился.")
+    else:
+        for idx, s in enumerate(supporters, start=1):
+            name = s.get("supporter_name") or s.get("supporter_username") or f"ID {s.get('supporter_id')}"
+            role = s.get("role") or "Сторонник"
+            joined = str(s.get("joined_date") or "")[:16].replace("T", " ")
+            if joined:
+                lines.append(f"{idx}. {name} - {role} ({joined})")
+            else:
+                lines.append(f"{idx}. {name} - {role}")
+
+        hidden_count = max(0, total - len(supporters))
+        if hidden_count > 0:
+            lines.append("")
+            lines.append(f"... и еще {hidden_count} чел.")
+
     keyboard = [
-        [InlineKeyboardButton("🔙 Назад", callback_data="revolution_campaign")]
+        [InlineKeyboardButton("📊 Статистика", callback_data="revolution_stats")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="revolution_campaign")],
     ]
-    
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
     await callback.answer()
 
 
 @router.callback_query(F.data == "revolution_history")
 async def revolution_history(callback: CallbackQuery, state: FSMContext):
-    """История революций"""
-    text = (
-        "📋 **ИСТОРИЯ РЕВОЛЮЦИЙ**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "**УСПЕШНЫЕ РЕВОЛЮЦИИ:**\n\n"
-        "✅ 2026-01-15: Смержение демократии\n"
-        "   Что: Монархия установлена\n"
-        "   Организатор: @kingmaker\n"
-        "   Сторонников: 87/100\n\n"
-        "✅ 2025-12-20: Восстання против монархии\n"
-        "   Что: Вернулась демократия\n"
-        "   Организатор: @freedomfighter\n"
-        "   Сторонников: 92/100\n\n"
-        "**НЕУДАЧНЫЕ:**\n\n"
-        "❌ 2025-11-10: Переворот\n"
-        "   Не набрали поддержку: 23/100\n"
-    )
-    
-    keyboard = [
-        [InlineKeyboardButton("🔙 Назад", callback_data="revolution_menu")]
+    """История завершенных революций из БД."""
+    history = await db.get_revolution_history(limit=15)
+    lines = [
+        "📋 ИСТОРИЯ РЕВОЛЮЦИЙ",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
     ]
-    
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    keyboard = []
+
+    if not history:
+        lines.append("Завершенных революций пока нет.")
+    else:
+        icon_map = {
+            "success": "✅",
+            "failed": "❌",
+            "cancelled": "⛔",
+        }
+        for rev in history:
+            rev_id = int(rev.get("id") or 0)
+            status = str(rev.get("status") or "unknown")
+            icon = icon_map.get(status, "•")
+            ended = str(rev.get("ended_date") or rev.get("started_date") or "")[:16].replace("T", " ")
+            supporters = int(rev.get("supporters_count") or 0)
+            needed = int(rev.get("supporters_needed") or 0)
+            result = str(rev.get("result") or "—")
+            lines.append(
+                f"{icon} #{rev_id} | {ended}\n"
+                f"Организатор: {rev.get('organizer_name')}\n"
+                f"Статус: {status} ({result})\n"
+                f"Поддержка: {supporters}/{needed}"
+            )
+            lines.append("")
+            keyboard.append([
+                InlineKeyboardButton(f"📖 Манифест #{rev_id}", callback_data=f"view_manifesto_{rev_id}")
+            ])
+
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="revolution_menu")])
+    await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
     await callback.answer()

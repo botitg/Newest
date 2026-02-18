@@ -1,4 +1,4 @@
-"""
+﻿"""
 handlers_part2.py - Обработчики организаций, бизнеса и работы
 Асинхронные handlers для aiogram 3.x
 """
@@ -112,27 +112,33 @@ async def legacy_view_organization(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("org_members_"))
 async def view_organization_members(callback: CallbackQuery, state: FSMContext):
-    """Список членов организации"""
-    org_id = int(callback.data.replace("org_members_", ""))
-    
+    """Список членов организации."""
+    try:
+        org_id = int(callback.data.replace("org_members_", ""))
+    except ValueError:
+        await callback.answer("❌ Некорректный ID организации.", show_alert=True)
+        return
+
     org = await db.get_organization_by_id(org_id)
+    if not org:
+        await callback.answer("❌ Организация не найдена.", show_alert=True)
+        return
+
     members = await db.get_organization_members(org_id)
-    
     text = f"👥 **Члены {org.get('name', 'Организации')}**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-    
+
     if not members:
         text += "Нет членов"
     else:
-        for member in members[:15]:  # Ограничиваем до 15
+        for member in members[:15]:
             text += f"• **{member.get('full_name')}** - {member.get('role', 'Участник')}\n"
-        
         if len(members) > 15:
             text += f"\n... и ещё {len(members) - 15} человек"
-    
-    keyboard = [
-        [InlineKeyboardButton("🔙 Назад", callback_data=OrgCallback(action="view_org", org_id=org_id, org_name="none").pack())]
-    ]
-    
+
+    keyboard = [[
+        InlineKeyboardButton("🔙 Назад", callback_data=OrgCallback(action="view_org", org_id=org_id, org_name="none").pack())
+    ]]
+
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
     await callback.answer()
 
@@ -307,23 +313,30 @@ async def org_chat_send_finish(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("apply_org_"))
 async def start_apply_to_organization(callback: CallbackQuery, state: FSMContext):
-    """Начало процесса применения в организацию"""
-    org_id = int(callback.data.replace("apply_org_", ""))
+    """Начало процесса применения в организацию."""
+    try:
+        org_id = int(callback.data.replace("apply_org_", ""))
+    except ValueError:
+        await callback.answer("❌ Некорректный ID организации.", show_alert=True)
+        return
+
     user_id = callback.from_user.id
-    
-    # Проверяем, уже ли пользователь в организации
     user = await db.get_user(user_id) or {}
     if user.get('organization'):
         await callback.answer("❌ Вы уже в организации", show_alert=True)
         return
-    
+
     org = await db.get_organization_by_id(org_id)
+    if not org:
+        await callback.answer("❌ Организация не найдена.", show_alert=True)
+        return
+
     text = f"📝 **Применение в {org.get('name')}**\n━━━━━━━━━━━━━━━━━━━━\n\n"
     text += "Напишите сообщение с причиной присоединения (до 500 символов):"
-    
+
     await state.set_state(OrganizationStates.application_text)
     await state.update_data(org_id=org_id, org_name=org.get('name'))
-    
+
     await callback.answer()
     await callback.message.edit_text(text, reply_markup=get_back_button(callback="orgs_main"), parse_mode='Markdown')
 
@@ -384,43 +397,23 @@ async def manage_organization_menu(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "review_applications")
 async def review_applications(callback: CallbackQuery, state: FSMContext):
-    """Проверка заявок в организацию"""
-    user_id = callback.from_user.id
-    user = await db.get_user(user_id) or {}
-    
-    org = await db.get_organization(user.get('organization'))
-    if not org:
-        await callback.answer("❌ Организация не найдена", show_alert=True)
-        return
-    
-    text = f"📋 **Заявки в {org.get('name')}**\n━━━━━━━━━━━━━━━━━━━━\n\n"
-    text += "Здесь будут заявки от претендентов.\n"
-    text += "Функция в разработке."
-    
-    await callback.message.edit_text(text, reply_markup=get_back_button("manage_organization"))
-    await callback.answer()
+    """Прокси на рабочий экран заявок организации."""
+    from feature_pack import feature_review_applications
+    await feature_review_applications(callback, state)
 
 
 @router.callback_query(F.data == "manage_members")
 async def manage_members(callback: CallbackQuery, state: FSMContext):
-    """Заглушка меню управления членами организации."""
-    await callback.message.edit_text(
-        "👥 **УПРАВЛЕНИЕ СОТРУДНИКАМИ**\n━━━━━━━━━━━━━━━━━━━━\n\nФункция в разработке.",
-        reply_markup=get_back_button(callback="manage_organization"),
-        parse_mode='Markdown',
-    )
-    await callback.answer()
+    """Прокси на рабочий экран сотрудников организации."""
+    from feature_pack import feature_manage_members
+    await feature_manage_members(callback, state)
 
 
 @router.callback_query(F.data == "org_finances")
 async def org_finances(callback: CallbackQuery, state: FSMContext):
-    """Заглушка меню финансов организации."""
-    await callback.message.edit_text(
-        "💰 **ФИНАНСЫ ОРГАНИЗАЦИИ**\n━━━━━━━━━━━━━━━━━━━━\n\nФункция в разработке.",
-        reply_markup=get_back_button(callback="manage_organization"),
-        parse_mode='Markdown',
-    )
-    await callback.answer()
+    """Прокси на рабочий экран финансов организации."""
+    from feature_pack import feature_org_finances
+    await feature_org_finances(callback, state)
 
 
 # ============================================================================
@@ -430,87 +423,31 @@ async def org_finances(callback: CallbackQuery, state: FSMContext):
 @router.message(Command("biz"))
 @router.callback_query(F.data == "biz_menu")
 async def business_menu(event, state: FSMContext):
-    """Меню бизнеса"""
-    if isinstance(event, Message):
-        message = event
-    else:
-        message = event.message
-        await event.answer()
-    
-    user_id = event.from_user.id
-    user = await db.get_user(user_id) or {}
-    
-    text = (
-        "🏪 **БИЗНЕС**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Управляйте своим бизнесом, нанимайте сотрудников,\n"
-        "закупайте оборудование и генерируйте прибыль.\n\n"
-    )
-    
-    if user.get('business_owner'):
-        text += "📊 **Ваши бизнесы:**\n"
-        text += "Здесь будет список ваших бизнесов"
-    else:
-        text += "Вы пока не владеете бизнесом.\n"
-    
-    keyboard = [
-        [InlineKeyboardButton("🆕 Создать", callback_data="create_business")],
-        [InlineKeyboardButton("📊 Мои бизнесы", callback_data="my_businesses")],
-        [InlineKeyboardButton("🔙 В меню", callback_data="back_to_main")]
-    ]
-    
-    await state.set_state(BusinessStates.business_menu)
-    await message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard)) if isinstance(event, CallbackQuery) else await message.answer(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    """Прокси на единое рабочее меню бизнеса."""
+    from feature_pack import feature_business_menu
+    await feature_business_menu(event, state)
 
 
 @router.callback_query(F.data == "create_business")
 async def start_create_business(callback: CallbackQuery, state: FSMContext):
-    """Начало создания бизнеса"""
-    user_id = callback.from_user.id
-    user = await db.get_user(user_id) or {}
-    
-    text = (
-        "🆕 **Создание Бизнеса**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Выберите тип бизнеса:\n"
-    )
-    
-    keyboard = [
-        [InlineKeyboardButton("🍔 Ресторан", callback_data="biz_type_restaurant")],
-        [InlineKeyboardButton("🏪 Магазин", callback_data="biz_type_shop")],
-        [InlineKeyboardButton("🏭 Фабрика", callback_data="biz_type_factory")],
-        [InlineKeyboardButton("🏨 Отель", callback_data="biz_type_hotel")],
-        [InlineKeyboardButton("🔙 Назад", callback_data="biz_menu")]
-    ]
-    
-    await state.set_state(BusinessStates.business_type)
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    await callback.answer()
+    """Прокси на рабочий сценарий открытия бизнеса через недвижимость."""
+    from feature_pack import feature_business_create_start
+    await feature_business_create_start(callback, state)
 
 
 @router.callback_query(F.data.startswith("biz_type_"))
 async def select_business_type(callback: CallbackQuery, state: FSMContext):
-    """Выбор типа бизнеса."""
-    selected_type = callback.data.replace("biz_type_", "")
-    await state.update_data(business_type=selected_type)
-    await state.set_state(BusinessStates.business_name)
-    await callback.message.edit_text(
-        f"🏷️ **Тип бизнеса:** {selected_type}\n\nВведите название бизнеса:",
-        reply_markup=get_back_button(callback="biz_menu"),
-        parse_mode='Markdown',
-    )
-    await callback.answer()
+    """Совместимость со старыми кнопками выбора типа бизнеса."""
+    await callback.answer("Сценарий обновлен. Откройте бизнес через новый мастер.", show_alert=True)
+    from feature_pack import feature_business_create_start
+    await feature_business_create_start(callback, state)
 
 
 @router.callback_query(F.data == "my_businesses")
 async def my_businesses(callback: CallbackQuery, state: FSMContext):
-    """Заглушка списка бизнесов пользователя."""
-    await callback.message.edit_text(
-        "📊 **МОИ БИЗНЕСЫ**\n━━━━━━━━━━━━━━━━━━━━\n\nРаздел в разработке.",
-        reply_markup=get_back_button(callback="biz_menu"),
-        parse_mode='Markdown',
-    )
-    await callback.answer()
+    """Прокси на рабочий список бизнесов пользователя."""
+    from feature_pack import feature_business_my
+    await feature_business_my(callback, state)
 
 
 # ============================================================================
@@ -712,24 +649,16 @@ async def property_menu(event, state: FSMContext):
 
 @router.callback_query(F.data == "property_catalog")
 async def property_catalog(callback: CallbackQuery, state: FSMContext):
-    """Заглушка каталога недвижимости."""
-    await callback.message.edit_text(
-        "🏠 **КАТАЛОГ НЕДВИЖИМОСТИ**\n━━━━━━━━━━━━━━━━━━━━\n\nРаздел в разработке.",
-        reply_markup=get_back_button(callback="prop_menu"),
-        parse_mode='Markdown',
-    )
-    await callback.answer()
+    """Прокси на рабочий каталог недвижимости."""
+    from feature_pack import feature_property_catalog
+    await feature_property_catalog(callback, state)
 
 
 @router.callback_query(F.data == "my_property")
 async def my_property(callback: CallbackQuery, state: FSMContext):
-    """Заглушка списка собственности пользователя."""
-    await callback.message.edit_text(
-        "🏠 **МОЕ ИМУЩЕСТВО**\n━━━━━━━━━━━━━━━━━━━━\n\nРаздел в разработке.",
-        reply_markup=get_back_button(callback="prop_menu"),
-        parse_mode='Markdown',
-    )
-    await callback.answer()
+    """Прокси на рабочий список собственности пользователя."""
+    from feature_pack import feature_my_property
+    await feature_my_property(callback, state)
 
 
 # ============================================================================
@@ -765,21 +694,14 @@ async def market_menu(event, state: FSMContext):
 
 @router.callback_query(F.data == "view_contracts")
 async def view_contracts(callback: CallbackQuery, state: FSMContext):
-    """Заглушка списка контрактов."""
-    await callback.message.edit_text(
-        "📋 **КОНТРАКТЫ**\n━━━━━━━━━━━━━━━━━━━━\n\nРаздел в разработке.",
-        reply_markup=get_back_button(callback="market_menu"),
-        parse_mode='Markdown',
-    )
-    await callback.answer()
+    """Прокси на рабочий список контрактов."""
+    from feature_pack import feature_contracts_view
+    await feature_contracts_view(callback, state)
 
 
 @router.callback_query(F.data == "create_contract")
 async def create_contract(callback: CallbackQuery, state: FSMContext):
-    """Заглушка создания контракта."""
-    await callback.message.edit_text(
-        "✍️ **СОЗДАНИЕ КОНТРАКТА**\n━━━━━━━━━━━━━━━━━━━━\n\nРаздел в разработке.",
-        reply_markup=get_back_button(callback="market_menu"),
-        parse_mode='Markdown',
-    )
-    await callback.answer()
+    """Прокси на рабочее создание контракта."""
+    from feature_pack import feature_contracts_create_start
+    await feature_contracts_create_start(callback, state)
+
