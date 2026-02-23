@@ -5,26 +5,31 @@ economy.py - Экономическая система
 
 import logging
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import random
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import aiosqlite
 from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from database import db
 
 logger = logging.getLogger(__name__)
-UZBEKISTAN_TZ = ZoneInfo("Asia/Tashkent")
+try:
+    UZBEKISTAN_TZ = ZoneInfo("Asia/Tashkent")
+except ZoneInfoNotFoundError:
+    logger.warning("tzdata не найдена, используем fallback UTC+5 для времени Узбекистана.")
+    UZBEKISTAN_TZ = timezone(timedelta(hours=5), name="UTC+5")
 
 # Экономические параметры (дневные ставки)
 DAILY_CITIZEN_TAX_RATE = 0.0035  # 0.35% дневного налога
-DAILY_MIN_CITIZEN_TAX = 30.0  # Минимум $30/день
+DAILY_MIN_CITIZEN_TAX = 3.0  # Минимум $3/день
 DAILY_PROPERTY_TAX_RATE = 0.00025  # 0.025% от стоимости имущества
 DAILY_BUSINESS_TAX_RATE = 0.001  # 0.1% дневного налога на бизнес
 DAILY_PRIVATE_ORG_TAX_RATE = 0.0015  # 0.15% дневного налога
 DAILY_LOAN_PENALTY_RATE = 0.01  # 1% штрафа за просрочку кредита
 DAILY_REPUTATION_PENALTY = 0.1  # -0.1 репутации в день за неуплаченные налоги
-BUSINESS_EQUIP_BASE_COST = 25000.0  # Базовая стоимость оборудования
+BUSINESS_EQUIP_BASE_COST = 2500.0  # Базовая стоимость оборудования
 
 
 async def apply_daily_taxes(bot: Bot = None):
@@ -36,6 +41,7 @@ async def apply_daily_taxes(bot: Bot = None):
         logger.info("=== ЗАПУСК ДНЕВНОГО НАЛОГОВОГО ЦИКЛА ===")
         summary = await db.run_advanced_tax_cycle()
         business_summary = await db.generate_business_tax_reports()
+        loan_summary = await process_all_daily_loan_payments(str(summary.get("cycle_date") or ""))
         logger.info(
             "Налоговый цикл завершен: users=%s debtors=%s collected=$%.2f new_debt=$%.2f",
             summary.get("processed_users", 0),
@@ -43,6 +49,23 @@ async def apply_daily_taxes(bot: Bot = None):
             float(summary.get("total_collected", 0)),
             float(summary.get("total_new_debt", 0)),
         )
+        logger.info(
+            "Кредитный цикл: borrowers=%s loans=%s paid=%s penalty=%s paid_total=$%.2f penalty_total=$%.2f defaults=%s",
+            int(loan_summary.get("borrowers", 0)),
+            int(loan_summary.get("loans_processed", 0)),
+            int(loan_summary.get("paid_count", 0)),
+            int(loan_summary.get("penalty_count", 0)),
+            float(loan_summary.get("total_paid", 0)),
+            float(loan_summary.get("total_penalty", 0)),
+            int(loan_summary.get("defaults", 0)),
+        )
+        if bot:
+            notify_stats = await notify_daily_tax_invoices(bot, str(summary.get("cycle_date") or ""))
+            logger.info(
+                "Tax invoices notified: sent=%s total=%s",
+                int(notify_stats.get("sent", 0)),
+                int(notify_stats.get("total", 0)),
+            )
         logger.info(
             "Business tax reports: created=%s paid=$%.2f unpaid=%s",
             business_summary.get("reports_created", 0),
@@ -235,6 +258,92 @@ async def process_loan_payments(user_id: int) -> dict:
     except Exception as e:
         logger.error(f"Error processing loans for user {user_id}: {e}")
         return {'error': str(e)}
+
+
+async def process_all_daily_loan_payments(cycle_date: str | None = None) -> dict:
+    """
+    Глобальный дневной цикл кредитов (один раз в день):
+    - списывает daily_payment по всем активным кредитам;
+    - при нехватке средств начисляет дневной штраф;
+    - запускает обработку дефолтов.
+    """
+    try:
+        safe_cycle = (cycle_date or datetime.now(UZBEKISTAN_TZ).date().isoformat()).strip()
+        checkpoint_key = "economy_loan_cycle_date"
+        already_done = await db.get_system_state(checkpoint_key)
+        if already_done == safe_cycle:
+            return {
+                "status": "already_processed",
+                "cycle_date": safe_cycle,
+                "borrowers": 0,
+                "loans_processed": 0,
+                "paid_count": 0,
+                "penalty_count": 0,
+                "total_paid": 0.0,
+                "total_penalty": 0.0,
+                "defaults": 0,
+            }
+
+        async with aiosqlite.connect(db.db_path) as conn:
+            async with conn.execute(
+                """
+                SELECT DISTINCT applicant_id
+                FROM loans
+                WHERE status IN ('approved', 'active')
+                  AND COALESCE(remaining_balance, 0) > 0
+                ORDER BY applicant_id ASC
+                """
+            ) as cur:
+                rows = await cur.fetchall()
+        borrower_ids = [int(r[0]) for r in rows if r and r[0] is not None]
+
+        borrowers = 0
+        loans_processed = 0
+        paid_count = 0
+        penalty_count = 0
+        total_paid = 0.0
+        total_penalty = 0.0
+
+        for borrower_id in borrower_ids:
+            result = await process_loan_payments(int(borrower_id))
+            if result.get("error"):
+                continue
+            borrowers += 1
+            loans_processed += int(result.get("loans_processed", 0) or 0)
+            paid_count += int(result.get("paid_count", 0) or 0)
+            penalty_count += int(result.get("penalty_count", 0) or 0)
+            total_paid = round(total_paid + float(result.get("total_paid", 0) or 0), 2)
+            total_penalty = round(total_penalty + float(result.get("total_penalty", 0) or 0), 2)
+
+        defaults_result = await process_loan_defaults()
+        defaults = int(defaults_result.get("defaults", 0) or 0)
+
+        await db.set_system_state(checkpoint_key, safe_cycle)
+        return {
+            "status": "processed",
+            "cycle_date": safe_cycle,
+            "borrowers": borrowers,
+            "loans_processed": loans_processed,
+            "paid_count": paid_count,
+            "penalty_count": penalty_count,
+            "total_paid": round(total_paid, 2),
+            "total_penalty": round(total_penalty, 2),
+            "defaults": defaults,
+        }
+    except Exception as e:
+        logger.error(f"Error in global daily loan cycle: {e}")
+        return {
+            "status": "error",
+            "cycle_date": (cycle_date or datetime.now(UZBEKISTAN_TZ).date().isoformat()),
+            "borrowers": 0,
+            "loans_processed": 0,
+            "paid_count": 0,
+            "penalty_count": 0,
+            "total_paid": 0.0,
+            "total_penalty": 0.0,
+            "defaults": 0,
+            "error": str(e),
+        }
 
 
 async def distribute_government_salaries(org_id: int) -> dict:
@@ -573,6 +682,26 @@ async def run_daily_economy_cycle(bot: Bot = None):
             cycle_date = now_uz.date().isoformat()
             last_cycle_date = await db.get_system_state("economy_last_cycle_date")
             if last_cycle_date == cycle_date:
+                loan_retry_summary = await process_all_daily_loan_payments(cycle_date)
+                if loan_retry_summary.get("status") == "processed":
+                    logger.info(
+                        "Кредитный цикл (retry): borrowers=%s loans=%s paid=%s penalty=%s paid_total=$%.2f penalty_total=$%.2f defaults=%s",
+                        int(loan_retry_summary.get("borrowers", 0)),
+                        int(loan_retry_summary.get("loans_processed", 0)),
+                        int(loan_retry_summary.get("paid_count", 0)),
+                        int(loan_retry_summary.get("penalty_count", 0)),
+                        float(loan_retry_summary.get("total_paid", 0)),
+                        float(loan_retry_summary.get("total_penalty", 0)),
+                        int(loan_retry_summary.get("defaults", 0)),
+                    )
+                if bot:
+                    notify_stats = await notify_daily_tax_invoices(bot, cycle_date)
+                    if int(notify_stats.get("sent", 0)) > 0:
+                        logger.info(
+                            "Daily tax notifications retry: sent=%s total=%s",
+                            int(notify_stats.get("sent", 0)),
+                            int(notify_stats.get("total", 0)),
+                        )
                 await asyncio.sleep(60)
                 continue
 
@@ -580,14 +709,18 @@ async def run_daily_economy_cycle(bot: Bot = None):
             logger.info("ЗАПУСК ЕЖЕДНЕВНОГО ЭКОНОМИЧЕСКОГО ЦИКЛА")
             logger.info("=" * 50)
 
-            summary = await db.run_advanced_tax_cycle()
+            summary = await db.run_advanced_tax_cycle(cycle_date=cycle_date)
             business_summary = await db.generate_business_tax_reports()
+            loan_summary = await process_all_daily_loan_payments(cycle_date)
+            inflation_summary = await db.apply_daily_inflation()
             stability = await calculate_government_stability()
 
             logger.info(
-                "Налоговый цикл: users=%s debtors=%s collected=$%.2f new_debt=$%.2f stability=%.2f",
+                "Налоговый цикл: users=%s debtors=%s invoices=%s due=$%.2f collected=$%.2f new_debt=$%.2f stability=%.2f",
                 summary.get("processed_users", 0),
                 summary.get("debtors", 0),
+                summary.get("created_invoices", 0),
+                float(summary.get("total_due_created", 0)),
                 float(summary.get("total_collected", 0)),
                 float(summary.get("total_new_debt", 0)),
                 stability,
@@ -598,16 +731,48 @@ async def run_daily_economy_cycle(bot: Bot = None):
                 float(business_summary.get("total_tax_paid", 0)),
                 business_summary.get("unpaid_count", 0),
             )
+            logger.info(
+                "Кредитный цикл: borrowers=%s loans=%s paid=%s penalty=%s paid_total=$%.2f penalty_total=$%.2f defaults=%s",
+                int(loan_summary.get("borrowers", 0)),
+                int(loan_summary.get("loans_processed", 0)),
+                int(loan_summary.get("paid_count", 0)),
+                int(loan_summary.get("penalty_count", 0)),
+                float(loan_summary.get("total_paid", 0)),
+                float(loan_summary.get("total_penalty", 0)),
+                int(loan_summary.get("defaults", 0)),
+            )
+            if inflation_summary.get("applied"):
+                logger.info(
+                    "Inflation updated: rate=%.4f%% factor=%.6f index=%.6f",
+                    float(inflation_summary.get("inflation_daily_rate", 0)) * 100,
+                    float(inflation_summary.get("inflation_factor", 1)),
+                    float(inflation_summary.get("inflation_index_after", 1)),
+                )
+            else:
+                logger.info(
+                    "Inflation already applied today: index=%.6f",
+                    float(inflation_summary.get("inflation_index", inflation_summary.get("inflation_index_after", 1))),
+                )
 
             if bot:
+                notify_stats = await notify_daily_tax_invoices(bot, cycle_date)
+                logger.info(
+                    "Daily tax notifications: sent=%s total=%s",
+                    int(notify_stats.get("sent", 0)),
+                    int(notify_stats.get("total", 0)),
+                )
                 tax_users = await db.get_tax_service_user_ids()
                 if tax_users:
                     tax_text = (
                         "🧾 Налоговая сводка за цикл\n"
                         "━━━━━━━━━━━━━━━━━━━━\n"
+                        f"Создано ежедневных счетов: {int(summary.get('created_invoices', 0))}\n"
+                        f"Сумма к оплате сегодня: ${float(summary.get('total_due_created', 0)):,.2f}\n"
                         f"Бизнес-отчетов: {business_summary.get('reports_created', 0)}\n"
                         f"Оплачено бизнес-налогов: ${float(business_summary.get('total_tax_paid', 0)):,.2f}\n"
                         f"Неоплаченных: {business_summary.get('unpaid_count', 0)}\n"
+                        f"Инфляция за сутки: {float(inflation_summary.get('inflation_daily_rate', 0)) * 100:.2f}%\n"
+                        f"Индекс инфляции: {float(inflation_summary.get('inflation_index_after', inflation_summary.get('inflation_index', 1))):.4f}\n"
                         f"Дата цикла: {business_summary.get('cycle_date')}"
                     )
                     for uid in tax_users:
@@ -622,6 +787,26 @@ async def run_daily_economy_cycle(bot: Bot = None):
             logger.error(f"Critical error in economy cycle: {e}")
 
         await asyncio.sleep(60)
+
+
+async def run_state_money_print_processor(bot: Bot = None):
+    """Периодически завершает готовые задания печати денег."""
+    while True:
+        try:
+            result = await db.claim_ready_state_money_print_jobs(actor_id=None, enforce_authority=False)
+            claimed = int(result.get("claimed_jobs") or 0)
+            if claimed > 0:
+                minted = float(result.get("minted_total") or 0)
+                gov_budget = float(result.get("government_budget_after") or 0)
+                logger.info(
+                    "State money print jobs completed: count=%s minted=$%.2f gov_budget=$%.2f",
+                    claimed,
+                    minted,
+                    gov_budget,
+                )
+        except Exception as e:
+            logger.error(f"Error in money print processor: {e}")
+        await asyncio.sleep(30)
 
 
 async def give_daily_bonus(user_id: int, amount: float = 1000) -> bool:
@@ -646,6 +831,79 @@ async def fine_player(user_id: int, amount: float) -> bool:
     except Exception as e:
         logger.error(f"Error fining {user_id}: {e}")
         return False
+
+
+async def notify_daily_tax_invoices(bot: Bot, cycle_date: str) -> dict:
+    """Разослать игрокам уведомления об ежедневном налоге с кнопкой оплаты."""
+    safe_cycle = str(cycle_date or "").strip()
+    if not safe_cycle:
+        safe_cycle = datetime.now(UZBEKISTAN_TZ).date().isoformat()
+
+    token = safe_cycle.replace("-", "")
+    invoices = await db.list_pending_daily_tax_invoices(
+        cycle_date=safe_cycle,
+        limit=20_000,
+        only_not_notified=True,
+    )
+    sent = 0
+    failed = 0
+    for row in invoices:
+        user_id = int(row.get("user_id") or 0)
+        if user_id <= 0:
+            continue
+        total_due = float(row.get("total_due") or 0)
+        if total_due <= 0:
+            await db.mark_daily_tax_invoice_notified(user_id, safe_cycle)
+            continue
+        living_tax = float(row.get("living_tax") or 0)
+        work_tax = float(row.get("work_tax") or 0)
+        property_tax = float(row.get("property_tax") or 0)
+        business_tax = float(row.get("business_tax") or 0)
+        private_org_tax = float(row.get("private_org_tax") or 0)
+        citizen_tax = float(row.get("citizen_tax") or 0)
+        if living_tax <= 0 and citizen_tax > 0:
+            living_tax = min(citizen_tax, 5000.0)
+        debt_interest = float(row.get("debt_interest") or 0)
+        scheduled_payment = float(row.get("scheduled_payment") or 0)
+
+        text = (
+            "🧾 НАЛОГОВОЕ УВЕДОМЛЕНИЕ\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"📅 Дата счета: {safe_cycle}\n"
+            f"💳 К оплате сейчас: ${total_due:,.2f}\n\n"
+            "Состав платежа:\n"
+            f"• Налог на проживание: ${living_tax:,.2f}\n"
+            f"• Налог на работу: ${work_tax:,.2f}\n"
+            f"• Налог на недвижимость: ${property_tax:,.2f}\n"
+            f"• Налог на бизнесы: ${business_tax:,.2f}\n"
+            f"• Налог на частные организации: ${private_org_tax:,.2f}\n"
+            f"• Проценты по долгу: ${debt_interest:,.2f}\n"
+            f"• Плановый платеж: ${scheduled_payment:,.2f}\n\n"
+            "Оплатите счет кнопкой ниже, чтобы не накапливать долг."
+        )
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=f"✅ Оплатить сейчас ${total_due:,.2f}", callback_data=f"daily_tax_pay_{token}")],
+            ]
+        )
+        try:
+            sent_message = await bot.send_message(user_id, text, reply_markup=keyboard, parse_mode=None)
+            # По запросу игроков пытаемся закрепить налоговый счет в чате.
+            try:
+                await bot.pin_chat_message(
+                    chat_id=user_id,
+                    message_id=sent_message.message_id,
+                    disable_notification=True,
+                )
+            except Exception:
+                pass
+            await db.mark_daily_tax_invoice_notified(user_id, safe_cycle)
+            sent += 1
+        except Exception:
+            failed += 1
+            logger.warning("Could not send daily tax invoice to user %s", user_id)
+
+    return {"cycle_date": safe_cycle, "total": len(invoices), "sent": sent, "failed": failed}
 
 
 async def transfer_money(from_user_id: int, to_user_id: int, amount: float) -> bool:

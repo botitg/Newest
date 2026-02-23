@@ -18,6 +18,8 @@ from keyboards import get_back_button
 logger = logging.getLogger(__name__)
 router = Router()
 
+INVISIBLE_NAME_CHARS = ("\u200b", "\u200c", "\u200d", "\ufeff", "\u2060", "\u00ad")
+
 
 class FBIStates(StatesGroup):
     """Состояния для системы ФБР"""
@@ -33,13 +35,75 @@ def _is_fbi_agent(user: dict | None) -> bool:
         return False
     role = str(user.get("role") or "").lower()
     org = str(user.get("organization") or "").lower()
-    return ("fbi" in role) or ("fbi" in org) or ("\u0444\u0431\u0440" in role) or ("\u0444\u0431\u0440" in org)
+    # Поддержка как нормальной кириллицы, так и mojibake-строк из старых данных.
+    return (
+        ("fbi" in role)
+        or ("fbi" in org)
+        or ("\u0444\u0431\u0440" in role)
+        or ("\u0444\u0431\u0440" in org)
+        or ("с„р±сђ" in role)
+        or ("с„р±сђ" in org)
+        or ("с„р±р" in role)
+        or ("с„р±р" in org)
+    )
+
+
+def _display_user_name(user: dict | None, fallback_id: int | None = None) -> str:
+    info = user or {}
+    for key in ("display_name", "nickname", "full_name"):
+        text = str(info.get(key) or "")
+        for token in INVISIBLE_NAME_CHARS:
+            text = text.replace(token, "")
+        text = " ".join(text.split()).strip()
+        if text:
+            return text
+    username = str(info.get("username") or "").strip().lstrip("@")
+    if username:
+        return f"@{username}"
+    uid = info.get("user_id") or fallback_id or "?"
+    return f"Игрок #{uid}"
+
+
+async def _notify_user_safe(bot_obj, user_id: int, text: str) -> None:
+    clean = str(text or "").strip()
+    if not clean:
+        return
+    try:
+        await bot_obj.send_message(int(user_id), clean, parse_mode=None)
+    except Exception:
+        pass
 
 
 async def _ensure_fbi_access(callback: CallbackQuery) -> bool:
     """Проверить доступ к модулям ФБР."""
-    user = await db.get_user(callback.from_user.id) or {}
-    if not _is_fbi_agent(user):
+    user_id = int(callback.from_user.id)
+    user = await db.get_user(user_id) or {}
+    authority = await db.get_government_authority(user_id)
+    is_fbi_lead = False
+    try:
+        orgs = await db.list_organizations()
+        for org in orgs:
+            if str(org.get("type") or "").strip().lower() != "fbi":
+                continue
+            org_id = int(org.get("id") or 0)
+            if org_id <= 0:
+                continue
+            full_org = await db.get_organization_by_id(org_id) or org
+            leader_id = int(full_org.get("leader_id") or 0)
+            deputy_id = int(full_org.get("deputy_id") or 0)
+            if user_id in {leader_id, deputy_id}:
+                is_fbi_lead = True
+                break
+    except Exception:
+        is_fbi_lead = False
+
+    has_fbi_access = (
+        _is_fbi_agent(user)
+        or await db.is_user_in_org_type(user_id, "fbi")
+        or is_fbi_lead
+        or authority in {"president", "vice_president", "finance_minister", "minister"}
+    )
+    if not has_fbi_access:
         await callback.answer("❌ Только агенты ФБР имеют доступ", show_alert=True)
         return False
     return True
@@ -115,13 +179,13 @@ async def fbi_intercept_messages_list(callback: CallbackQuery, state: FSMContext
     text = "\n".join(text_lines)
     
     keyboard = [
-        [InlineKeyboardButton("🔄 Обновить", callback_data="fbi_intercept_messages")],
-        [InlineKeyboardButton("🎯 Отследить игрока", callback_data="fbi_track_player")],
-        [InlineKeyboardButton("🔙 Назад", callback_data="fbi_menu")]
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="fbi_intercept_messages")],
+        [InlineKeyboardButton(text="🎯 Отследить игрока", callback_data="fbi_track_player")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="fbi_menu")]
     ]
     
     await state.set_state(FBIStates.viewing_intercepts)
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode=None)
     await callback.answer()
 
 
@@ -148,15 +212,15 @@ async def fbi_track_player(callback: CallbackQuery, state: FSMContext):
         player_id = int(player.get("user_id") or 0)
         if player_id <= 0:
             continue
-        display = (player.get("full_name") or "").strip() or (f"@{player.get('username')}" if player.get("username") else f"ID {player_id}")
+        display = _display_user_name(player, fallback_id=player_id)
         if len(display) > 30:
             display = display[:27] + "..."
-        keyboard.append([InlineKeyboardButton(f"👤 {display}", callback_data=f"fbi_monitor_{player_id}")])
+        keyboard.append([InlineKeyboardButton(text=f"👤 {display}", callback_data=f"fbi_monitor_{player_id}")])
 
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="fbi_intercept_messages")])
+    keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="fbi_intercept_messages")])
     
     await state.set_state(FBIStates.selecting_target)
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode=None)
     await callback.answer()
 
 
@@ -192,7 +256,7 @@ async def fbi_monitor_player_details(callback: CallbackQuery, state: FSMContext)
         f"📊 **ФАЙЛ НА ИГРОКА #{player_id_str}**\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"**ID:** {player_id_str}\n"
-        f"**Имя:** {target.get('full_name') or target.get('username') or 'Неизвестно'}\n"
+        f"**Имя:** {_display_user_name(target, fallback_id=player_id)}\n"
         f"**Статус:** Активен\n"
         f"**Организация:** {target.get('organization') or 'Нет'}\n"
         f"**Роль:** {target.get('role') or 'Гражданин'}\n"
@@ -210,14 +274,14 @@ async def fbi_monitor_player_details(callback: CallbackQuery, state: FSMContext)
     )
     
     keyboard = [
-        [InlineKeyboardButton("💬 История сообщений", callback_data=f"fbi_message_history_{player_id_str}")],
-        [InlineKeyboardButton("🗺️ Маршрут передвижения", callback_data=f"fbi_location_history_{player_id_str}")],
-        [InlineKeyboardButton("👥 Контакты", callback_data=f"fbi_contacts_{player_id_str}")],
-        [InlineKeyboardButton("⚔️ Операция", callback_data=f"fbi_operation_{player_id_str}")],
-        [InlineKeyboardButton("🔙 Назад", callback_data="fbi_track_player")]
+        [InlineKeyboardButton(text="💬 История сообщений", callback_data=f"fbi_message_history_{player_id_str}")],
+        [InlineKeyboardButton(text="🗺️ Маршрут передвижения", callback_data=f"fbi_location_history_{player_id_str}")],
+        [InlineKeyboardButton(text="👥 Контакты", callback_data=f"fbi_contacts_{player_id_str}")],
+        [InlineKeyboardButton(text="⚔️ Операция", callback_data=f"fbi_operation_{player_id_str}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="fbi_track_player")]
     ]
     
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode=None)
     await callback.answer()
 
 
@@ -268,11 +332,11 @@ async def fbi_message_history(callback: CallbackQuery, state: FSMContext):
     text = "\n".join(lines)
 
     keyboard = [
-        [InlineKeyboardButton("🔍 Поиск", callback_data=f"fbi_search_messages_{player_id}")],
-        [InlineKeyboardButton("🔙 Назад", callback_data=f"fbi_monitor_{player_id}")]
+        [InlineKeyboardButton(text="🔍 Поиск", callback_data=f"fbi_search_messages_{player_id}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data=f"fbi_monitor_{player_id}")]
     ]
     
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode=None)
     await callback.answer()
 
 
@@ -349,10 +413,10 @@ async def fbi_search_messages(callback: CallbackQuery, state: FSMContext):
 
     text = "\n".join(lines)
     keyboard = [
-        [InlineKeyboardButton("🔄 Обновить", callback_data=f"fbi_search_messages_{player_id}")],
-        [InlineKeyboardButton("🔙 Назад", callback_data=f"fbi_message_history_{player_id}")]
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"fbi_search_messages_{player_id}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data=f"fbi_message_history_{player_id}")]
     ]
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode=None)
     await callback.answer()
 
 
@@ -392,12 +456,12 @@ async def fbi_contacts(callback: CallbackQuery, state: FSMContext):
     text = "\n".join(lines)
     
     keyboard = [
-        [InlineKeyboardButton("🔗 Граф контактов", callback_data=f"fbi_contact_graph_{player_id}")],
-        [InlineKeyboardButton("⚠️ Подозрительные", callback_data=f"fbi_suspicious_{player_id}")],
-        [InlineKeyboardButton("🔙 Назад", callback_data=f"fbi_monitor_{player_id}")]
+        [InlineKeyboardButton(text="🔗 Граф контактов", callback_data=f"fbi_contact_graph_{player_id}")],
+        [InlineKeyboardButton(text="⚠️ Подозрительные", callback_data=f"fbi_suspicious_{player_id}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data=f"fbi_monitor_{player_id}")]
     ]
     
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
     await callback.answer()
 
 
@@ -428,10 +492,10 @@ async def fbi_contact_graph(callback: CallbackQuery, state: FSMContext):
             lines.append(f"{bar} {name} ({count})")
     text = "\n".join(lines)
     keyboard = [
-        [InlineKeyboardButton("⚠️ Подозрительные", callback_data=f"fbi_suspicious_{player_id}")],
-        [InlineKeyboardButton("🔙 Назад", callback_data=f"fbi_contacts_{player_id}")]
+        [InlineKeyboardButton(text="⚠️ Подозрительные", callback_data=f"fbi_suspicious_{player_id}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data=f"fbi_contacts_{player_id}")]
     ]
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
     await callback.answer()
 
 
@@ -467,7 +531,7 @@ async def fbi_suspicious_contacts(callback: CallbackQuery, state: FSMContext):
             flagged.append((row, reasons))
 
     if not flagged:
-        lines.append("Сильных подозрительных связей не найдено.")
+        lines.append("Сильных подозрительных связей не найдено. Kamron")
     else:
         for row, reasons in flagged[:12]:
             name = row.get("display_name") or f"ID {row.get('user_id')}"
@@ -479,10 +543,10 @@ async def fbi_suspicious_contacts(callback: CallbackQuery, state: FSMContext):
 
     text = "\n".join(lines)
     keyboard = [
-        [InlineKeyboardButton("🔗 Граф", callback_data=f"fbi_contact_graph_{player_id}")],
-        [InlineKeyboardButton("🔙 Назад", callback_data=f"fbi_contacts_{player_id}")]
+        [InlineKeyboardButton(text="🔗 Граф", callback_data=f"fbi_contact_graph_{player_id}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data=f"fbi_contacts_{player_id}")]
     ]
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
     await callback.answer()
 
 
@@ -518,11 +582,11 @@ async def fbi_location_history(callback: CallbackQuery, state: FSMContext):
     )
     
     keyboard = [
-        [InlineKeyboardButton("📍 Текущее место", callback_data=f"fbi_current_location_{player_id}")],
-        [InlineKeyboardButton("🔙 Назад", callback_data=f"fbi_monitor_{player_id}")]
+        [InlineKeyboardButton(text="📍 Текущее место", callback_data=f"fbi_current_location_{player_id}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data=f"fbi_monitor_{player_id}")]
     ]
     
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
     await callback.answer()
 
 
@@ -565,10 +629,10 @@ async def fbi_current_location(callback: CallbackQuery, state: FSMContext):
             lines.append(f"• {ts} — {src} — {peer}")
     text = "\n".join(lines)
     keyboard = [
-        [InlineKeyboardButton("🔄 Обновить", callback_data=f"fbi_current_location_{player_id}")],
-        [InlineKeyboardButton("🔙 Назад", callback_data=f"fbi_location_history_{player_id}")]
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"fbi_current_location_{player_id}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data=f"fbi_location_history_{player_id}")]
     ]
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
     await callback.answer()
 
 
@@ -604,16 +668,16 @@ async def fbi_special_operation(callback: CallbackQuery, state: FSMContext):
     )
     
     keyboard = [
-        [InlineKeyboardButton("🔓 Раскрыть", callback_data=f"fbi_op_expose_{player_id}")],
-        [InlineKeyboardButton("⚠️ Скандал", callback_data=f"fbi_op_scandal_{player_id}")],
-        [InlineKeyboardButton("👮 Арест", callback_data=f"fbi_op_arrest_{player_id}")],
-        [InlineKeyboardButton("🔒 Заморозить", callback_data=f"fbi_op_freeze_{player_id}")],
-        [InlineKeyboardButton("🤐 Шантаж", callback_data=f"fbi_op_blackmail_{player_id}")],
-        [InlineKeyboardButton("🔙 Назад", callback_data=f"fbi_monitor_{player_id}")]
+        [InlineKeyboardButton(text="🔓 Раскрыть", callback_data=f"fbi_op_expose_{player_id}")],
+        [InlineKeyboardButton(text="⚠️ Скандал", callback_data=f"fbi_op_scandal_{player_id}")],
+        [InlineKeyboardButton(text="👮 Арест", callback_data=f"fbi_op_arrest_{player_id}")],
+        [InlineKeyboardButton(text="🔒 Заморозить", callback_data=f"fbi_op_freeze_{player_id}")],
+        [InlineKeyboardButton(text="🤐 Шантаж", callback_data=f"fbi_op_blackmail_{player_id}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data=f"fbi_monitor_{player_id}")]
     ]
     
     await state.set_state(FBIStates.starting_operation)
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
     await callback.answer()
 
 
@@ -657,6 +721,9 @@ async def fbi_confirm_operation(callback: CallbackQuery, state: FSMContext):
         details.append(f"Δ налогового долга: {float(payload.get('delta_tax_debt') or 0):,.2f}")
     if payload.get("case_id"):
         details.append(f"Судебное дело: #{int(payload.get('case_id') or 0)}")
+    target_notice_text = str(payload.get("target_notice_text") or "").strip()
+    if ok and target_notice_text:
+        await _notify_user_safe(callback.bot, int(player_id), target_notice_text)
 
     if ok:
         lines = [
@@ -679,7 +746,7 @@ async def fbi_confirm_operation(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton("🔙 В ФБР", callback_data="fbi_menu")]]
+            inline_keyboard=[[InlineKeyboardButton(text="🔙 В ФБР", callback_data="fbi_menu")]]
         ),
         parse_mode="Markdown",
     )

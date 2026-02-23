@@ -10,6 +10,9 @@ class MainStates(StatesGroup):
     """Основные состояния бота"""
     main_menu = State()
     waiting_choice = State()
+    setting_nickname = State()
+    sending_gov_radio = State()
+    sending_president_appeal = State()
 
 
 class ElectionStates(StatesGroup):
@@ -48,6 +51,7 @@ class OrganizationStates(StatesGroup):
     approving_member = State()  # Одобрение члена
     setting_position = State()  # Установка должности
     org_chat_message = State()  # Установка должности
+    org_news_draft = State()  # Черновик новости организации
 
 
 class BusinessStates(StatesGroup):

@@ -3,12 +3,14 @@ main.py - точка входа Telegram-бота на aiogram 3.x (асинхр
 """
 
 import asyncio
+import json
 import logging
 import os
 import warnings
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from time import monotonic
 from typing import Any
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dotenv import load_dotenv
 
 # Подавляем предупреждение pydantic об aiogram
@@ -25,15 +27,18 @@ from aiogram.types import (
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.session.middlewares.base import BaseRequestMiddleware, NextRequestMiddlewareType
-from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter, TelegramServerError
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.methods.base import TelegramType
 
 # Импорт твоих модулей
 from database import db
 from middlewares import (
+    ActionBanMiddleware,
     EnsureUserMiddleware,
     GlobalLockMiddleware,
+    MandatoryNicknameMiddleware,
+    RateLimitMiddleware,
 )
 from handlers_part1 import router as main_router
 from handlers_part2 import router as handlers_part2_router
@@ -42,7 +47,7 @@ from feature_pack import router as feature_router
 from presidential_admin import router as presidential_router
 from fbi_intercept import router as fbi_router
 from revolutions import router as revolution_router
-from economy import run_daily_economy_cycle
+from economy import run_daily_economy_cycle, run_state_money_print_processor
 
 # Настройка логирования
 logging.basicConfig(
@@ -51,7 +56,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-load_dotenv()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(dotenv_path=os.path.join(BASE_DIR, ".env"))
 TOKEN = os.getenv("BOT_TOKEN")
 
 
@@ -63,6 +69,19 @@ def _read_float_env(name: str, default: float) -> float:
         return float(value)
     except ValueError:
         return default
+
+
+def _read_int_env(name: str, default: int, *, min_value: int | None = None) -> int:
+    value = (os.getenv(name) or "").strip()
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    if min_value is not None and parsed < min_value:
+        return default
+    return parsed
 
 
 def _read_admin_ids() -> set[int]:
@@ -80,7 +99,11 @@ BOT_ADMIN_IDS = _read_admin_ids()
 ADMIN_ENABLE_CODE = (os.getenv("ADMIN_ENABLE_CODE") or "MIRNASTAN01").strip().upper()
 ADMIN_DISABLE_CODE = (os.getenv("ADMIN_DISABLE_CODE") or "MIRNASTAN00").strip().upper()
 
-UZBEKISTAN_TZ = ZoneInfo("Asia/Tashkent")
+try:
+    UZBEKISTAN_TZ = ZoneInfo("Asia/Tashkent")
+except ZoneInfoNotFoundError:
+    logger.warning("tzdata не найдена, используем fallback UTC+5 для времени Узбекистана.")
+    UZBEKISTAN_TZ = timezone(timedelta(hours=5), name="UTC+5")
 WORK_START_HOUR = 8
 WORK_END_HOUR = 21
 SHUTDOWN_WARNING_HOUR = 20
@@ -90,23 +113,34 @@ runtime_state: dict[str, Any] = {
     "is_online": False,
     "force_online": False,
     "last_warning_date": None,
-    "last_hourly_news_key": None,
+    "last_media_news_slot": None,
 }
 session_startup_announced_groups: set[int] = set()
 session_offline_start_notified_groups: set[int] = set()
 
 STARTUP_TEXT = (
-    "🟢 Бот включился и работает.\n"
-    "🕗 Режим: 08:00-21:00 (UTC+5, Asia/Tashkent)."
+    "🟢 Мирнастан онлайн\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "Бот включился и готов к работе.\n"
+    "🕗 Режим: 08:00-21:00 (Asia/Tashkent, UTC+5)."
 )
 PROCESS_STARTED_OFFLINE_TEXT = (
-    "🛠 Бот запущен, но сейчас вне рабочего времени.\n"
-    "🕗 Режим: 08:00-21:00 (UTC+5, Asia/Tashkent)."
+    "🛠 Мирнастан запущен\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "Сейчас вне рабочего окна.\n"
+    "🕗 Режим: 08:00-21:00 (Asia/Tashkent, UTC+5)."
 )
 SHUTDOWN_WARNING_TEXT = (
-    "⚠️ Бот выключится через 10 минут.\n"
-    "⏰ Отключение в 21:00 по времени Узбекистана (UTC+5)."
+    "⚠️ Плановое отключение через 10 минут\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "⏰ Бот выключится в 21:00 (Asia/Tashkent, UTC+5)."
 )
+LOCAL_SERVER_ENABLED = os.getenv("LOCAL_SERVER_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+LOCAL_SERVER_HOST = os.getenv("LOCAL_SERVER_HOST", "127.0.0.1")
+LOCAL_SERVER_PORT = _read_int_env("LOCAL_SERVER_PORT", 8787, min_value=1)
+GROUP_ACTIVITY_SYNC_SECONDS = _read_float_env("GROUP_ACTIVITY_SYNC_SECONDS", 45.0)
+_group_sync_cache: dict[int, float] = {}
+_group_sync_cache_cleanup_at = 0.0
 
 
 def is_working_hours(now: datetime) -> bool:
@@ -120,6 +154,27 @@ def get_next_start_time(now: datetime) -> datetime:
     if now < today_start:
         return today_start
     return (now + timedelta(days=1)).replace(hour=WORK_START_HOUR, minute=0, second=0, microsecond=0)
+
+
+def should_sync_group_chat(chat_id: int) -> bool:
+    """Троттлинг апдейтов активности групп в БД, чтобы снизить лишнюю нагрузку."""
+    global _group_sync_cache_cleanup_at
+
+    now = monotonic()
+    safe_chat_id = int(chat_id)
+    last_sync = _group_sync_cache.get(safe_chat_id)
+    if last_sync is not None and (now - last_sync) < GROUP_ACTIVITY_SYNC_SECONDS:
+        return False
+    _group_sync_cache[safe_chat_id] = now
+
+    if len(_group_sync_cache) > 5000 and now > _group_sync_cache_cleanup_at:
+        cutoff = now - (GROUP_ACTIVITY_SYNC_SECONDS * 3)
+        stale_ids = [cid for cid, ts in _group_sync_cache.items() if ts < cutoff]
+        for cid in stale_ids:
+            _group_sync_cache.pop(cid, None)
+        _group_sync_cache_cleanup_at = now + 120
+
+    return True
 
 
 async def _is_activation_admin(message: Message) -> bool:
@@ -184,6 +239,92 @@ class TelegramRetryMiddleware(BaseRequestMiddleware):
                 await asyncio.sleep(wait_seconds)
 
 
+MOJIBAKE_WEIRD_CHARS = set("ЂЃ‚ѓ„…†‡€‰Љ‹ЊЌЋЏђ‘’“”•–—™љ›ќћџў")
+MOJIBAKE_TOKENS = ("рџ", "пё", "вЂ")
+
+
+def _looks_like_mojibake(text: str) -> bool:
+    if not text or not isinstance(text, str):
+        return False
+    if any(token in text for token in MOJIBAKE_TOKENS):
+        return True
+    if any(ch in MOJIBAKE_WEIRD_CHARS for ch in text):
+        return True
+    return False
+
+
+def _repair_mojibake(text: str) -> str:
+    if not _looks_like_mojibake(text):
+        return text
+
+    best = text
+    for source_encoding in ("cp1251", "latin1"):
+        try:
+            candidate = text.encode(source_encoding).decode("utf-8")
+        except UnicodeError:
+            continue
+        if not candidate:
+            continue
+        # Берем вариант только если он действительно устраняет "битые" паттерны.
+        if not _looks_like_mojibake(candidate):
+            return candidate
+        if len(candidate) >= len(best) and candidate.count("�") < best.count("�"):
+            best = candidate
+    return best
+
+
+class TextSanitizerRequestMiddleware(BaseRequestMiddleware):
+    """Чинит mojibake в исходящих методах Telegram API (текст и кнопки)."""
+
+    TEXT_ATTRS = ("text", "caption", "question", "explanation", "title", "message")
+
+    def _sanitize_markup(self, markup: Any) -> None:
+        if markup is None:
+            return
+        for attr in ("inline_keyboard", "keyboard"):
+            rows = getattr(markup, attr, None)
+            if not rows:
+                continue
+            for row in rows:
+                for button in row or []:
+                    label = getattr(button, "text", None)
+                    if not isinstance(label, str) or not label:
+                        continue
+                    fixed = _repair_mojibake(label)
+                    if fixed != label:
+                        try:
+                            button.text = fixed
+                        except Exception:
+                            pass
+
+    def _sanitize_method(self, method: Any) -> None:
+        for attr in self.TEXT_ATTRS:
+            value = getattr(method, attr, None)
+            if not isinstance(value, str) or not value:
+                continue
+            fixed = _repair_mojibake(value)
+            if fixed != value:
+                try:
+                    setattr(method, attr, fixed)
+                except Exception:
+                    pass
+
+        self._sanitize_markup(getattr(method, "reply_markup", None))
+
+    async def __call__(
+        self,
+        make_request: NextRequestMiddlewareType[TelegramType],
+        bot: Bot,
+        method,
+    ):
+        try:
+            self._sanitize_method(method)
+        except Exception:
+            # Санитайзер не должен ломать отправку.
+            logger.exception("Ошибка санитайзера текста в методе %s", type(method).__name__)
+        return await make_request(bot, method)
+
+
 class TransientTelegramErrorMiddleware(BaseMiddleware):
     """Не даем временным сетевым ошибкам разваливать обработку update."""
 
@@ -192,6 +333,25 @@ class TransientTelegramErrorMiddleware(BaseMiddleware):
             return await handler(event, data)
         except (TelegramNetworkError, TelegramServerError) as exc:
             logger.warning("Временная ошибка Telegram API во время обработки update: %s", exc)
+            return None
+        except TelegramBadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                return None
+            raise
+        except Exception:
+            logger.exception("Необработанная ошибка в обработчике update")
+            if isinstance(event, CallbackQuery):
+                try:
+                    await event.answer("⚠️ Внутренняя ошибка. Нажмите кнопку еще раз или /start.", show_alert=True)
+                except Exception:
+                    pass
+                return None
+            if isinstance(event, Message):
+                try:
+                    await event.answer("⚠️ Внутренняя ошибка. Повторите действие позже или откройте /start.")
+                except Exception:
+                    pass
+                return None
             return None
 
 
@@ -245,11 +405,12 @@ class WorkingHoursMiddleware(BaseMiddleware):
         if isinstance(event, Message):
             if event.chat.type in {"group", "supergroup"}:
                 # Даже вне рабочего окна обновляем реестр групп, чтобы утренние рассылки работали.
-                await db.upsert_bot_chat(
-                    chat_id=event.chat.id,
-                    chat_type=event.chat.type,
-                    title=event.chat.title or "",
-                )
+                if should_sync_group_chat(event.chat.id):
+                    await db.upsert_bot_chat(
+                        chat_id=event.chat.id,
+                        chat_type=event.chat.type,
+                        title=event.chat.title or "",
+                    )
                 if event.chat.id not in session_offline_start_notified_groups:
                     try:
                         await event.bot.send_message(event.chat.id, PROCESS_STARTED_OFFLINE_TEXT, parse_mode=None)
@@ -312,11 +473,12 @@ async def track_group_activity(message: Message):
     Обновляем реестр групп при активности.
     Это помогает сохранить список чатов даже при редких my_chat_member update.
     """
-    await db.upsert_bot_chat(
-        chat_id=message.chat.id,
-        chat_type=message.chat.type,
-        title=message.chat.title or "",
-    )
+    if should_sync_group_chat(message.chat.id):
+        await db.upsert_bot_chat(
+            chat_id=message.chat.id,
+            chat_type=message.chat.type,
+            title=message.chat.title or "",
+        )
     if runtime_state.get("is_online") and message.chat.id not in session_startup_announced_groups:
         try:
             await message.bot.send_message(message.chat.id, STARTUP_TEXT, parse_mode=None)
@@ -395,44 +557,138 @@ async def run_work_hours_controller(bot: Bot, state: dict[str, Any]):
         await asyncio.sleep(5)
 
 
-async def run_hourly_media_news(bot: Bot, state: dict[str, Any]):
-    """Раз в час генерирует новость СМИ и рассылает ее в активные группы."""
+def _media_news_slot_key(now: datetime, *, period_minutes: int = 10) -> str:
+    safe_period = max(1, int(period_minutes or 10))
+    slot_minute = (now.minute // safe_period) * safe_period
+    return now.strftime("%Y-%m-%d %H:") + f"{slot_minute:02d}"
+
+
+async def run_media_news_digest(bot: Bot, state: dict[str, Any], period_minutes: int = 10):
+    """Генерирует и рассылает СМИ-новость раз в N минут (по умолчанию 10)."""
+    safe_period = max(1, int(period_minutes or 10))
+    state_key = "last_media_news_slot"
+    persisted_state_key = "media_last_news_slot"
     while True:
         try:
             now = datetime.now(UZBEKISTAN_TZ)
-            key = now.strftime("%Y-%m-%d %H")
-            last_key = state.get("last_hourly_news_key")
+            key = _media_news_slot_key(now, period_minutes=safe_period)
+            last_key = state.get(state_key)
             if last_key is None:
-                persisted_key = await db.get_system_state("media_last_hourly_news_key")
-                state["last_hourly_news_key"] = persisted_key or ""
-                last_key = state["last_hourly_news_key"]
+                persisted_key = await db.get_system_state(persisted_state_key)
+                if not persisted_key:
+                    # Fallback со старого hourly-ключа (для плавной миграции).
+                    persisted_key = await db.get_system_state("media_last_hourly_news_key")
+                state[state_key] = persisted_key or ""
+                last_key = state[state_key]
             if (
                 state.get("is_online")
                 and last_key != key
             ):
                 news = await db.generate_hourly_news()
                 if news:
+                    created = str(news.get("created_date") or "")
+                    created_short = created[11:16] if len(created) >= 16 else "сейчас"
+                    severity = str(news.get("severity") or "normal").strip().lower()
+                    severity_label = {
+                        "critical": "🔥 критично",
+                        "high": "⚠️ важное",
+                        "hot": "📣 горячее",
+                    }.get(severity, "🟢 обычное")
+                    source = str(news.get("source_name") or "").strip()
                     text = (
-                        "📰 НОВОСТИ СМИ\n"
+                        "📰 ЛЕНТА СМИ MIRNASTAN\n"
                         "━━━━━━━━━━━━━━━━━━━━\n"
-                        f"{news.get('title')}\n\n"
-                        f"{news.get('body')}"
+                        f"🕙 {created_short} | {severity_label}\n\n"
+                        f"Заголовок: {news.get('title')}\n\n"
+                        f"{news.get('body')}\n"
+                        + (f"\nИсточник: {source}" if source else "")
                     )
                     await broadcast_to_active_groups(bot, text)
-                    state["last_hourly_news_key"] = key
-                    await db.set_system_state("media_last_hourly_news_key", key)
+                    state[state_key] = key
+                    await db.set_system_state(persisted_state_key, key)
         except Exception:
-            logger.exception("Ошибка в задаче почасовых новостей")
-        await asyncio.sleep(20)
+            logger.exception("Ошибка в задаче новостей СМИ")
+        await asyncio.sleep(15)
+
+
+async def run_local_health_server(state: dict[str, Any]):
+    """Локальный HTTP health endpoint для мониторинга процесса."""
+    async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        try:
+            # Читаем только заголовки запроса; содержимое не требуется.
+            try:
+                await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=2.0)
+            except Exception:
+                pass
+
+            now = datetime.now(UZBEKISTAN_TZ)
+            payload = {
+                "status": "ok",
+                "time_uz": now.isoformat(),
+                "is_online": bool(state.get("is_online")),
+                "work_window": f"{WORK_START_HOUR:02d}:00-{WORK_END_HOUR:02d}:00",
+            }
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            headers = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/json; charset=utf-8\r\n"
+                + f"Content-Length: {len(body)}\r\n".encode("ascii")
+                + b"Connection: close\r\n\r\n"
+            )
+            writer.write(headers + body)
+            await writer.drain()
+        except Exception:
+            logger.exception("Ошибка обработки запроса локального сервера")
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    try:
+        server = await asyncio.start_server(_handle_client, host=LOCAL_SERVER_HOST, port=LOCAL_SERVER_PORT)
+    except Exception:
+        logger.exception("Не удалось запустить локальный сервер %s:%s", LOCAL_SERVER_HOST, LOCAL_SERVER_PORT)
+        return
+
+    sockets = ", ".join(str(sock.getsockname()) for sock in (server.sockets or []))
+    logger.info("Локальный сервер здоровья запущен: %s", sockets or f"{LOCAL_SERVER_HOST}:{LOCAL_SERVER_PORT}")
+    async with server:
+        await server.serve_forever()
 
 async def init_default_data():
     """Инициализировать данные по умолчанию"""
     logger.info("Инициализация БД...")
     await db.init_db()
     await db.init_default_organizations()
+    normalized = await db.normalize_organization_budgets(minimum_budget=0.0)
+    if int(normalized.get("updated_count") or 0) > 0:
+        logger.warning(
+            "Нормализованы бюджеты организаций: count=%s min=%s",
+            normalized.get("updated_count"),
+            normalized.get("minimum_budget"),
+        )
     await db.bootstrap_world_data()
+    rebalance = await db.apply_currency_rebalance_once()
+    if rebalance.get("applied"):
+        logger.info(
+            "Валютный ребаланс применен: factor=%s tables=%s columns=%s users_reset=%s",
+            rebalance.get("factor"),
+            rebalance.get("scaled_tables"),
+            rebalance.get("scaled_columns"),
+            rebalance.get("users_reset"),
+        )
+
+    gov_floor = await db.ensure_government_budget_floor(minimum_budget=10_000_000.0)
+    if gov_floor.get("updated"):
+        logger.warning(
+            "Госбюджет скорректирован до минимума: old=$%.2f new=$%.2f",
+            float(gov_floor.get("old_budget") or 0),
+            float(gov_floor.get("new_budget") or 0),
+        )
     
-    election_id = await db.ensure_presidential_election(duration_hours=30)
+    election_id = await db.ensure_presidential_election(duration_hours=15)
     if election_id:
         logger.info(f"Активированы президентские выборы (ID {election_id})")
 
@@ -442,15 +698,24 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="start", description="🎮 Начать игру"),
         BotCommand(command="menu", description="🏛️ Главное меню"),
         BotCommand(command="profile", description="👤 Мой профиль"),
+        BotCommand(command="nick", description="✏️ Изменить персональный ник"),
+        BotCommand(command="ai", description="🤖 AI-ассистент"),
+        BotCommand(command="radio", description="📡 Гос-рация"),
         BotCommand(command="orgs", description="🏛️ Организации"),
         BotCommand(command="biz", description="🏢 Бизнес"),
         BotCommand(command="work", description="💼 Работа и подработки"),
+        BotCommand(command="tax", description="🧾 Налоги за день"),
         BotCommand(command="edu", description="🎓 Образование"),
         BotCommand(command="prop", description="🏠 Недвижимость"),
         BotCommand(command="priv", description="🏢 Частные организации"),
         BotCommand(command="gang", description="🕶️ Банды"),
         BotCommand(command="market", description="📣 Городская площадка"),
+        BotCommand(command="ref", description="👥 Рефералы и маркетинг"),
+        BotCommand(command="builder", description="🏗️ Панель застройщика"),
+        BotCommand(command="stocks", description="📈 Акции и биржа"),
+        BotCommand(command="fun", description="🎪 Сюжетное событие"),
         BotCommand(command="casino", description="🎰 Казино"),
+        BotCommand(command="duel", description="🎲 Дуэль в группе (reply)"),
         BotCommand(command="news", description="📰 Новости СМИ"),
         BotCommand(command="id", description="🆔 Мой ID"),
     ]
@@ -473,6 +738,7 @@ async def main():
     
     # 2. Настройка бота
     session = AiohttpSession(timeout=TELEGRAM_REQUEST_TIMEOUT)
+    session.middleware(TextSanitizerRequestMiddleware())
     session.middleware(TelegramRetryMiddleware(retries=2, base_delay=1.0))
     bot = Bot(
         token=TOKEN,
@@ -490,12 +756,16 @@ async def main():
     # 3. Регистрация Middleware (Важен порядок!)
     dp.message.middleware(TransientTelegramErrorMiddleware())
     dp.callback_query.middleware(TransientTelegramErrorMiddleware())
+    # Сначала ограничиваем спам, чтобы не нагружать БД и обработчики лишними апдейтами.
+    dp.message.middleware(RateLimitMiddleware(calls=8, period=2.0, callback_calls=12, callback_period=2.0))
+    dp.callback_query.middleware(RateLimitMiddleware(calls=8, period=2.0, callback_calls=12, callback_period=2.0))
     dp.message.middleware(EnsureUserMiddleware())
     dp.callback_query.middleware(EnsureUserMiddleware())
     dp.message.middleware(WorkingHoursMiddleware(runtime_state))
     dp.callback_query.middleware(WorkingHoursMiddleware(runtime_state))
+    dp.message.middleware(MandatoryNicknameMiddleware())
+    dp.callback_query.middleware(MandatoryNicknameMiddleware())
     # Middleware, блокирующий пользователей с active action_banned_until
-    from middlewares import ActionBanMiddleware
     dp.message.middleware(ActionBanMiddleware())
     dp.callback_query.middleware(ActionBanMiddleware())
     # Global lock for election mode
@@ -526,14 +796,17 @@ async def main():
         session_offline_start_notified_groups.update(sent_ids)
     asyncio.create_task(run_work_hours_controller(bot, runtime_state))
     asyncio.create_task(run_daily_economy_cycle(bot))
-    asyncio.create_task(run_hourly_media_news(bot, runtime_state))
+    asyncio.create_task(run_state_money_print_processor(bot))
+    asyncio.create_task(run_media_news_digest(bot, runtime_state, period_minutes=10))
+    if LOCAL_SERVER_ENABLED:
+        asyncio.create_task(run_local_health_server(runtime_state))
     # Фоновое обслуживание выборов
     async def run_election_maintenance(bot: Bot):
         """Проверяет и поддерживает президентские выборы."""
         while True:
             try:
                 # Если президента нет — гарантируем существование активных выборов
-                await db.ensure_presidential_election(duration_hours=30)
+                await db.ensure_presidential_election(duration_hours=15)
 
                 # Автоматически синхронизируем этапы активных выборов по времени
                 stage_changes = await db.sync_active_election_stages()

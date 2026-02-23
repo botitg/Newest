@@ -8753,8 +8753,8 @@ async def government_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     keyboard = [
-        [InlineKeyboardButton("�️ ВЫБОРЫ ПРЕЗИДЕНТА", callback_data="elections_vote")],
-        [InlineKeyboardButton("�📣 Активные революции", callback_data="revolutions_list")],
+        [InlineKeyboardButton("🗳️ ВЫБОРЫ ПРЕЗИДЕНТА", callback_data="elections_vote")],
+        [InlineKeyboardButton("📣 Активные революции", callback_data="revolutions_list")],
         [InlineKeyboardButton("🚩 Начать восстание", callback_data="start_revolution")],
     ]
     
