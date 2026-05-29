@@ -256,18 +256,17 @@ STARTUP_TEXT = (
     "🟢 Мирнастан онлайн\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
     "Бот включился и готов к работе.\n"
-    "🕗 Режим: 08:00-21:00 (Asia/Tashkent, UTC+5)."
+    "🕗 Режим: 24/7 (Asia/Tashkent, UTC+5)."
 )
 PROCESS_STARTED_OFFLINE_TEXT = (
     "🛠 Мирнастан запущен\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
-    "Сейчас вне рабочего окна.\n"
-    "🕗 Режим: 08:00-21:00 (Asia/Tashkent, UTC+5)."
+    "Бот работает 24/7 и готов к взаимодействию."
 )
 SHUTDOWN_WARNING_TEXT = (
-    "⚠️ Плановое отключение через 10 минут\n"
+    "⚠️ Внимание\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
-    "⏰ Бот выключится в 21:00 (Asia/Tashkent, UTC+5)."
+    "Бот работает 24/7 и не планируется к отключению."
 )
 MEDIA_NEWS_GROUP_BROADCAST_ENABLED = os.getenv("MEDIA_NEWS_GROUP_BROADCAST_ENABLED", "0").strip().lower() in {
     "1",
@@ -577,15 +576,13 @@ class WorkingHoursMiddleware(BaseMiddleware):
                 return
             if event.chat.type == "private":
                 await event.answer(
-                    "⏸ Бот сейчас выключен.\n"
-                    "Рабочее время: 08:00-21:00 (UTC+5, Asia/Tashkent).\n"
-                    f"Следующее включение: {next_start:%d.%m %H:%M}"
+                    "⏸ Бот временно недоступен. Попробуйте позже."
                 )
             return
 
         if isinstance(event, CallbackQuery):
             await event.answer(
-                f"⏸ Бот выключен. Включится в {next_start:%H:%M} (Asia/Tashkent).",
+                "⏸ Бот временно недоступен. Попробуйте позже.",
                 show_alert=True,
             )
             return
@@ -970,9 +967,10 @@ async def main() -> int:
         dp = Dispatcher(storage=MemoryStorage())
 
         # Инициализация состояния рабочего времени при старте процесса
+        # По умолчанию включаем принудительный 24/7 режим (убираем расписание).
         now_uz = datetime.now(UZBEKISTAN_TZ)
-        runtime_state["is_online"] = is_working_hours(now_uz)
-        runtime_state["force_online"] = False
+        runtime_state["is_online"] = True
+        runtime_state["force_online"] = True
         runtime_state["last_warning_date"] = None
         
         # 3. Регистрация Middleware (Важен порядок!)
