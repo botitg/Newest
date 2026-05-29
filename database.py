@@ -1,30 +1,182 @@
-﻿"""
+"""
 Асинхронная база данных на aiosqlite для нового Telegram-бота (aiogram 3.x)
 Все операции async/await, никаких блокировок
 """
 
 import aiosqlite
-import asyncio
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 import sqlite3
 import random
 import os
 import re
+import json
 
 DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state_game_async.db")
+SQLITE_CONNECT_TIMEOUT_SECONDS = max(0.2, float(os.getenv("SQLITE_CONNECT_TIMEOUT_SECONDS", "1.3")))
+SQLITE_BUSY_TIMEOUT_MS = max(200, int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "1300")))
 
 # Экономические параметры
-DAILY_CITIZEN_TAX_RATE = 0.0035
+DAILY_CITIZEN_TAX_RATE = 0.004
 DAILY_MIN_CITIZEN_TAX = 3.0
-DAILY_PROPERTY_TAX_RATE = 0.00025
+DAILY_PROPERTY_TAX_RATE = 0.003
 DAILY_BUSINESS_TAX_RATE = 0.001
 DAILY_PRIVATE_ORG_TAX_RATE = 0.0015
-DAILY_LOAN_PENALTY_RATE = 0.01
-BUSINESS_EQUIP_BASE_COST = 2500.0
+DAILY_LOAN_PENALTY_RATE = 0.007
+TAX_NONPAYMENT_PENALTY_RATE = 0.015
+TOTAL_ASSET_DAILY_TAX_RATE = 0.15
+BUSINESS_EQUIP_BASE_COST = 3800.0
 PRIVATE_ORG_EQUIP_MULTIPLIER = 5.0
+JOB_SALARY_MULTIPLIER = 2.1
+MIN_CITIZEN_HOURLY_SALARY = 1200.0
+FAMILY_DAILY_MARRIAGE_EXPENSE = 85_000.0
+FAMILY_DAILY_MIN_TOTAL_EXPENSE = 100_000.0
+FAMILY_DAILY_PET_EXPENSE = 260.0
+PET_ADOPTION_FEE = 1500.0
+MARRIAGE_PROPOSAL_TTL_MINUTES = 5
+CASINO_TURNOVER_GOV_RATE = 0.02
+MONEY_CIRCULATION_GOV_SHARE = 0.12
+MONEY_CIRCULATION_TAX_SHARE = 0.03
+RELATIONSHIP_MAX_LEVEL = 25
+RELATIONSHIP_POINTS_PER_LEVEL = 120
+RELATIONSHIP_LEVEL_DAILY_EXPENSE_STEP = 0.05
+RELATIONSHIP_POINT_CAP = (RELATIONSHIP_MAX_LEVEL - 1) * RELATIONSHIP_POINTS_PER_LEVEL
+MAX_PUNISHMENT_MINUTES = 45
+MIN_PUNISHMENT_MINUTES = 15
+SECURITY_INVESTIGATION_ACCESS_MINUTES = 24 * 60
+SECURITY_INVESTIGATION_CONFIG: Dict[str, Dict[str, int | float]] = {
+    "police": {
+        "cost": 400_000.0,
+        "duration_minutes": 4 * 60,
+    },
+    "fbi": {
+        "cost": 1_500_000.0,
+        "duration_minutes": 8 * 60,
+    },
+}
+RELATIONSHIP_ACTIONS: Dict[str, Dict[str, Any]] = {
+    "gift_small": {
+        "title": "Подарок",
+        "cost": 4000.0,
+        "points": 45,
+        "description": "Небольшой подарок партнеру",
+    },
+    "date_night": {
+        "title": "Свидание",
+        "cost": 18000.0,
+        "points": 165,
+        "description": "Романтический вечер в ресторане и прогулка",
+    },
+    "weekend_trip": {
+        "title": "Поездка",
+        "cost": 60000.0,
+        "points": 520,
+        "description": "Поездка на выходные с улучшением отношений",
+    },
+    "resort_vacation": {
+        "title": "Курорт",
+        "cost": 140000.0,
+        "points": 820,
+        "description": "Большой отпуск на курорте для пары",
+    },
+}
+
+SLOT_SYMBOLS: tuple[str, str, str, str] = ("CHERRY", "LEMON", "BELL", "SEVEN")
+ROULETTE_RED_NUMBERS: set[int] = {
+    1, 3, 5, 7, 9,
+    12, 14, 16, 18,
+    19, 21, 23, 25, 27,
+    30, 32, 34, 36,
+}
+
+# Дифференцированная налоговая модель (дневной цикл):
+# - фиксированный "бытовой" налог зависит от суммарного капитала;
+# - работа/ликвидность/частные организации — прогрессивные ставки;
+# - недвижимость и бизнес — ставки зависят от типа актива.
+LIVING_TAX_BY_NET_WORTH_TIERS: list[tuple[float, float]] = [
+    (25_000.0, 750.0),
+    (120_000.0, 1_500.0),
+    (500_000.0, 2_800.0),
+    (2_000_000.0, 4_200.0),
+    (float("inf"), 6_200.0),
+]
+WORK_TAX_RATE_TIERS: list[tuple[float, float]] = [
+    (1_500.0, 0.12),
+    (4_000.0, 0.18),
+    (10_000.0, 0.24),
+    (float("inf"), 0.30),
+]
+LIQUID_ASSET_TAX_RATE_TIERS: list[tuple[float, float]] = [
+    (40_000.0, 0.0008),
+    (200_000.0, 0.0016),
+    (float("inf"), 0.0026),
+]
+PRIVATE_ORG_TAX_RATE_TIERS: list[tuple[float, float]] = [
+    (120_000.0, 0.0022),
+    (500_000.0, 0.0035),
+    (float("inf"), 0.0050),
+]
+PROPERTY_CATEGORY_TAX_RATES: Dict[str, float] = {
+    "residential": 0.0015,
+    "commercial": 0.0025,
+    "industrial": 0.0032,
+}
+PROPERTY_DEFAULT_TAX_RATE = 0.0022
+STOCK_PORTFOLIO_DAILY_TAX_RATE = 0.0018
+GANG_ASSET_DAILY_TAX_RATE = 0.0045
 
 INVISIBLE_NAME_CHARS = ("\u200b", "\u200c", "\u200d", "\ufeff", "\u2060", "\u00ad")
+PROMO_USER_FIELD_ALIASES: Dict[str, str] = {
+    "shadow": "shadow_balance",
+    "shadow_balance": "shadow_balance",
+    "rep": "reputation",
+    "reputation": "reputation",
+    "edu": "education",
+    "education": "education",
+    "exp": "experience",
+    "experience": "experience",
+    "lvl": "level",
+    "level": "level",
+    "hp": "health",
+    "health": "health",
+    "happiness": "happiness",
+    "hunger": "hunger",
+    "balance": "balance",
+    "bank": "bank",
+    "cash": "cash",
+    "tax_debt": "tax_debt",
+    "citizen_salary": "citizen_salary",
+    "corruption": "corruption_score",
+    "corruption_score": "corruption_score",
+    "referral_earnings": "referral_earnings",
+    "marketing_level": "marketing_level",
+}
+PROMO_USER_FIELDS: set[str] = {
+    "balance",
+    "bank",
+    "cash",
+    "shadow_balance",
+    "reputation",
+    "education",
+    "experience",
+    "level",
+    "health",
+    "happiness",
+    "hunger",
+    "tax_debt",
+    "citizen_salary",
+    "corruption_score",
+    "referral_earnings",
+    "marketing_level",
+}
+
+
+def _normalize_promocode_code(raw_code: str, max_len: int = 32) -> str:
+    raw = str(raw_code or "").strip().upper()
+    if not raw:
+        return ""
+    cleaned = "".join(ch for ch in raw if ch.isalnum() or ch in {"_", "-", "."})
+    return cleaned[:max_len]
 
 JOB_CATALOG: List[Dict[str, Any]] = [
     {
@@ -125,6 +277,229 @@ JOB_CATALOG: List[Dict[str, Any]] = [
     },
 ]
 
+# Актуальный каталог поверх старых строк с битой кодировкой. Вакансии ниже
+# используются во всех меню, заявках и рабочих сменах.
+JOB_CATALOG = [
+    {
+        "code": "cleaner",
+        "title": "Городской санитар",
+        "salary": 220.0,
+        "edu_required": 1,
+        "rep_required": 0.0,
+        "department": "Коммунальная служба",
+        "description": "Стартовая работа: порядок в городе, чистые улицы и первые полезные связи.",
+        "impact": "Поднимает репутацию через регулярные смены и открывает путь в муниципальные роли.",
+        "shift_events": [
+            "Вы закрыли жалобу жителей на мусорный двор и получили благодарность района.",
+            "Нашли потерянный документ и передали его в мэрию.",
+            "После смены город выглядит так, будто им наконец кто-то занимается.",
+        ],
+    },
+    {
+        "code": "loader",
+        "title": "Складской логист",
+        "salary": 300.0,
+        "edu_required": 1,
+        "rep_required": 4.0,
+        "department": "Городская логистика",
+        "description": "Принимает поставки для бизнесов, больницы и госслужб.",
+        "impact": "Связывает работу с рынком, бизнесом и больницей.",
+        "shift_events": [
+            "Вы спасли поставку лекарств от вечного статуса 'уже едет'.",
+            "Сверили накладные, поймали недостачу и не дали складу стать легендой.",
+            "Бизнесы получили товар вовремя, а вы получили уважение людей с тележками.",
+        ],
+    },
+    {
+        "code": "driver",
+        "title": "Городской водитель",
+        "salary": 410.0,
+        "edu_required": 2,
+        "rep_required": 10.0,
+        "department": "Транспорт",
+        "description": "Перевозит людей, документы и важные грузы между организациями.",
+        "impact": "Помогает госорганам и частному сектору работать без простоя.",
+        "shift_events": [
+            "Доставили срочные бумаги в суд за минуту до закрытия окна.",
+            "Развезли сотрудников по районам и не потеряли ни одного министра.",
+            "Объехали пробку так красиво, что навигатор сделал вид, будто это он придумал.",
+        ],
+    },
+    {
+        "code": "clerk",
+        "title": "Муниципальный клерк",
+        "salary": 360.0,
+        "edu_required": 2,
+        "rep_required": 12.0,
+        "department": "Правительство",
+        "description": "Оформляет заявления, заявки, справки и письма граждан.",
+        "impact": "Полезная ступень к правительству, суду и налоговой.",
+        "shift_events": [
+            "Разобрали очередь заявлений и нашли форму, которую никто не видел с прошлой эпохи.",
+            "Помогли новичку понять, куда нажимать, и предотвратили административный кризис.",
+            "Починили реестр заявок. Мирнастан стал на один файл аккуратнее.",
+        ],
+    },
+    {
+        "code": "dispatcher",
+        "title": "Диспетчер служб",
+        "salary": 470.0,
+        "edu_required": 2,
+        "rep_required": 14.0,
+        "department": "Координация",
+        "description": "Связывает полицию, больницу, банк и коммунальные службы.",
+        "impact": "Учит видеть систему целиком и готовит к управленческим должностям.",
+        "shift_events": [
+            "Состыковали полицию и больницу без десяти лишних сообщений.",
+            "Развели три заявки по нужным отделам и не дали им утонуть в чате.",
+            "Смена прошла спокойно, потому что вы успели до того, как все стало срочным.",
+        ],
+    },
+    {
+        "code": "tech_support",
+        "title": "Техподдержка госуслуг",
+        "salary": 520.0,
+        "edu_required": 3,
+        "rep_required": 16.0,
+        "department": "Цифровые сервисы",
+        "description": "Помогает игрокам, организациям и бизнесам не ломаться об интерфейсы.",
+        "impact": "Дает базу для аналитики, банка и медиа.",
+        "shift_events": [
+            "Объяснили пользователю, что кнопка 'Назад' не является заговором государства.",
+            "Починили заявку, которая выглядела как древнее заклинание из символов.",
+            "Сервис ожил, игроки выдохнули, вы сделали вид, что так и было задумано.",
+        ],
+    },
+    {
+        "code": "medic_assistant",
+        "title": "Фельдшер",
+        "salary": 520.0,
+        "edu_required": 3,
+        "rep_required": 18.0,
+        "department": "Больница",
+        "description": "Помогает лечить травмы и удерживает город от медицинского хаоса.",
+        "impact": "Полезен больнице, полиции и всем слишком смелым игрокам.",
+        "shift_events": [
+            "Приняли пациента после неудачной авантюры. Пациент утверждает, что так и планировал.",
+            "Навели порядок в карте лечения и спасли врача от бумажного обвала.",
+            "Смена тяжелая, зато город стал чуть живее в буквальном смысле.",
+        ],
+    },
+    {
+        "code": "officer",
+        "title": "Патрульный офицер",
+        "salary": 560.0,
+        "edu_required": 3,
+        "rep_required": 22.0,
+        "department": "Полиция",
+        "description": "Следит за порядком, помогает расследованиям и передает дела в суд.",
+        "impact": "Делает полицию нужной: штрафы, задержания, безопасность и репутация закона.",
+        "shift_events": [
+            "Разрулили спор без суда. Судьи где-то тихо поставили вам лайк.",
+            "Проверили район и нашли схему, которую теперь изучит ФБР.",
+            "Патруль прошел без лишнего героизма. Иногда это лучший результат.",
+        ],
+    },
+    {
+        "code": "bank_operator",
+        "title": "Банковский операционист",
+        "salary": 590.0,
+        "edu_required": 3,
+        "rep_required": 23.0,
+        "department": "Банк",
+        "description": "Ведет счета, переводы и помогает игрокам не хранить все под матрасом.",
+        "impact": "Связывает депозиты, переводы, комиссии и кредитную историю.",
+        "shift_events": [
+            "Провели сверку переводов и нашли комиссию, которая уже готовилась потеряться.",
+            "Объяснили клиенту сложный процент без магии и угроз калькулятору.",
+            "Операционный день закрыт, баланс сошелся, банк дышит ровно.",
+        ],
+    },
+    {
+        "code": "credit_manager",
+        "title": "Кредитный менеджер",
+        "salary": 650.0,
+        "edu_required": 4,
+        "rep_required": 28.0,
+        "department": "Банк",
+        "description": "Оценивает заявки, риски и решает, кому можно доверить деньги банка.",
+        "impact": "Делает банкиров важными: ручное одобрение кредитов и контроль дефолтов.",
+        "shift_events": [
+            "Проверили кредитную заявку и заметили долг, который очень хотел быть невидимым.",
+            "Собрали скоринг клиента: репутация, образование, долги. Банк любит цифры.",
+            "Одобрили аккуратный заем и не дали бюджету банка уйти в приключение.",
+        ],
+    },
+    {
+        "code": "accountant",
+        "title": "Муниципальный бухгалтер",
+        "salary": 610.0,
+        "edu_required": 3,
+        "rep_required": 24.0,
+        "department": "Финансы",
+        "description": "Сверяет бюджеты, зарплаты, налоги и выплаты организаций.",
+        "impact": "Без бухгалтерии деньги быстро становятся слухами.",
+        "shift_events": [
+            "Сверили ведомости зарплат. Один ноль пытался сбежать, но вы его поймали.",
+            "Нашли ошибку в бюджете и сохранили организации приличную сумму.",
+            "Отчет сдан, финансы чистые, министр финансов может моргнуть.",
+        ],
+    },
+    {
+        "code": "inspector",
+        "title": "Налоговый инспектор",
+        "salary": 660.0,
+        "edu_required": 4,
+        "rep_required": 28.0,
+        "department": "Налоговая служба",
+        "description": "Проверяет долги, бизнес-отчеты и помогает бюджету не голодать.",
+        "impact": "Нужен для налогов, льгот, взысканий и честной экономики.",
+        "shift_events": [
+            "Проверили отчет бизнеса и нашли не ошибку, а творческую бухгалтерию.",
+            "Собрали часть долгов без драмы. Почти дипломатия, только с квитанцией.",
+            "Налоговый реестр обновлен. Бюджет благодарно шуршит.",
+        ],
+    },
+    {
+        "code": "analyst",
+        "title": "Госаналитик",
+        "salary": 700.0,
+        "edu_required": 4,
+        "rep_required": 30.0,
+        "department": "Правительство",
+        "description": "Собирает данные по экономике, организациям, рынку и рискам страны.",
+        "impact": "Готовит к министерским и президентским ролям через цифры и решения.",
+        "shift_events": [
+            "Собрали доклад по экономике и сделали его короче, чем список проблем.",
+            "Поймали тренд до того, как он стал кризисом. Аналитика любит тишину.",
+            "Сценарный расчет показал: паниковать рано, но таблицу лучше открыть.",
+        ],
+    },
+    {
+        "code": "judge_assistant",
+        "title": "Помощник суда",
+        "salary": 820.0,
+        "edu_required": 5,
+        "rep_required": 38.0,
+        "department": "Суд",
+        "description": "Готовит дела, доказательства и проекты решений для судебной системы.",
+        "impact": "Связывает полицию, ФБР, штрафы, апелляции и законность власти.",
+        "shift_events": [
+            "Собрали материалы дела так аккуратно, что даже хаос попросил копию.",
+            "Подготовили заседание и нашли доказательство, которое спряталось в примечаниях.",
+            "Судебный день пережит. Закон снова выглядит как система, а не как настроение.",
+        ],
+    },
+]
+
+for _job_item in JOB_CATALOG:
+    scaled_salary = float(_job_item.get("salary") or 0.0) * JOB_SALARY_MULTIPLIER
+    _job_item["salary"] = round(max(MIN_CITIZEN_HOURLY_SALARY, scaled_salary), 2)
+    base_edu = int(_job_item.get("edu_required") or 1)
+    base_rep = float(_job_item.get("rep_required") or 0.0)
+    _job_item["edu_required"] = max(1, min(12, base_edu + 1))
+    _job_item["rep_required"] = round(max(0.0, min(100.0, base_rep * 1.35 + 2.0)), 1)
+
 STOCK_EXCHANGE_ASSETS: List[Dict[str, Any]] = [
     {"symbol": "MRTB", "name": "MirnaTech", "price": 180.0, "volatility": 0.045, "trend": 0.0018},
     {"symbol": "MRBN", "name": "MirnaBank", "price": 140.0, "volatility": 0.03, "trend": 0.0012},
@@ -144,6 +519,45 @@ def _parse_iso_datetime(value: Any) -> Optional[datetime]:
         return datetime.fromisoformat(raw)
     except Exception:
         return None
+
+
+def _parse_iso_date(value: Any):
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw[:10]).date()
+    except Exception:
+        return None
+
+
+def _relationship_snapshot(points: Any) -> Dict[str, Any]:
+    safe_points = max(0, int(points or 0))
+    capped_points = min(RELATIONSHIP_POINT_CAP, safe_points)
+    level = min(
+        RELATIONSHIP_MAX_LEVEL,
+        int(capped_points // RELATIONSHIP_POINTS_PER_LEVEL) + 1,
+    )
+    level_floor = (level - 1) * RELATIONSHIP_POINTS_PER_LEVEL
+    next_level_threshold = (
+        None
+        if level >= RELATIONSHIP_MAX_LEVEL
+        else level * RELATIONSHIP_POINTS_PER_LEVEL
+    )
+    progress_points = max(0, capped_points - level_floor)
+    points_to_next = 0 if next_level_threshold is None else max(0, next_level_threshold - capped_points)
+    progress_total = 1 if next_level_threshold is None else RELATIONSHIP_POINTS_PER_LEVEL
+    progress_pct = round(100.0 * (progress_points / progress_total), 2)
+    upkeep_multiplier = round(1.0 + ((level - 1) * RELATIONSHIP_LEVEL_DAILY_EXPENSE_STEP), 3)
+    return {
+        "relationship_points": int(capped_points),
+        "relationship_level": int(level),
+        "relationship_progress_points": int(progress_points),
+        "relationship_points_to_next": int(points_to_next),
+        "relationship_next_level_points": int(next_level_threshold or capped_points),
+        "relationship_upkeep_multiplier": float(upkeep_multiplier),
+        "relationship_progress_pct": float(100.0 if next_level_threshold is None else progress_pct),
+    }
 
 
 def _sanitize_display_name(value: Any, max_len: int = 32) -> str:
@@ -234,18 +648,100 @@ def _normalize_election_stage(stage_value: Any) -> str:
     return stage
 
 
+def _pick_progressive_tier(value: float, tiers: list[tuple[float, float]], default: float = 0.0) -> float:
+    safe_value = max(0.0, float(value or 0.0))
+    for upper_bound, tier_value in tiers:
+        if safe_value <= float(upper_bound):
+            return float(tier_value)
+    return float(default)
+
+
+def _property_daily_tax_rate(category: Any) -> float:
+    key = str(category or "").strip().lower()
+    return float(PROPERTY_CATEGORY_TAX_RATES.get(key, PROPERTY_DEFAULT_TAX_RATE))
+
+
+def _business_daily_tax_rate(business_type: Any) -> float:
+    raw = str(business_type or "").strip().lower()
+    if not raw:
+        return 0.0032
+
+    # Финансы и азартные категории облагаются выше.
+    high_risk_tokens = ("bank", "фин", "банк", "casino", "казино", "bet", "букмек", "crypto", "крипт", "бирж")
+    if any(token in raw for token in high_risk_tokens):
+        return 0.0045
+
+    industrial_tokens = ("factory", "завод", "industrial", "производ", "oil", "энерг", "логист")
+    if any(token in raw for token in industrial_tokens):
+        return 0.0038
+
+    service_tokens = ("shop", "магаз", "service", "кафе", "rest", "hotel", "отел", "clinic", "сервис")
+    if any(token in raw for token in service_tokens):
+        return 0.0030
+
+    return 0.0032
+
+
+def _decode_slots_roll(value: int) -> tuple[int, int, int]:
+    safe = max(1, min(int(value or 1), 64))
+    encoded = safe - 1
+    left = encoded // 16
+    middle = (encoded // 4) % 4
+    right = encoded % 4
+    return left, middle, right
+
+
+def _analyze_slots_roll(value: int) -> Dict[str, Any]:
+    reels = _decode_slots_roll(value)
+    counts: Dict[int, int] = {}
+    for symbol_id in reels:
+        counts[symbol_id] = counts.get(symbol_id, 0) + 1
+    max_count = max(counts.values())
+    if max_count >= 3:
+        combo = "triple"
+    elif max_count == 2:
+        combo = "pair"
+    else:
+        combo = "none"
+    top_symbol = max(symbol_id for symbol_id, cnt in counts.items() if cnt == max_count)
+    score = int(max_count * 100 + top_symbol * 10 + sum(reels))
+    labels = [SLOT_SYMBOLS[idx] for idx in reels]
+    return {
+        "reels": reels,
+        "labels": labels,
+        "display": " | ".join(labels),
+        "combo": combo,
+        "max_count": int(max_count),
+        "top_symbol": int(top_symbol),
+        "score": score,
+    }
+
+
+def _roulette_color_by_number(number: int) -> str:
+    safe = int(number or 0)
+    if safe <= 0 or safe > 36:
+        return "green"
+    return "red" if safe in ROULETTE_RED_NUMBERS else "black"
+
+
 class AsyncDatabase:
     """Асинхронная база данных с полной защитой от блокировок"""
     
     def __init__(self, db_path: str = DATABASE_PATH):
         self.db_path = db_path
+        self.sqlite_timeout_seconds = SQLITE_CONNECT_TIMEOUT_SECONDS
+        self.sqlite_busy_timeout_ms = SQLITE_BUSY_TIMEOUT_MS
+
+    def _connect(self, timeout: Optional[float] = None):
+        safe_timeout = self.sqlite_timeout_seconds if timeout is None else max(0.2, float(timeout))
+        return aiosqlite.connect(self.db_path, timeout=safe_timeout)
     
     async def init_db(self):
         """Инициализация базы данных - создание всех таблиц"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute("PRAGMA journal_mode=WAL")
             await db.execute("PRAGMA synchronous=NORMAL")
-            await db.execute("PRAGMA busy_timeout=2000")
+            await db.execute(f"PRAGMA busy_timeout={int(self.sqlite_busy_timeout_ms)}")
             
             # Пользователи
             await db.execute('''
@@ -294,7 +790,13 @@ class AsyncDatabase:
                     citizen_job TEXT,
                     citizen_salary REAL DEFAULT 0,
                     last_job_shift TEXT,
-                    loan_defaults INTEGER DEFAULT 0
+                    loan_defaults INTEGER DEFAULT 0,
+                    last_education_activity_at TEXT,
+                    education_last_reminder_date TEXT,
+                    tax_unpaid_streak INTEGER DEFAULT 0,
+                    tax_disabled INTEGER DEFAULT 0,
+                    is_ai_agent INTEGER DEFAULT 0,
+                    ai_role_tag TEXT
                 )
             ''')
             
@@ -306,7 +808,7 @@ class AsyncDatabase:
                     type TEXT NOT NULL,
                     leader_id INTEGER,
                     deputy_id INTEGER,
-                    budget REAL DEFAULT 1000000,
+                    budget REAL DEFAULT 0,
                     members INTEGER DEFAULT 0,
                     reputation INTEGER DEFAULT 50,
                     created_date TEXT NOT NULL,
@@ -482,6 +984,10 @@ class AsyncDatabase:
                 await db.execute("ALTER TABLE users ADD COLUMN last_illegal_hustle_at TEXT")
             if 'last_education_test_at' not in ucol_names:
                 await db.execute("ALTER TABLE users ADD COLUMN last_education_test_at TEXT")
+            if 'last_education_activity_at' not in ucol_names:
+                await db.execute("ALTER TABLE users ADD COLUMN last_education_activity_at TEXT")
+            if 'education_last_reminder_date' not in ucol_names:
+                await db.execute("ALTER TABLE users ADD COLUMN education_last_reminder_date TEXT")
             if 'referrer_id' not in ucol_names:
                 await db.execute("ALTER TABLE users ADD COLUMN referrer_id INTEGER")
             if 'referral_code' not in ucol_names:
@@ -494,6 +1000,17 @@ class AsyncDatabase:
                 await db.execute("ALTER TABLE users ADD COLUMN referral_gift_eligible INTEGER DEFAULT 0")
             if 'referral_gift_claimed' not in ucol_names:
                 await db.execute("ALTER TABLE users ADD COLUMN referral_gift_claimed INTEGER DEFAULT 0")
+            if 'tax_unpaid_streak' not in ucol_names:
+                await db.execute("ALTER TABLE users ADD COLUMN tax_unpaid_streak INTEGER DEFAULT 0")
+            if 'tax_disabled' not in ucol_names:
+                await db.execute("ALTER TABLE users ADD COLUMN tax_disabled INTEGER DEFAULT 0")
+            if 'is_ai_agent' not in ucol_names:
+                await db.execute("ALTER TABLE users ADD COLUMN is_ai_agent INTEGER DEFAULT 0")
+            if 'ai_role_tag' not in ucol_names:
+                await db.execute("ALTER TABLE users ADD COLUMN ai_role_tag TEXT")
+            await db.execute(
+                "UPDATE users SET tax_unpaid_streak = COALESCE(tax_unpaid_streak, 0), tax_disabled = COALESCE(tax_disabled, 0), is_ai_agent = COALESCE(is_ai_agent, 0)"
+            )
             await db.execute(
                 "UPDATE users SET referral_code = 'REF' || CAST(user_id AS TEXT) WHERE COALESCE(referral_code, '') = ''"
             )
@@ -888,6 +1405,15 @@ class AsyncDatabase:
                     condition INTEGER DEFAULT 100
                 )
             ''')
+            async with db.execute("PRAGMA table_info(properties)") as cursor:
+                prop_cols = await cursor.fetchall()
+                prop_col_names = {str(col[1]) for col in prop_cols}
+            if "category" not in prop_col_names:
+                await db.execute("ALTER TABLE properties ADD COLUMN category TEXT DEFAULT 'residential'")
+            if "maintenance_daily" not in prop_col_names:
+                await db.execute("ALTER TABLE properties ADD COLUMN maintenance_daily REAL DEFAULT 120")
+            if "condition" not in prop_col_names:
+                await db.execute("ALTER TABLE properties ADD COLUMN condition INTEGER DEFAULT 100")
             
             # Собственность недвижимости
             await db.execute('''
@@ -1024,6 +1550,98 @@ class AsyncDatabase:
                     reviewed_date TEXT
                 )
             ''')
+
+            await db.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS gang_hostage_cases (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    gang_id INTEGER NOT NULL,
+                    actor_id INTEGER NOT NULL,
+                    victim_id INTEGER NOT NULL,
+                    demand_amount REAL NOT NULL,
+                    demand_text TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_date TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    resolved_date TEXT,
+                    resolved_note TEXT
+                )
+                '''
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_gang_hostage_status ON gang_hostage_cases(gang_id, status, created_date DESC)"
+            )
+
+            await db.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS gang_roof_contracts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    gang_id INTEGER NOT NULL,
+                    target_type TEXT NOT NULL,
+                    target_id INTEGER NOT NULL,
+                    target_name TEXT,
+                    fee_amount REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_by INTEGER NOT NULL,
+                    created_date TEXT NOT NULL,
+                    next_collection_at TEXT NOT NULL,
+                    last_collection_at TEXT,
+                    expires_at TEXT NOT NULL,
+                    total_collected REAL DEFAULT 0,
+                    notes TEXT
+                )
+                '''
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_gang_roof_gang_status ON gang_roof_contracts(gang_id, status, next_collection_at)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_gang_roof_target ON gang_roof_contracts(target_type, target_id, status)"
+            )
+
+            await db.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS gang_wars (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    attacker_gang_id INTEGER NOT NULL,
+                    defender_gang_id INTEGER NOT NULL,
+                    created_by INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    started_date TEXT NOT NULL,
+                    ends_at TEXT NOT NULL,
+                    ended_date TEXT,
+                    attacker_score INTEGER DEFAULT 0,
+                    defender_score INTEGER DEFAULT 0,
+                    battle_count INTEGER DEFAULT 0,
+                    prize_pool REAL DEFAULT 0,
+                    last_battle_at TEXT,
+                    winner_gang_id INTEGER,
+                    summary_note TEXT
+                )
+                '''
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_gang_wars_status_end ON gang_wars(status, ends_at)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_gang_wars_pair ON gang_wars(attacker_gang_id, defender_gang_id, status)"
+            )
+
+            await db.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS charity_donations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    amount REAL NOT NULL,
+                    rep_bonus REAL DEFAULT 0,
+                    note TEXT,
+                    created_date TEXT NOT NULL
+                )
+                '''
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_charity_user_date ON charity_donations(user_id, created_date DESC)"
+            )
             
             # Статистика системы
             await db.execute('''
@@ -1214,6 +1832,65 @@ class AsyncDatabase:
 
             await db.execute(
                 '''
+                CREATE TABLE IF NOT EXISTS promo_codes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code TEXT NOT NULL UNIQUE,
+                    description TEXT,
+                    reward_payload TEXT NOT NULL,
+                    created_by INTEGER NOT NULL,
+                    created_date TEXT NOT NULL,
+                    expires_at TEXT,
+                    max_uses INTEGER DEFAULT 0,
+                    uses_count INTEGER DEFAULT 0,
+                    is_active INTEGER DEFAULT 1
+                )
+                '''
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_promo_codes_active_date ON promo_codes(is_active, created_date DESC)"
+            )
+            await db.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS promo_code_claims (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    promo_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    claimed_date TEXT NOT NULL,
+                    payload_snapshot TEXT,
+                    UNIQUE(promo_id, user_id)
+                )
+                '''
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_promo_claims_user_date ON promo_code_claims(user_id, claimed_date DESC)"
+            )
+
+            await db.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS donation_purchases (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    pack_key TEXT NOT NULL,
+                    pack_title TEXT NOT NULL,
+                    currency TEXT NOT NULL DEFAULT 'XTR',
+                    amount INTEGER NOT NULL DEFAULT 0,
+                    invoice_payload TEXT NOT NULL UNIQUE,
+                    telegram_payment_charge_id TEXT UNIQUE,
+                    provider_payment_charge_id TEXT,
+                    reward_payload TEXT NOT NULL,
+                    rewards_applied TEXT,
+                    status TEXT NOT NULL DEFAULT 'paid',
+                    created_date TEXT NOT NULL,
+                    confirmed_date TEXT
+                )
+                '''
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_donation_purchases_user_date ON donation_purchases(user_id, created_date DESC)"
+            )
+
+            await db.execute(
+                '''
                 CREATE TABLE IF NOT EXISTS citizen_appeals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     citizen_id INTEGER NOT NULL,
@@ -1268,6 +1945,104 @@ class AsyncDatabase:
             )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_group_casino_duels_players ON group_casino_duels(challenger_id, opponent_id, status)"
+            )
+
+            await db.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS family_marriages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    proposer_id INTEGER NOT NULL,
+                    target_id INTEGER NOT NULL,
+                    user1_id INTEGER NOT NULL,
+                    user2_id INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    source_chat_id INTEGER,
+                    created_date TEXT NOT NULL,
+                    approved_date TEXT,
+                    ended_date TEXT,
+                    ended_by INTEGER,
+                    closure_note TEXT,
+                    relationship_points INTEGER DEFAULT 0
+                )
+                '''
+            )
+            try:
+                await db.execute("ALTER TABLE family_marriages ADD COLUMN relationship_points INTEGER DEFAULT 0")
+            except Exception:
+                pass
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_family_marriages_status_date ON family_marriages(status, created_date DESC)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_family_marriages_pair ON family_marriages(user1_id, user2_id, status)"
+            )
+
+            await db.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS family_accounts (
+                    user_id INTEGER PRIMARY KEY,
+                    family_debt REAL DEFAULT 0,
+                    total_family_charged REAL DEFAULT 0,
+                    total_family_paid REAL DEFAULT 0,
+                    updated_date TEXT NOT NULL
+                )
+                '''
+            )
+
+            await db.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS user_pets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_id INTEGER NOT NULL UNIQUE,
+                    pet_type TEXT NOT NULL,
+                    pet_name TEXT NOT NULL,
+                    level INTEGER DEFAULT 1,
+                    xp INTEGER DEFAULT 0,
+                    hunger INTEGER DEFAULT 80,
+                    mood INTEGER DEFAULT 80,
+                    energy INTEGER DEFAULT 80,
+                    health INTEGER DEFAULT 100,
+                    status TEXT DEFAULT 'active',
+                    created_date TEXT NOT NULL,
+                    last_feed_date TEXT,
+                    last_play_date TEXT,
+                    last_train_date TEXT
+                )
+                '''
+            )
+            # Новые поля для редкости и бонусов питомцев (если БД старая).
+            for col_sql in (
+                "ALTER TABLE user_pets ADD COLUMN rarity TEXT DEFAULT 'обычный'",
+                "ALTER TABLE user_pets ADD COLUMN bonus_type TEXT",
+                "ALTER TABLE user_pets ADD COLUMN bonus_value REAL DEFAULT 0",
+            ):
+                try:
+                    await db.execute(col_sql)
+                except Exception:
+                    pass
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_user_pets_owner_status ON user_pets(owner_id, status)"
+            )
+
+            await db.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS family_expense_journal (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    partner_id INTEGER,
+                    cycle_date TEXT NOT NULL,
+                    expense_total REAL DEFAULT 0,
+                    base_expense REAL DEFAULT 0,
+                    pet_expense REAL DEFAULT 0,
+                    paid_from_bank REAL DEFAULT 0,
+                    paid_from_balance REAL DEFAULT 0,
+                    debt_added REAL DEFAULT 0,
+                    created_date TEXT NOT NULL
+                )
+                '''
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_family_expense_user_cycle ON family_expense_journal(user_id, cycle_date DESC)"
             )
 
             await db.execute(
@@ -1395,7 +2170,7 @@ class AsyncDatabase:
     
     async def get_user(self, user_id: int) -> Optional[Dict[str, Any]]:
         """Получить пользователя по ID"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute('SELECT * FROM users WHERE user_id = ?', (user_id,)) as cursor:
                 row = await cursor.fetchone()
@@ -1407,7 +2182,7 @@ class AsyncDatabase:
         """Создать или обновить пользователя"""
         now = datetime.now().isoformat()
         
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             # Проверяем существование пользователя
             async with db.execute('SELECT user_id FROM users WHERE user_id = ?', (user_id,)) as cursor:
                 existing = await cursor.fetchone()
@@ -1417,6 +2192,15 @@ class AsyncDatabase:
                 await db.execute(
                     'UPDATE users SET username = ?, full_name = ?, last_activity = ? WHERE user_id = ?',
                     (username, full_name, now, user_id)
+                )
+                await db.execute(
+                    """
+                    UPDATE users
+                    SET tax_unpaid_streak = CASE WHEN COALESCE(tax_disabled, 0) = 1 THEN 0 ELSE COALESCE(tax_unpaid_streak, 0) END,
+                        tax_disabled = CASE WHEN COALESCE(tax_disabled, 0) = 1 THEN 0 ELSE COALESCE(tax_disabled, 0) END
+                    WHERE user_id = ?
+                    """,
+                    (int(user_id),),
                 )
                 await db.execute(
                     "UPDATE users SET referral_code = COALESCE(NULLIF(referral_code, ''), ?) WHERE user_id = ?",
@@ -1454,7 +2238,7 @@ class AsyncDatabase:
         set_clause = ', '.join([f'{key} = ?' for key in kwargs.keys()])
         values = list(kwargs.values()) + [user_id]
         
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(f'UPDATE users SET {set_clause} WHERE user_id = ?', values)
             await db.commit()
         
@@ -1488,7 +2272,7 @@ class AsyncDatabase:
         if clean and any(ch in "\\`*_[]()~>#+-=|{}!" for ch in clean):
             return False, "Ник содержит запрещенные спецсимволы.", None
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute("SELECT user_id FROM users WHERE user_id = ? LIMIT 1", (int(user_id),)) as cursor:
                 row = await cursor.fetchone()
             if not row:
@@ -1514,7 +2298,7 @@ class AsyncDatabase:
     
     async def get_organization(self, org_name: str) -> Optional[Dict[str, Any]]:
         """Получить организацию по имени"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute('SELECT * FROM organizations WHERE name = ?', (org_name,)) as cursor:
                 row = await cursor.fetchone()
@@ -1524,7 +2308,7 @@ class AsyncDatabase:
     
     async def get_organization_by_id(self, org_id: int) -> Optional[Dict[str, Any]]:
         """Получить организацию по ID"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute('SELECT * FROM organizations WHERE id = ?', (org_id,)) as cursor:
                 row = await cursor.fetchone()
@@ -1532,9 +2316,138 @@ class AsyncDatabase:
                     return dict(row)
         return None
 
+    async def get_organization_by_type(self, org_type: str) -> Optional[Dict[str, Any]]:
+        """Получить организацию по типу (type)."""
+        safe_type = str(org_type or "").strip().lower()
+        if not safe_type:
+            return None
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT *
+                FROM organizations
+                WHERE lower(COALESCE(type, '')) = ?
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (safe_type,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return dict(row)
+        return None
+
+    async def ensure_ai_governance_user(
+        self,
+        user_id: int,
+        username: str,
+        full_name: str,
+        role_tag: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Создать/обновить системного AI-пользователя для гос-ролей."""
+        safe_user_id = int(user_id or 0)
+        if safe_user_id <= 0:
+            return None
+        now = datetime.now().isoformat()
+        safe_username = str(username or f"ai_{safe_user_id}")[:64]
+        safe_full_name = str(full_name or f"AI Agent #{safe_user_id}")[:90]
+        safe_role_tag = str(role_tag or "").strip()[:64]
+        referral_code = f"AI{safe_user_id}"
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute("SELECT user_id FROM users WHERE user_id = ? LIMIT 1", (safe_user_id,)) as cursor:
+                row = await cursor.fetchone()
+            if row:
+                await db.execute(
+                    """
+                    UPDATE users
+                    SET username = ?,
+                        full_name = ?,
+                        nickname = COALESCE(NULLIF(nickname, ''), ?),
+                        is_ai_agent = 1,
+                        ai_role_tag = ?,
+                        tax_disabled = 0,
+                        tax_unpaid_streak = 0,
+                        referral_code = COALESCE(NULLIF(referral_code, ''), ?),
+                        last_activity = ?
+                    WHERE user_id = ?
+                    """,
+                    (
+                        safe_username,
+                        safe_full_name,
+                        safe_full_name,
+                        safe_role_tag or None,
+                        referral_code,
+                        now,
+                        safe_user_id,
+                    ),
+                )
+            else:
+                await db.execute(
+                    """
+                    INSERT INTO users
+                    (user_id, username, full_name, nickname, balance, cash, bank, level, education,
+                     reputation, organization, role, salary, last_activity, created_date, life_state,
+                     referral_code, tax_unpaid_streak, tax_disabled, is_ai_agent, ai_role_tag)
+                    VALUES (?, ?, ?, ?, 0, 0, 0, 10, 8, 75, NULL, NULL, 0, ?, ?, 'alive', ?, 0, 0, 1, ?)
+                    """,
+                    (
+                        safe_user_id,
+                        safe_username,
+                        safe_full_name,
+                        safe_full_name,
+                        now,
+                        now,
+                        referral_code,
+                        safe_role_tag or None,
+                    ),
+                )
+            await db.commit()
+
+        return await self.get_user(safe_user_id)
+
+    async def set_government_authority_assignment(
+        self,
+        user_id: int,
+        authority: str,
+        granted_by: Optional[int] = None,
+        is_active: bool = True,
+    ) -> bool:
+        """Прямо установить уровень гос-полномочий."""
+        safe_user_id = int(user_id or 0)
+        safe_authority = str(authority or "").strip().lower()
+        if safe_user_id <= 0 or safe_authority not in {"president", "vice_president", "finance_minister", "minister"}:
+            return False
+        now = datetime.now().isoformat()
+        granted_by_value = int(granted_by) if granted_by is not None else None
+        try:
+            async with self._connect() as db:
+                await db.execute(
+                    """
+                    INSERT INTO government_authority_assignments
+                    (user_id, authority, granted_by, granted_date, is_active)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        authority = excluded.authority,
+                        granted_by = excluded.granted_by,
+                        granted_date = excluded.granted_date,
+                        is_active = excluded.is_active
+                    """,
+                    (safe_user_id, safe_authority, granted_by_value, now, 1 if is_active else 0),
+                )
+                await db.commit()
+            return True
+        except sqlite3.OperationalError as exc:
+            if "government_authority_assignments" in str(exc).lower():
+                return False
+            raise
+
     async def get_government_organization(self) -> Optional[Dict[str, Any]]:
         """Получить организацию правительства (по type=government, с fallback по имени)."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 """
@@ -1557,10 +2470,78 @@ class AsyncDatabase:
                 if row:
                     return dict(row)
         return None
+
+    async def _credit_public_budgets(
+        self,
+        db_conn: aiosqlite.Connection,
+        amount: float,
+        *,
+        tax_share: float = MONEY_CIRCULATION_TAX_SHARE,
+    ) -> Dict[str, float]:
+        safe_amount = round(max(0.0, float(amount or 0.0)), 2)
+        if safe_amount <= 0:
+            return {"government_credit": 0.0, "tax_service_credit": 0.0}
+
+        safe_tax_share = max(0.0, min(0.95, float(tax_share or 0.0)))
+        tax_credit = round(safe_amount * safe_tax_share, 2)
+        gov_credit = round(safe_amount - tax_credit, 2)
+
+        tax_org_row = None
+        if tax_credit > 0:
+            async with db_conn.execute(
+                """
+                SELECT id, COALESCE(budget, 0) AS budget
+                FROM organizations
+                WHERE lower(COALESCE(type, '')) = 'tax'
+                ORDER BY id ASC
+                LIMIT 1
+                """
+            ) as cursor:
+                tax_org_row = await cursor.fetchone()
+            if tax_org_row:
+                new_tax_budget = round(float(tax_org_row["budget"] or 0.0) + tax_credit, 2)
+                await db_conn.execute(
+                    "UPDATE organizations SET budget = ? WHERE id = ?",
+                    (new_tax_budget, int(tax_org_row["id"] or 0)),
+                )
+            else:
+                gov_credit = round(gov_credit + tax_credit, 2)
+                tax_credit = 0.0
+
+        gov_row = None
+        async with db_conn.execute(
+            """
+            SELECT id, COALESCE(budget, 0) AS budget
+            FROM organizations
+            WHERE lower(COALESCE(type, '')) = 'government'
+            ORDER BY id ASC
+            LIMIT 1
+            """
+        ) as cursor:
+            gov_row = await cursor.fetchone()
+        if not gov_row:
+            async with db_conn.execute(
+                "SELECT id, COALESCE(budget, 0) AS budget FROM organizations WHERE name = 'Правительство' ORDER BY id ASC LIMIT 1"
+            ) as cursor:
+                gov_row = await cursor.fetchone()
+        if gov_row and gov_credit > 0:
+            new_budget = round(float(gov_row["budget"] or 0.0) + gov_credit, 2)
+            await db_conn.execute(
+                "UPDATE organizations SET budget = ? WHERE id = ?",
+                (new_budget, int(gov_row["id"] or 0)),
+            )
+        elif not gov_row:
+            tax_credit = 0.0
+            gov_credit = 0.0
+
+        return {
+            "government_credit": round(gov_credit, 2),
+            "tax_service_credit": round(tax_credit, 2),
+        }
     
     async def list_organizations(self) -> List[Dict[str, Any]]:
         """Получить список всех организаций"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute('SELECT id, name, type FROM organizations ORDER BY name ASC') as cursor:
                 rows = await cursor.fetchall()
@@ -1568,7 +2549,7 @@ class AsyncDatabase:
 
     async def get_organization_members(self, org_id: int, limit: int = 50) -> List[Dict[str, Any]]:
         """Получить участников организации с базовой информацией профиля."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 '''SELECT om.user_id,
@@ -1594,7 +2575,7 @@ class AsyncDatabase:
 
     async def is_user_org_member(self, user_id: int, org_id: int) -> bool:
         """Проверить членство игрока в организации с fallback по лидеру/названию."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
 
             async with db.execute(
@@ -1642,7 +2623,7 @@ class AsyncDatabase:
             "tax": ("налог", "tax"),
         }
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 """
@@ -1687,8 +2668,11 @@ class AsyncDatabase:
     async def can_manage_organization(self, user_id: int, org_id: int) -> bool:
         """
         Проверить доступ к управлению организацией.
-        Основной критерий: leader_id/deputy_id.
-        Fallback: руководящая роль в organization_members или users при совпадении организации.
+        Строгая модель:
+        - президент/вице-президент могут управлять;
+        - лидер/заместитель конкретной организации могут управлять.
+        Дополнительно: мягкий backfill leader_id/deputy_id, если в organization_members
+        уже есть явная роль "лидер"/"заместитель", но поля организации пустые.
         """
         safe_user_id = int(user_id)
         safe_org_id = int(org_id)
@@ -1699,39 +2683,7 @@ class AsyncDatabase:
         if authority in {"president", "vice_president"}:
             return True
 
-        manager_tokens = (
-            "лидер",
-            "зам",
-            "заместитель",
-            "глава",
-            "директор",
-            "шеф",
-            "руковод",
-            "leader",
-            "deputy",
-            "director",
-            "head",
-            "chief",
-            "manager",
-        )
-        leader_tokens = ("лидер", "глава", "leader", "chief", "head")
-        deputy_tokens = ("зам", "заместитель", "deputy", "vice")
-
-        def _is_manager_role(raw_role: Any) -> bool:
-            role_lc = str(raw_role or "").strip().lower()
-            return any(token in role_lc for token in manager_tokens)
-
-        def _is_leader_like(raw_role: Any) -> bool:
-            role_lc = str(raw_role or "").strip().lower()
-            return any(token in role_lc for token in leader_tokens)
-
-        def _is_deputy_like(raw_role: Any) -> bool:
-            role_lc = str(raw_role or "").strip().lower()
-            return any(token in role_lc for token in deputy_tokens)
-
-        now = datetime.now().isoformat()
-
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 "SELECT id, name, leader_id, deputy_id FROM organizations WHERE id = ? LIMIT 1",
@@ -1751,69 +2703,250 @@ class AsyncDatabase:
                 (safe_org_id, safe_user_id),
             ) as cursor:
                 member = await cursor.fetchone()
-
-            if member and _is_manager_role(member["role"]):
-                updates: list[tuple[str, tuple[Any, ...]]] = []
-                if current_leader_id <= 0 and _is_leader_like(member["role"]):
-                    updates.append(("UPDATE organizations SET leader_id = ? WHERE id = ?", (safe_user_id, safe_org_id)))
-                if current_deputy_id <= 0 and _is_deputy_like(member["role"]):
-                    updates.append(("UPDATE organizations SET deputy_id = ? WHERE id = ?", (safe_user_id, safe_org_id)))
-                if updates:
-                    for sql, params in updates:
-                        await db.execute(sql, params)
-                    await db.commit()
-                return True
-
-            async with db.execute(
-                "SELECT organization, role FROM users WHERE user_id = ? LIMIT 1",
-                (safe_user_id,),
-            ) as cursor:
-                user = await cursor.fetchone()
-            if not user:
-                return False
-
-            user_org_lc = str(user["organization"] or "").strip().lower()
-            org_name_lc = str(org["name"] or "").strip().lower()
-            if user_org_lc != org_name_lc or not _is_manager_role(user["role"]):
-                return False
-
-            role_for_member = str(user["role"] or "").strip() or "Руководитель"
             if not member:
-                await db.execute(
-                    """
-                    INSERT INTO organization_members
-                    (org_id, user_id, role, salary, join_date, last_promotion)
-                    VALUES (?, ?, ?, 0, ?, ?)
-                    """,
-                    (safe_org_id, safe_user_id, role_for_member, now, now),
-                )
+                return False
+
+            role_lc = str(member["role"] or "").strip().lower()
+            is_leader_role = any(token in role_lc for token in ("лидер", "leader", "chief", "head", "глава"))
+            is_deputy_role = any(token in role_lc for token in ("зам", "замест", "deputy", "vice", "вице"))
 
             updates: list[tuple[str, tuple[Any, ...]]] = []
-            if current_leader_id <= 0 and _is_leader_like(user["role"]):
+            if current_leader_id <= 0 and is_leader_role:
                 updates.append(("UPDATE organizations SET leader_id = ? WHERE id = ?", (safe_user_id, safe_org_id)))
-            if current_deputy_id <= 0 and _is_deputy_like(user["role"]):
+            if current_deputy_id <= 0 and is_deputy_role:
                 updates.append(("UPDATE organizations SET deputy_id = ? WHERE id = ?", (safe_user_id, safe_org_id)))
-            for sql, params in updates:
-                await db.execute(sql, params)
-            await db.commit()
-            return True
+            if updates:
+                for sql, params in updates:
+                    await db.execute(sql, params)
+                await db.commit()
+                return True
+
+            return False
     
+    async def run_org_initiative(
+        self,
+        actor_id: int,
+        org_id: int,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_actor = int(actor_id or 0)
+        safe_org_id = int(org_id or 0)
+        if safe_actor <= 0 or safe_org_id <= 0:
+            return False, "Некорректные параметры.", None
+
+        if not await self.can_manage_organization(safe_actor, safe_org_id):
+            return False, "Доступно только руководству организации.", None
+
+        ok_cd, remain = await self.check_and_set_user_cooldown(
+            user_id=safe_actor,
+            action_key=f"org_initiative_{safe_org_id}",
+            cooldown_minutes=120,
+        )
+        if not ok_cd:
+            return False, f"До следующей инициативы: {remain} мин.", {"cooldown_minutes": remain}
+
+        delta_budget = round(random.uniform(2_500.0, 7_500.0), 2)
+        delta_rep = int(random.randint(1, 4))
+        now = datetime.now().isoformat()
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT budget, reputation FROM organizations WHERE id = ? LIMIT 1",
+                (safe_org_id,),
+            ) as cursor:
+                org_row = await cursor.fetchone()
+            if not org_row:
+                await db.rollback()
+                return False, "Организация не найдена.", None
+
+            budget_before = round(float(org_row["budget"] or 0), 2)
+            rep_before = int(org_row["reputation"] or 0)
+            budget_after = round(budget_before + delta_budget, 2)
+            rep_after = max(0, min(100, rep_before + delta_rep))
+
+            await db.execute(
+                "UPDATE organizations SET budget = ?, reputation = ? WHERE id = ?",
+                (budget_after, rep_after, safe_org_id),
+            )
+            await db.commit()
+
+        await self.log_player_activity(
+            user_id=safe_actor,
+            activity_type="org_initiative",
+            details=f"Инициатива для организации #{safe_org_id}",
+            value=delta_budget,
+        )
+        return True, "Инициатива выполнена.", {
+            "org_id": safe_org_id,
+            "budget_before": budget_before,
+            "budget_after": budget_after,
+            "reputation_before": rep_before,
+            "reputation_after": rep_after,
+            "delta_budget": delta_budget,
+            "delta_rep": delta_rep,
+            "timestamp": now,
+        }
+
     async def init_default_organizations(self):
+        now = datetime.now().isoformat()
+
+        organizations = [
+            (
+                "Правительство",
+                "government",
+                "Центр решений Мирнастана: бюджет, законы, назначения, госрация и кризисные меры.",
+                2_000_000,
+                100,
+                "Нужны активность, репутация и готовность отвечать за экономику страны.",
+            ),
+            (
+                "Полиция",
+                "police",
+                "Порядок, розыск, штрафы и первые материалы для суда.",
+                450_000,
+                82,
+                "Подходит игрокам с дисциплиной: расследуйте, не злоупотребляйте властью.",
+            ),
+            (
+                "Больница",
+                "hospital",
+                "Лечение травм, приемы пациентов и восстановление граждан после рискованных решений.",
+                380_000,
+                90,
+                "Нужны внимательность и желание помогать игрокам возвращаться в строй.",
+            ),
+            (
+                "Суд",
+                "court",
+                "Дела, доказательства, решения, апелляции и баланс между силой и законом.",
+                360_000,
+                95,
+                "Требуются грамотность, нейтральность и уважение к фактам.",
+            ),
+            (
+                "Банк",
+                "bank",
+                "Счета, проценты, переводы, кредитные заявки и контроль финансовых рисков.",
+                1_500_000,
+                88,
+                "Банкиры нужны для ручной проверки кредитов, анализа скоринга и управления ликвидностью.",
+            ),
+            (
+                "Университет",
+                "education",
+                "Обучение, тесты, программы роста и подготовка кадров для всех организаций.",
+                420_000,
+                78,
+                "Подходит тем, кто хочет прокачивать игроков и объяснять механику без скуки.",
+            ),
+            (
+                "ФБР",
+                "fbi",
+                "Глубокие расследования, санкции, аналитика рисков и контроль опасных схем.",
+                620_000,
+                74,
+                "Нужны осторожность, терпение и умение отличать угрозу от шумного чата.",
+            ),
+            (
+                "Налоговая служба",
+                "tax",
+                "Налоги, долги, отчеты бизнеса, льготы и пополнение бюджета.",
+                430_000,
+                88,
+                "Работа для тех, кто любит порядок в цифрах и не боится квитанций.",
+            ),
+        ]
+
+        def _legacy_mojibake(value: str) -> str:
+            try:
+                return value.encode("utf-8").decode("cp1251")
+            except Exception:
+                return value
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            for org_name, org_type, description, budget_floor, reputation, requirements in organizations:
+                async with db.execute("SELECT id FROM organizations WHERE name = ? LIMIT 1", (org_name,)) as cursor:
+                    row = await cursor.fetchone()
+                if not row:
+                    async with db.execute(
+                        "SELECT id FROM organizations WHERE lower(COALESCE(type, '')) = ? ORDER BY id ASC LIMIT 1",
+                        (org_type,),
+                    ) as cursor:
+                        row = await cursor.fetchone()
+
+                if row:
+                    org_id = int(row["id"] or 0)
+                    await db.execute(
+                        """
+                        UPDATE organizations
+                        SET name = ?,
+                            type = ?,
+                            description = ?,
+                            requirements = ?,
+                            reputation = MAX(COALESCE(reputation, 50), ?),
+                            budget = CASE
+                                WHEN COALESCE(budget, 0) < ? THEN ?
+                                ELSE budget
+                            END,
+                            policy = COALESCE(NULLIF(policy, ''), 'neutral')
+                        WHERE id = ?
+                        """,
+                        (
+                            org_name,
+                            org_type,
+                            description,
+                            requirements,
+                            int(reputation),
+                            float(budget_floor),
+                            float(budget_floor),
+                            org_id,
+                        ),
+                    )
+                else:
+                    await db.execute(
+                        """
+                        INSERT INTO organizations
+                        (name, type, budget, reputation, created_date, policy, description, requirements,
+                         income_tax, property_tax, business_tax)
+                        VALUES (?, ?, ?, ?, ?, 'neutral', ?, ?, 0.12, 0.04, 0.15)
+                        """,
+                        (
+                            org_name,
+                            org_type,
+                            float(budget_floor),
+                            int(reputation),
+                            now,
+                            description,
+                            requirements,
+                        ),
+                    )
+
+                legacy_name = _legacy_mojibake(org_name)
+                await db.execute(
+                    "UPDATE users SET organization = ? WHERE organization IN (?, ?)",
+                    (org_name, org_name, legacy_name),
+                )
+
+            await db.commit()
+        return
         """Инициализировать стандартные организации"""
         now = datetime.now().isoformat()
         
         organizations = [
-            ('Правительство', 'government', 'Управление государством', 10000000, 100),
-            ('Полиция', 'police', 'Правопорядок и безопасность', 2000000, 80),
-            ('Больница', 'hospital', 'Медицинские услуги', 1500000, 90),
-            ('Суд', 'court', 'Судебная система', 1000000, 95),
-            ('Банк', 'bank', 'Финансы и кредиты', 10000000, 85),
-            ('Университет', 'education', 'Образование и наука', 800000, 75),
-            ('ФБР', 'fbi', 'Расследования и безопасность', 3000000, 70),
-            ('Налоговая служба', 'tax', 'Сбор налогов и контроль долгов', 1800000, 88),
+            ('Правительство', 'government', 'Управление государством', 1_000_000, 100),
+            ('Полиция', 'police', 'Правопорядок и безопасность', 0, 80),
+            ('Больница', 'hospital', 'Медицинские услуги', 0, 90),
+            ('Суд', 'court', 'Судебная система', 0, 95),
+            ('Банк', 'bank', 'Финансы и кредиты', 0, 85),
+            ('Университет', 'education', 'Образование и наука', 0, 75),
+            ('ФБР', 'fbi', 'Расследования и безопасность', 0, 70),
+            ('Налоговая служба', 'tax', 'Сбор налогов и контроль долгов', 0, 88),
         ]
         
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             for org_name, org_type, description, budget, reputation in organizations:
                 # Проверяем существование
                 async with db.execute('SELECT id FROM organizations WHERE name = ?', (org_name,)) as cursor:
@@ -1825,6 +2958,10 @@ class AsyncDatabase:
                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0.12, 0.04, 0.15)''',
                             (org_name, org_type, budget, reputation, now, 'neutral', description, 'No requirements')
                         )
+                await db.execute(
+                    "UPDATE organizations SET budget = ? WHERE name = ?",
+                    (budget, org_name),
+                )
             
             await db.commit()
 
@@ -1839,7 +2976,7 @@ class AsyncDatabase:
             safe_min = 0.0
 
         changed: list[tuple[int, str, float]] = []
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -1909,7 +3046,7 @@ class AsyncDatabase:
                 "org_id": gov_org_id,
             }
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute("UPDATE organizations SET budget = ? WHERE id = ?", (safe_min, gov_org_id))
             await db.commit()
 
@@ -1924,7 +3061,7 @@ class AsyncDatabase:
     async def upsert_bot_chat(self, chat_id: int, chat_type: str, title: str = "") -> bool:
         """Создать или обновить запись чата, где бот находится."""
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 '''
                 INSERT INTO bot_chats (chat_id, title, chat_type, is_active, joined_date, last_seen, left_date)
@@ -1944,7 +3081,7 @@ class AsyncDatabase:
     async def deactivate_bot_chat(self, chat_id: int) -> bool:
         """Пометить чат как неактивный (бот покинул чат или был удален)."""
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 '''
                 UPDATE bot_chats
@@ -1960,7 +3097,7 @@ class AsyncDatabase:
 
     async def get_active_group_chats(self) -> List[Dict[str, Any]]:
         """Получить список активных групп и супергрупп, где состоит бот."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 '''
@@ -1978,7 +3115,7 @@ class AsyncDatabase:
         safe_key = (key or "").strip()[:120]
         if not safe_key:
             return None
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 "SELECT value FROM system_state WHERE key = ? LIMIT 1",
                 (safe_key,),
@@ -1991,7 +3128,7 @@ class AsyncDatabase:
         if not safe_key:
             return False
         safe_value = "" if value is None else str(value)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT INTO system_state (key, value)
@@ -2002,6 +3139,744 @@ class AsyncDatabase:
             )
             await db.commit()
         return True
+
+    def _normalize_promocode_payload(self, payload: Dict[str, Any] | None) -> Dict[str, Any]:
+        source = payload if isinstance(payload, dict) else {}
+
+        def _to_float(value: Any) -> Optional[float]:
+            try:
+                return round(float(value), 4)
+            except Exception:
+                return None
+
+        def _normalize_budget_map(raw: Any) -> Dict[int, float]:
+            result: Dict[int, float] = {}
+            items: list[tuple[Any, Any]] = []
+            if isinstance(raw, dict):
+                items = list(raw.items())
+            elif isinstance(raw, list):
+                for entry in raw:
+                    if isinstance(entry, dict):
+                        items.append((entry.get("id"), entry.get("amount")))
+            for key, value in items:
+                try:
+                    target_id = int(key)
+                except Exception:
+                    continue
+                amount = _to_float(value)
+                if target_id <= 0 or amount is None or amount <= 0:
+                    continue
+                if abs(amount) > 1_000_000_000_000:
+                    continue
+                result[target_id] = round(result.get(target_id, 0.0) + amount, 2)
+            return result
+
+        def _normalize_id_list(raw: Any) -> List[int]:
+            values: List[int] = []
+            if isinstance(raw, (list, tuple, set)):
+                candidates = list(raw)
+            elif raw is None:
+                candidates = []
+            else:
+                candidates = [raw]
+            for item in candidates:
+                try:
+                    candidate = int(item)
+                except Exception:
+                    continue
+                if candidate > 0 and candidate not in values:
+                    values.append(candidate)
+            return values[:50]
+
+        normalized: Dict[str, Any] = {
+            "user_add": {},
+            "government_budget_add": 0.0,
+            "organizations_budget_add": {},
+            "businesses_budget_add": {},
+            "private_orgs_budget_add": {},
+            "grant_properties": [],
+            "grant_businesses": [],
+            "grant_private_orgs": [],
+            "gang_reputation_add": 0,
+        }
+
+        user_add = source.get("user_add")
+        if isinstance(user_add, dict):
+            for raw_field, raw_value in user_add.items():
+                field = PROMO_USER_FIELD_ALIASES.get(str(raw_field or "").strip().lower())
+                if not field or field not in PROMO_USER_FIELDS:
+                    continue
+                amount = _to_float(raw_value)
+                if amount is None:
+                    continue
+                if abs(amount) > 1_000_000_000_000:
+                    continue
+                normalized["user_add"][field] = round(float(normalized["user_add"].get(field) or 0.0) + amount, 2)
+
+        gov_add = _to_float(source.get("government_budget_add"))
+        if gov_add is not None and gov_add > 0:
+            normalized["government_budget_add"] = round(gov_add, 2)
+
+        normalized["organizations_budget_add"] = _normalize_budget_map(source.get("organizations_budget_add"))
+        normalized["businesses_budget_add"] = _normalize_budget_map(source.get("businesses_budget_add"))
+        normalized["private_orgs_budget_add"] = _normalize_budget_map(source.get("private_orgs_budget_add"))
+        normalized["grant_properties"] = _normalize_id_list(source.get("grant_properties"))
+        normalized["grant_businesses"] = _normalize_id_list(source.get("grant_businesses"))
+        normalized["grant_private_orgs"] = _normalize_id_list(source.get("grant_private_orgs"))
+        try:
+            gang_rep = int(source.get("gang_reputation_add") or 0)
+        except Exception:
+            gang_rep = 0
+        normalized["gang_reputation_add"] = max(-80, min(80, gang_rep))
+        return normalized
+
+    def _promocode_payload_has_rewards(self, payload: Dict[str, Any] | None) -> bool:
+        info = payload if isinstance(payload, dict) else {}
+        return bool(
+            (info.get("user_add") and len(dict(info.get("user_add") or {})) > 0)
+            or float(info.get("government_budget_add") or 0.0) > 0
+            or (info.get("organizations_budget_add") and len(dict(info.get("organizations_budget_add") or {})) > 0)
+            or (info.get("businesses_budget_add") and len(dict(info.get("businesses_budget_add") or {})) > 0)
+            or (info.get("private_orgs_budget_add") and len(dict(info.get("private_orgs_budget_add") or {})) > 0)
+            or (info.get("grant_properties") and len(list(info.get("grant_properties") or [])) > 0)
+            or (info.get("grant_businesses") and len(list(info.get("grant_businesses") or [])) > 0)
+            or (info.get("grant_private_orgs") and len(list(info.get("grant_private_orgs") or [])) > 0)
+            or int(info.get("gang_reputation_add") or 0) != 0
+        )
+
+    async def _apply_promocode_payload_tx(
+        self,
+        db: aiosqlite.Connection,
+        user_id: int,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        summary: Dict[str, Any] = {
+            "user_add_applied": {},
+            "government_budget_added": 0.0,
+            "organizations_budget_added": {},
+            "businesses_budget_added": {},
+            "private_orgs_budget_added": {},
+            "granted_properties": [],
+            "granted_businesses": [],
+            "granted_private_orgs": [],
+            "gang_reputation_delta": 0,
+            "skipped": [],
+        }
+
+        async with db.execute("SELECT * FROM users WHERE user_id = ? LIMIT 1", (int(user_id),)) as cursor:
+            user_row = await cursor.fetchone()
+        if not user_row:
+            summary["error"] = "user_not_found"
+            return summary
+
+        user_add = dict(payload.get("user_add") or {})
+        user_updates: Dict[str, Any] = {}
+        user_columns = set(user_row.keys())
+        int_fields = {"level", "education", "experience", "health", "happiness", "hunger", "corruption_score", "marketing_level"}
+        bounded_0_100 = {"health", "happiness", "hunger", "corruption_score", "reputation"}
+
+        for field, delta_raw in user_add.items():
+            if field not in PROMO_USER_FIELDS or field not in user_columns:
+                summary["skipped"].append(f"user_field:{field}")
+                continue
+            try:
+                delta = float(delta_raw)
+            except Exception:
+                summary["skipped"].append(f"user_field_invalid:{field}")
+                continue
+            current = float(user_row[field] or 0.0)
+            new_value = current + delta
+
+            if field == "level":
+                new_value = max(1.0, new_value)
+            elif field == "education":
+                new_value = max(1.0, new_value)
+            elif field in {"experience", "marketing_level"}:
+                new_value = max(0.0, new_value)
+            elif field in {"balance", "bank", "cash", "shadow_balance", "referral_earnings"}:
+                new_value = max(0.0, new_value)
+            elif field in {"tax_debt", "citizen_salary"}:
+                new_value = max(0.0, new_value)
+
+            if field in bounded_0_100:
+                new_value = max(0.0, min(100.0, new_value))
+
+            if field in int_fields:
+                cast_value: Any = int(round(new_value))
+                applied_delta = int(cast_value - int(round(current)))
+            else:
+                cast_value = round(new_value, 2)
+                applied_delta = round(float(cast_value) - current, 2)
+
+            if applied_delta == 0:
+                continue
+            user_updates[field] = cast_value
+            summary["user_add_applied"][field] = applied_delta
+
+        if user_updates:
+            set_clause = ", ".join([f"{key} = ?" for key in user_updates.keys()])
+            values = list(user_updates.values()) + [int(user_id)]
+            await db.execute(f"UPDATE users SET {set_clause} WHERE user_id = ?", tuple(values))
+
+        gov_add = round(float(payload.get("government_budget_add") or 0.0), 2)
+        if gov_add > 0:
+            async with db.execute(
+                """
+                SELECT id, budget
+                FROM organizations
+                WHERE type = 'government' OR lower(name) LIKE '%правитель%'
+                ORDER BY CASE WHEN type = 'government' THEN 0 ELSE 1 END, id ASC
+                LIMIT 1
+                """
+            ) as cursor:
+                gov_row = await cursor.fetchone()
+            if gov_row:
+                gov_id = int(gov_row["id"] or 0)
+                old_budget = round(float(gov_row["budget"] or 0.0), 2)
+                new_budget = round(max(0.0, old_budget + gov_add), 2)
+                await db.execute("UPDATE organizations SET budget = ? WHERE id = ?", (new_budget, gov_id))
+                summary["government_budget_added"] = round(new_budget - old_budget, 2)
+            else:
+                summary["skipped"].append("government_budget:no_government_org")
+
+        for org_id, amount in dict(payload.get("organizations_budget_add") or {}).items():
+            safe_amount = round(float(amount or 0.0), 2)
+            if org_id <= 0 or safe_amount <= 0:
+                continue
+            async with db.execute("SELECT budget FROM organizations WHERE id = ? LIMIT 1", (int(org_id),)) as cursor:
+                row = await cursor.fetchone()
+            if not row:
+                summary["skipped"].append(f"org_budget:{int(org_id)}")
+                continue
+            old_budget = round(float(row["budget"] or 0.0), 2)
+            new_budget = round(max(0.0, old_budget + safe_amount), 2)
+            await db.execute("UPDATE organizations SET budget = ? WHERE id = ?", (new_budget, int(org_id)))
+            summary["organizations_budget_added"][int(org_id)] = round(new_budget - old_budget, 2)
+
+        for biz_id, amount in dict(payload.get("businesses_budget_add") or {}).items():
+            safe_amount = round(float(amount or 0.0), 2)
+            if biz_id <= 0 or safe_amount <= 0:
+                continue
+            async with db.execute("SELECT budget FROM businesses WHERE id = ? LIMIT 1", (int(biz_id),)) as cursor:
+                row = await cursor.fetchone()
+            if not row:
+                summary["skipped"].append(f"business_budget:{int(biz_id)}")
+                continue
+            old_budget = round(float(row["budget"] or 0.0), 2)
+            new_budget = round(max(0.0, old_budget + safe_amount), 2)
+            await db.execute("UPDATE businesses SET budget = ? WHERE id = ?", (new_budget, int(biz_id)))
+            summary["businesses_budget_added"][int(biz_id)] = round(new_budget - old_budget, 2)
+
+        for org_id, amount in dict(payload.get("private_orgs_budget_add") or {}).items():
+            safe_amount = round(float(amount or 0.0), 2)
+            if org_id <= 0 or safe_amount <= 0:
+                continue
+            async with db.execute("SELECT budget FROM private_orgs WHERE id = ? LIMIT 1", (int(org_id),)) as cursor:
+                row = await cursor.fetchone()
+            if not row:
+                summary["skipped"].append(f"private_org_budget:{int(org_id)}")
+                continue
+            old_budget = round(float(row["budget"] or 0.0), 2)
+            new_budget = round(max(0.0, old_budget + safe_amount), 2)
+            await db.execute("UPDATE private_orgs SET budget = ? WHERE id = ?", (new_budget, int(org_id)))
+            summary["private_orgs_budget_added"][int(org_id)] = round(new_budget - old_budget, 2)
+
+        for property_id in list(payload.get("grant_properties") or []):
+            safe_property_id = int(property_id or 0)
+            if safe_property_id <= 0:
+                continue
+            async with db.execute("SELECT id FROM properties WHERE id = ? LIMIT 1", (safe_property_id,)) as cursor:
+                prop_row = await cursor.fetchone()
+            if not prop_row:
+                summary["skipped"].append(f"property:{safe_property_id}")
+                continue
+
+            async with db.execute(
+                "SELECT owner_id FROM property_ownership WHERE property_id = ? LIMIT 1",
+                (safe_property_id,),
+            ) as cursor:
+                owner_row = await cursor.fetchone()
+            if owner_row and int(owner_row["owner_id"] or 0) not in {0, int(user_id)}:
+                summary["skipped"].append(f"property_busy:{safe_property_id}")
+                continue
+            if not owner_row:
+                await db.execute(
+                    "INSERT INTO property_ownership (property_id, owner_id, acquired_date, last_rent_claimed) VALUES (?, ?, ?, ?)",
+                    (safe_property_id, int(user_id), datetime.now().isoformat(), datetime.now().isoformat()),
+                )
+            elif int(owner_row["owner_id"] or 0) != int(user_id):
+                await db.execute(
+                    "UPDATE property_ownership SET owner_id = ?, acquired_date = ? WHERE property_id = ?",
+                    (int(user_id), datetime.now().isoformat(), safe_property_id),
+                )
+            await db.execute("UPDATE properties SET status = 'owned' WHERE id = ?", (safe_property_id,))
+            if safe_property_id not in summary["granted_properties"]:
+                summary["granted_properties"].append(safe_property_id)
+
+        for business_id in list(payload.get("grant_businesses") or []):
+            safe_business_id = int(business_id or 0)
+            if safe_business_id <= 0:
+                continue
+            async with db.execute("SELECT id FROM businesses WHERE id = ? LIMIT 1", (safe_business_id,)) as cursor:
+                row = await cursor.fetchone()
+            if not row:
+                summary["skipped"].append(f"business:{safe_business_id}")
+                continue
+            await db.execute(
+                "UPDATE businesses SET owner_id = ?, status = 'active' WHERE id = ?",
+                (int(user_id), safe_business_id),
+            )
+            if safe_business_id not in summary["granted_businesses"]:
+                summary["granted_businesses"].append(safe_business_id)
+
+        for org_id in list(payload.get("grant_private_orgs") or []):
+            safe_org_id = int(org_id or 0)
+            if safe_org_id <= 0:
+                continue
+            async with db.execute("SELECT id FROM private_orgs WHERE id = ? LIMIT 1", (safe_org_id,)) as cursor:
+                row = await cursor.fetchone()
+            if not row:
+                summary["skipped"].append(f"private_org:{safe_org_id}")
+                continue
+            await db.execute(
+                "UPDATE private_orgs SET leader_id = ?, status = 'active' WHERE id = ?",
+                (int(user_id), safe_org_id),
+            )
+            if safe_org_id not in summary["granted_private_orgs"]:
+                summary["granted_private_orgs"].append(safe_org_id)
+
+        gang_delta = int(payload.get("gang_reputation_add") or 0)
+        if gang_delta != 0:
+            async with db.execute(
+                """
+                SELECT g.id, g.reputation
+                FROM gang_members gm
+                JOIN gangs g ON g.id = gm.gang_id
+                WHERE gm.user_id = ? AND g.status = 'active'
+                ORDER BY gm.join_date DESC, gm.id DESC
+                LIMIT 1
+                """,
+                (int(user_id),),
+            ) as cursor:
+                gang_row = await cursor.fetchone()
+            if not gang_row:
+                summary["skipped"].append("gang_reputation:no_gang")
+            else:
+                gang_id = int(gang_row["id"] or 0)
+                old_rep = int(gang_row["reputation"] or 50)
+                new_rep = max(0, min(100, old_rep + gang_delta))
+                await db.execute("UPDATE gangs SET reputation = ? WHERE id = ?", (int(new_rep), gang_id))
+                summary["gang_reputation_delta"] = int(new_rep - old_rep)
+
+        return summary
+
+    async def list_user_donation_purchases(self, user_id: int, limit: int = 8) -> List[Dict[str, Any]]:
+        safe_user_id = int(user_id or 0)
+        safe_limit = max(1, min(int(limit or 8), 50))
+        if safe_user_id <= 0:
+            return []
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT id, pack_key, pack_title, currency, amount, status, created_date, confirmed_date
+                FROM donation_purchases
+                WHERE user_id = ?
+                ORDER BY created_date DESC, id DESC
+                LIMIT ?
+                """,
+                (safe_user_id, safe_limit),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+    async def apply_donation_purchase(
+        self,
+        user_id: int,
+        pack_key: str,
+        pack_title: str,
+        amount: int,
+        currency: str,
+        invoice_payload: str,
+        telegram_payment_charge_id: str,
+        provider_payment_charge_id: str,
+        rewards: Dict[str, Any],
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_user_id = int(user_id or 0)
+        safe_pack_key = str(pack_key or "").strip()[:64]
+        safe_pack_title = str(pack_title or "").strip()[:128] or "Donation Pack"
+        safe_currency = str(currency or "").strip().upper()[:12] or "XTR"
+        safe_invoice_payload = str(invoice_payload or "").strip()[:128]
+        safe_tg_charge = str(telegram_payment_charge_id or "").strip()[:255]
+        safe_provider_charge = str(provider_payment_charge_id or "").strip()[:255]
+        safe_amount = max(0, int(amount or 0))
+        normalized_rewards = self._normalize_promocode_payload(rewards)
+
+        if safe_user_id <= 0:
+            return False, "Игрок не найден.", None
+        if not safe_pack_key or not safe_invoice_payload or not safe_tg_charge:
+            return False, "Некорректные параметры оплаты.", None
+        if safe_amount <= 0:
+            return False, "Сумма оплаты некорректна.", None
+        if not self._promocode_payload_has_rewards(normalized_rewards):
+            return False, "У донат-пакета нет наград.", None
+
+        now_iso = datetime.now().isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+
+            async with db.execute(
+                """
+                SELECT *
+                FROM donation_purchases
+                WHERE telegram_payment_charge_id = ? OR invoice_payload = ?
+                LIMIT 1
+                """,
+                (safe_tg_charge, safe_invoice_payload),
+            ) as cursor:
+                existing = await cursor.fetchone()
+            if existing:
+                await db.commit()
+                payload_existing = dict(existing)
+                rewards_applied = {}
+                try:
+                    rewards_applied = json.loads(str(payload_existing.get("rewards_applied") or "{}"))
+                except Exception:
+                    rewards_applied = {}
+                return True, "Покупка уже была обработана.", {
+                    "already_applied": True,
+                    "purchase_id": int(payload_existing.get("id") or 0),
+                    "pack_key": str(payload_existing.get("pack_key") or safe_pack_key),
+                    "pack_title": str(payload_existing.get("pack_title") or safe_pack_title),
+                    "amount": int(payload_existing.get("amount") or safe_amount),
+                    "currency": str(payload_existing.get("currency") or safe_currency),
+                    "rewards_applied": rewards_applied,
+                }
+
+            summary = await self._apply_promocode_payload_tx(db, safe_user_id, normalized_rewards)
+            if summary.get("error"):
+                await db.rollback()
+                return False, "Не удалось выдать награды после оплаты.", None
+
+            rewards_applied_json = json.dumps(summary, ensure_ascii=False)
+            cursor = await db.execute(
+                """
+                INSERT INTO donation_purchases
+                (
+                    user_id, pack_key, pack_title, currency, amount, invoice_payload,
+                    telegram_payment_charge_id, provider_payment_charge_id, reward_payload,
+                    rewards_applied, status, created_date, confirmed_date
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'paid', ?, ?)
+                """,
+                (
+                    safe_user_id,
+                    safe_pack_key,
+                    safe_pack_title,
+                    safe_currency,
+                    safe_amount,
+                    safe_invoice_payload,
+                    safe_tg_charge,
+                    safe_provider_charge,
+                    json.dumps(normalized_rewards, ensure_ascii=False),
+                    rewards_applied_json,
+                    now_iso,
+                    now_iso,
+                ),
+            )
+            purchase_id = int(cursor.lastrowid or 0)
+            await db.commit()
+
+        try:
+            await self.log_player_activity(
+                user_id=safe_user_id,
+                activity_type="donation_purchase",
+                details=f"Покупка донат-пакета {safe_pack_key} ({safe_amount} {safe_currency})",
+                value=float(safe_amount),
+            )
+        except Exception:
+            pass
+
+        return True, "Оплата подтверждена, награды выданы.", {
+            "already_applied": False,
+            "purchase_id": purchase_id,
+            "pack_key": safe_pack_key,
+            "pack_title": safe_pack_title,
+            "amount": safe_amount,
+            "currency": safe_currency,
+            "rewards_applied": summary,
+        }
+
+    async def list_promocodes_for_user(
+        self,
+        user_id: int,
+        limit: int = 20,
+        include_inactive: bool = False,
+    ) -> List[Dict[str, Any]]:
+        safe_limit = max(1, min(int(limit or 20), 100))
+        now = datetime.now().isoformat()
+        where_parts = []
+        params: List[Any] = [int(user_id)]
+        if include_inactive:
+            where_parts.append("1 = 1")
+        else:
+            where_parts.append("pc.is_active = 1")
+            where_parts.append("(pc.expires_at IS NULL OR pc.expires_at = '' OR pc.expires_at > ?)")
+            where_parts.append("(pc.max_uses <= 0 OR pc.uses_count < pc.max_uses)")
+            params.append(now)
+        params.append(safe_limit)
+        query = f"""
+            SELECT pc.*,
+                   COALESCE(NULLIF(u.nickname, ''), NULLIF(u.full_name, ''), NULLIF(u.username, ''), CAST(pc.created_by AS TEXT)) AS creator_name,
+                   CASE WHEN pcc.id IS NULL THEN 0 ELSE 1 END AS claimed_by_user
+            FROM promo_codes pc
+            LEFT JOIN users u ON u.user_id = pc.created_by
+            LEFT JOIN promo_code_claims pcc ON pcc.promo_id = pc.id AND pcc.user_id = ?
+            WHERE {' AND '.join(where_parts)}
+            ORDER BY pc.created_date DESC, pc.id DESC
+            LIMIT ?
+        """
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, tuple(params)) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+    async def list_promocodes_admin(self, limit: int = 24, include_inactive: bool = True) -> List[Dict[str, Any]]:
+        safe_limit = max(1, min(int(limit or 24), 120))
+        where_sql = "" if include_inactive else "WHERE pc.is_active = 1"
+        query = f"""
+            SELECT pc.*,
+                   COALESCE(NULLIF(u.nickname, ''), NULLIF(u.full_name, ''), NULLIF(u.username, ''), CAST(pc.created_by AS TEXT)) AS creator_name
+            FROM promo_codes pc
+            LEFT JOIN users u ON u.user_id = pc.created_by
+            {where_sql}
+            ORDER BY pc.created_date DESC, pc.id DESC
+            LIMIT ?
+        """
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, (safe_limit,)) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+    async def create_promocode(
+        self,
+        actor_id: int,
+        code: str,
+        description: str,
+        rewards: Dict[str, Any],
+        max_uses: int = 0,
+        expires_hours: int = 0,
+        allow_system: bool = False,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        authority = await self.get_government_authority(int(actor_id))
+        if authority != "president" and not allow_system:
+            return False, "Только президент может создавать промокоды.", None
+
+        promo_code = _normalize_promocode_code(code)
+        if len(promo_code) < 3:
+            return False, "Код промокода слишком короткий (минимум 3 символа).", None
+
+        clean_description = " ".join(str(description or "").strip().split())
+        if len(clean_description) > 240:
+            clean_description = clean_description[:240]
+
+        safe_max_uses = max(0, min(int(max_uses or 0), 5_000_000))
+        safe_expires_hours = max(0, min(int(expires_hours or 0), 24 * 365))
+        normalized_rewards = self._normalize_promocode_payload(rewards)
+        if not self._promocode_payload_has_rewards(normalized_rewards):
+            return False, "Промокод должен содержать хотя бы одну награду.", None
+
+        now_dt = datetime.now()
+        now = now_dt.isoformat()
+        expires_at = (now_dt + timedelta(hours=safe_expires_hours)).isoformat() if safe_expires_hours > 0 else None
+
+        async with self._connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT id FROM promo_codes WHERE upper(code) = ? LIMIT 1",
+                (promo_code.upper(),),
+            ) as cursor:
+                exists = await cursor.fetchone()
+            if exists:
+                await db.rollback()
+                return False, "Промокод с таким кодом уже существует.", None
+
+            cursor = await db.execute(
+                """
+                INSERT INTO promo_codes
+                (code, description, reward_payload, created_by, created_date, expires_at, max_uses, uses_count, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1)
+                """,
+                (
+                    promo_code,
+                    clean_description or None,
+                    json.dumps(normalized_rewards, ensure_ascii=False),
+                    int(actor_id),
+                    now,
+                    expires_at,
+                    int(safe_max_uses),
+                ),
+            )
+            promo_id = int(cursor.lastrowid or 0)
+            await db.commit()
+
+        await self.log_player_activity(
+            user_id=int(actor_id),
+            activity_type="promo_create",
+            details=f"Создан промокод {promo_code}",
+            value=float(safe_max_uses or 0),
+        )
+        return True, "Промокод создан.", {
+            "promo_id": promo_id,
+            "code": promo_code,
+            "description": clean_description,
+            "max_uses": int(safe_max_uses),
+            "expires_at": expires_at,
+            "rewards": normalized_rewards,
+        }
+
+    async def set_promocode_active(
+        self,
+        actor_id: int,
+        promo_id: int,
+        is_active: bool,
+        allow_system: bool = False,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        authority = await self.get_government_authority(int(actor_id))
+        if authority != "president" and not allow_system:
+            return False, "Только президент может управлять промокодами.", None
+        safe_promo_id = int(promo_id or 0)
+        if safe_promo_id <= 0:
+            return False, "Некорректный промокод.", None
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute("SELECT * FROM promo_codes WHERE id = ? LIMIT 1", (safe_promo_id,)) as cursor:
+                row = await cursor.fetchone()
+            if not row:
+                await db.rollback()
+                return False, "Промокод не найден.", None
+
+            await db.execute(
+                "UPDATE promo_codes SET is_active = ? WHERE id = ?",
+                (1 if is_active else 0, safe_promo_id),
+            )
+            await db.commit()
+
+        return True, "Статус промокода обновлен.", {
+            "promo_id": safe_promo_id,
+            "is_active": bool(is_active),
+            "code": str(row["code"] or ""),
+        }
+
+    async def redeem_promocode(
+        self,
+        user_id: int,
+        code: str,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_user_id = int(user_id or 0)
+        if safe_user_id <= 0:
+            return False, "Некорректный игрок.", None
+        promo_code = _normalize_promocode_code(code)
+        if len(promo_code) < 3:
+            return False, "Некорректный промокод.", None
+
+        now = datetime.now().isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT * FROM promo_codes WHERE upper(code) = ? LIMIT 1",
+                (promo_code.upper(),),
+            ) as cursor:
+                promo_row = await cursor.fetchone()
+            if not promo_row:
+                await db.rollback()
+                return False, "Промокод не найден.", None
+
+            promo_id = int(promo_row["id"] or 0)
+            if int(promo_row["is_active"] or 0) != 1:
+                await db.rollback()
+                return False, "Промокод не активен.", None
+
+            expires_at = str(promo_row["expires_at"] or "").strip()
+            if expires_at and expires_at <= now:
+                await db.execute("UPDATE promo_codes SET is_active = 0 WHERE id = ?", (promo_id,))
+                await db.commit()
+                return False, "Срок действия промокода истек.", None
+
+            max_uses = int(promo_row["max_uses"] or 0)
+            uses_count = int(promo_row["uses_count"] or 0)
+            if max_uses > 0 and uses_count >= max_uses:
+                await db.execute("UPDATE promo_codes SET is_active = 0 WHERE id = ?", (promo_id,))
+                await db.commit()
+                return False, "Лимит активаций промокода исчерпан.", None
+
+            async with db.execute(
+                "SELECT id FROM promo_code_claims WHERE promo_id = ? AND user_id = ? LIMIT 1",
+                (promo_id, safe_user_id),
+            ) as cursor:
+                already_claimed = await cursor.fetchone()
+            if already_claimed:
+                await db.rollback()
+                return False, "Вы уже активировали этот промокод.", None
+
+            try:
+                rewards_raw = json.loads(str(promo_row["reward_payload"] or "{}"))
+            except Exception:
+                rewards_raw = {}
+            normalized_rewards = self._normalize_promocode_payload(rewards_raw if isinstance(rewards_raw, dict) else {})
+            if not self._promocode_payload_has_rewards(normalized_rewards):
+                await db.rollback()
+                return False, "Промокод не содержит наград.", None
+
+            summary = await self._apply_promocode_payload_tx(db, safe_user_id, normalized_rewards)
+            if summary.get("error"):
+                await db.rollback()
+                return False, "Не удалось применить награды промокода.", None
+
+            await db.execute(
+                """
+                INSERT INTO promo_code_claims (promo_id, user_id, claimed_date, payload_snapshot)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    promo_id,
+                    safe_user_id,
+                    now,
+                    json.dumps(summary, ensure_ascii=False),
+                ),
+            )
+
+            new_uses_count = uses_count + 1
+            should_disable = bool(max_uses > 0 and new_uses_count >= max_uses)
+            await db.execute(
+                "UPDATE promo_codes SET uses_count = ?, is_active = ? WHERE id = ?",
+                (new_uses_count, 0 if should_disable else 1, promo_id),
+            )
+            await db.commit()
+
+        await self.log_player_activity(
+            user_id=safe_user_id,
+            activity_type="promo_redeem",
+            details=f"Активирован промокод {promo_code}",
+            value=float(new_uses_count),
+        )
+        return True, "Промокод успешно активирован.", {
+            "promo_id": promo_id,
+            "code": str(promo_row["code"] or promo_code),
+            "description": str(promo_row["description"] or ""),
+            "uses_count": int(new_uses_count),
+            "max_uses": int(max_uses),
+            "expires_at": expires_at or None,
+            "rewards_applied": summary,
+            "is_active_after": not should_disable,
+        }
 
     async def apply_currency_rebalance_once(self, force: bool = False) -> Dict[str, Any]:
         """
@@ -2061,7 +3936,7 @@ class AsyncDatabase:
         scaled_columns = 0
         users_reset = 0
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
 
@@ -2135,6 +4010,369 @@ class AsyncDatabase:
             "applied_at": now,
         }
 
+    async def apply_salary_rebalance_once(
+        self,
+        multiplier: float = JOB_SALARY_MULTIPLIER,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Одноразово увеличивает зарплаты:
+        - гражданские вакансии (users.citizen_salary);
+        - должности в организациях (organization_members.salary);
+        - ожидаемые зарплаты в pending HR-заявках.
+        """
+        safe_multiplier = max(1.0, min(float(multiplier or JOB_SALARY_MULTIPLIER), 10.0))
+        done_key = "salary_rebalance_v2_done"
+        if not force:
+            done_flag = await self.get_system_state(done_key)
+            if done_flag == "1":
+                return {"applied": False, "reason": "already_applied", "multiplier": safe_multiplier}
+
+        now = datetime.now().isoformat()
+        citizens_updated = 0
+        org_members_updated = 0
+        applications_updated = 0
+        citizens_floor_fixed = 0
+        applications_floor_fixed = 0
+        users_salary_synced = 0
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+
+            cursor = await db.execute(
+                """
+                UPDATE users
+                SET citizen_salary = ROUND(COALESCE(citizen_salary, 0) * ?, 2)
+                WHERE COALESCE(citizen_job, '') <> '' AND COALESCE(citizen_salary, 0) > 0
+                """,
+                (safe_multiplier,),
+            )
+            citizens_updated = int(cursor.rowcount or 0)
+
+            cursor = await db.execute(
+                """
+                UPDATE organization_members
+                SET salary = ROUND(COALESCE(salary, 0) * ?, 2)
+                WHERE COALESCE(salary, 0) > 0
+                """,
+                (safe_multiplier,),
+            )
+            org_members_updated = int(cursor.rowcount or 0)
+
+            cursor = await db.execute(
+                """
+                UPDATE job_applications
+                SET expected_salary = ROUND(COALESCE(expected_salary, 0) * ?, 2)
+                WHERE status = 'pending' AND COALESCE(expected_salary, 0) > 0
+                """,
+                (safe_multiplier,),
+            )
+            applications_updated = int(cursor.rowcount or 0)
+
+            cursor = await db.execute(
+                """
+                UPDATE users
+                SET citizen_salary = ?
+                WHERE COALESCE(citizen_job, '') <> ''
+                  AND COALESCE(citizen_salary, 0) < ?
+                """,
+                (MIN_CITIZEN_HOURLY_SALARY, MIN_CITIZEN_HOURLY_SALARY),
+            )
+            citizens_floor_fixed = int(cursor.rowcount or 0)
+
+            cursor = await db.execute(
+                """
+                UPDATE job_applications
+                SET expected_salary = ?
+                WHERE status = 'pending' AND COALESCE(expected_salary, 0) < ?
+                """,
+                (MIN_CITIZEN_HOURLY_SALARY, MIN_CITIZEN_HOURLY_SALARY),
+            )
+            applications_floor_fixed = int(cursor.rowcount or 0)
+
+            cursor = await db.execute(
+                """
+                UPDATE users
+                SET salary = ROUND(
+                    CASE
+                        WHEN EXISTS (SELECT 1 FROM organization_members om WHERE om.user_id = users.user_id)
+                            THEN COALESCE(
+                                (
+                                    SELECT MAX(COALESCE(om2.salary, 0))
+                                    FROM organization_members om2
+                                    WHERE om2.user_id = users.user_id
+                                ),
+                                0
+                            )
+                        WHEN COALESCE(citizen_job, '') <> '' THEN COALESCE(citizen_salary, 0)
+                        ELSE 0
+                    END,
+                    2
+                )
+                """
+            )
+            users_salary_synced = int(cursor.rowcount or 0)
+
+            await db.execute(
+                """
+                INSERT INTO system_state (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (done_key, "1"),
+            )
+            await db.execute(
+                """
+                INSERT INTO system_state (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                ("salary_rebalance_v2_applied_at", now),
+            )
+            await db.execute(
+                """
+                INSERT INTO system_state (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                ("salary_rebalance_v2_multiplier", str(round(safe_multiplier, 4))),
+            )
+            await db.commit()
+
+        return {
+            "applied": True,
+            "multiplier": round(safe_multiplier, 4),
+            "citizens_updated": citizens_updated,
+            "citizens_floor_fixed": citizens_floor_fixed,
+            "org_members_updated": org_members_updated,
+            "applications_updated": applications_updated,
+            "applications_floor_fixed": applications_floor_fixed,
+            "users_salary_synced": users_salary_synced,
+            "applied_at": now,
+        }
+
+    async def ensure_citizen_salary_floor_once(
+        self,
+        minimum_salary: float = MIN_CITIZEN_HOURLY_SALARY,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        safe_minimum = round(max(100.0, float(minimum_salary or MIN_CITIZEN_HOURLY_SALARY)), 2)
+        done_key = "salary_floor_v1_done"
+        if not force:
+            done_flag = await self.get_system_state(done_key)
+            if done_flag == "1":
+                return {"applied": False, "reason": "already_applied", "minimum_salary": safe_minimum}
+
+        now = datetime.now().isoformat()
+        users_updated = 0
+        user_salary_synced = 0
+        applications_updated = 0
+        catalog_updated = 0
+        for job in JOB_CATALOG:
+            current_salary = round(float(job.get("salary") or 0.0), 2)
+            if current_salary < safe_minimum:
+                job["salary"] = safe_minimum
+                catalog_updated += 1
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                """
+                UPDATE users
+                SET citizen_salary = ?
+                WHERE COALESCE(citizen_job, '') <> '' AND COALESCE(citizen_salary, 0) < ?
+                """,
+                (safe_minimum, safe_minimum),
+            )
+            users_updated = int(cursor.rowcount or 0)
+
+            cursor = await db.execute(
+                """
+                UPDATE users
+                SET salary = ?
+                WHERE COALESCE(citizen_job, '') <> '' AND COALESCE(salary, 0) < ?
+                """,
+                (safe_minimum, safe_minimum),
+            )
+            user_salary_synced = int(cursor.rowcount or 0)
+
+            cursor = await db.execute(
+                """
+                UPDATE job_applications
+                SET expected_salary = ?
+                WHERE status = 'pending' AND COALESCE(expected_salary, 0) < ?
+                """,
+                (safe_minimum, safe_minimum),
+            )
+            applications_updated = int(cursor.rowcount or 0)
+
+            await db.execute(
+                """
+                INSERT INTO system_state (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (done_key, "1"),
+            )
+            await db.execute(
+                """
+                INSERT INTO system_state (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                ("salary_floor_v1_applied_at", now),
+            )
+            await db.execute(
+                """
+                INSERT INTO system_state (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                ("salary_floor_v1_minimum", str(safe_minimum)),
+            )
+            await db.commit()
+
+        return {
+            "applied": True,
+            "minimum_salary": safe_minimum,
+            "catalog_updated": catalog_updated,
+            "users_updated": users_updated,
+            "user_salary_synced": user_salary_synced,
+            "applications_updated": applications_updated,
+            "applied_at": now,
+        }
+
+    async def raise_property_prices_once(
+        self,
+        multiplier: float = 1.65,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        """Одноразово повышает стоимость недвижимости и аренды."""
+        safe_multiplier = max(1.05, min(float(multiplier or 1.65), 6.0))
+        done_key = "property_price_raise_v2_done"
+        if not force:
+            done_flag = await self.get_system_state(done_key)
+            if done_flag == "1":
+                return {"applied": False, "reason": "already_applied", "multiplier": safe_multiplier}
+
+        now = datetime.now().isoformat()
+        updated_rows = 0
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                """
+                UPDATE properties
+                SET price = ROUND(COALESCE(price, 0) * ?, 2),
+                    rent = ROUND(COALESCE(rent, 0) * ?, 2),
+                    maintenance_daily = ROUND(COALESCE(maintenance_daily, 0) * ?, 2)
+                """,
+                (
+                    safe_multiplier,
+                    max(1.05, safe_multiplier * 0.9),
+                    max(1.03, safe_multiplier * 0.75),
+                ),
+            )
+            updated_rows = int(cursor.rowcount or 0)
+            await db.execute(
+                """
+                INSERT INTO system_state (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (done_key, "1"),
+            )
+            await db.execute(
+                """
+                INSERT INTO system_state (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                ("property_price_raise_v2_applied_at", now),
+            )
+            await db.execute(
+                """
+                INSERT INTO system_state (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                ("property_price_raise_v2_multiplier", str(round(safe_multiplier, 4))),
+            )
+            await db.commit()
+
+        return {
+            "applied": True,
+            "multiplier": round(safe_multiplier, 4),
+            "updated_rows": updated_rows,
+            "applied_at": now,
+        }
+
+    async def reset_tax_system_state(
+        self,
+        cycle_date: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Полностью сбросить налоговые долги/историю для всех игроков."""
+        now = datetime.now().isoformat()
+        cycle = (cycle_date or datetime.now().date().isoformat()).strip()
+        users_total = 0
+        tax_logs_deleted = 0
+        invoices_deleted = 0
+        business_reports_deleted = 0
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+
+            async with db.execute("SELECT COUNT(*) FROM users") as cursor:
+                row = await cursor.fetchone()
+                users_total = int((row[0] if row else 0) or 0)
+
+            await db.execute(
+                """
+                UPDATE users
+                SET tax_debt = 0,
+                    total_tax_paid = 0,
+                    tax_unpaid_streak = 0,
+                    tax_disabled = 0
+                """
+            )
+
+            cursor = await db.execute("DELETE FROM tax_logs")
+            tax_logs_deleted = int(cursor.rowcount or 0)
+            cursor = await db.execute("DELETE FROM daily_tax_invoices")
+            invoices_deleted = int(cursor.rowcount or 0)
+            cursor = await db.execute("DELETE FROM business_tax_reports")
+            business_reports_deleted = int(cursor.rowcount or 0)
+
+            await db.execute(
+                """
+                INSERT INTO system_state (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                ("tax_reset_last_cycle", cycle),
+            )
+            await db.execute(
+                """
+                INSERT INTO system_state (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                ("tax_reset_applied_at", now),
+            )
+            await db.commit()
+
+        return {
+            "cycle_date": cycle,
+            "users_total": users_total,
+            "tax_logs_deleted": tax_logs_deleted,
+            "invoices_deleted": invoices_deleted,
+            "business_reports_deleted": business_reports_deleted,
+            "reset_at": now,
+        }
+
     def _normalize_referral_code(self, raw_code: str) -> str:
         raw = str(raw_code or "").strip()
         if not raw:
@@ -2186,7 +4424,7 @@ class AsyncDatabase:
             ORDER BY re.created_date DESC
             LIMIT 12
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (safe_user_id,)) as cursor:
                 row = await cursor.fetchone()
@@ -2224,7 +4462,7 @@ class AsyncDatabase:
         referred_id = int(referred_user_id)
         now = datetime.now().isoformat()
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
 
@@ -2369,7 +4607,7 @@ class AsyncDatabase:
         if safe_budget > 50_000:
             return False, "Слишком большой бюджет маркетинга за один запуск.", None
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
 
@@ -2430,7 +4668,7 @@ class AsyncDatabase:
     async def claim_referral_gift(self, user_id: int) -> tuple[bool, str, Optional[Dict[str, Any]]]:
         uid = int(user_id)
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -2537,7 +4775,7 @@ class AsyncDatabase:
                 id DESC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (int(user_id), safe_limit)) as cursor:
                 rows = await cursor.fetchall()
@@ -2548,30 +4786,58 @@ class AsyncDatabase:
         owner_id: int,
         tier: str,
         project_name: str = "",
+        custom_invest: Optional[float] = None,
     ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
         safe_owner = int(owner_id)
         tier_code = str(tier or "").strip().lower()
         tier_cfg: Dict[str, Dict[str, Any]] = {
-            "small": {"title": "Малый ЖК", "invest": 280.0, "minutes": 25, "mult_min": 1.20, "mult_max": 1.42},
-            "district": {"title": "Городской квартал", "invest": 950.0, "minutes": 90, "mult_min": 1.24, "mult_max": 1.56},
-            "mega": {"title": "Сити-проект", "invest": 2600.0, "minutes": 240, "mult_min": 1.30, "mult_max": 1.65},
+            "small": {"title": "Малый ЖК", "invest": 2_000.0, "minutes": 25, "mult_min": 1.20, "mult_max": 1.42},
+            "district": {"title": "Городской квартал", "invest": 3_000.0, "minutes": 90, "mult_min": 1.24, "mult_max": 1.56},
+            "mega": {"title": "Сити-проект", "invest": 4_000.0, "minutes": 240, "mult_min": 1.30, "mult_max": 1.65},
         }
-        cfg = tier_cfg.get(tier_code)
-        if not cfg:
-            return False, "Неизвестный тип проекта.", None
+        build_minutes = 0
+        mult_boost = 0.0
+        if tier_code == "custom":
+            try:
+                invested = round(float(custom_invest or 0), 2)
+            except Exception:
+                return False, "Некорректная сумма инвестиций.", None
+            if invested < 2_000:
+                return False, "Минимальная инвестиция в кастомный проект: $2,000.", None
+            if invested > 10_000_000:
+                return False, "Слишком большая сумма для одного проекта.", None
+            if invested < 3_000:
+                tier_code = "small"
+            elif invested < 4_000:
+                tier_code = "district"
+            else:
+                tier_code = "mega"
+            cfg = tier_cfg[tier_code]
+            size_factor = max(0.8, min(20.0, invested / float(cfg["invest"])))
+            build_minutes = int(round(float(cfg["minutes"]) * (size_factor ** 0.9)))
+            build_minutes = max(int(float(cfg["minutes"]) * 0.8), min(24 * 60, build_minutes))
+            mult_boost = min(0.35, max(0.0, (size_factor - 1.0) * 0.05))
+        else:
+            cfg = tier_cfg.get(tier_code)
+            if not cfg:
+                return False, "Неизвестный тип проекта.", None
+            invested = float(cfg["invest"])
+            build_minutes = int(cfg["minutes"])
 
         now_dt = datetime.now()
         now = now_dt.isoformat()
-        ready_dt = now_dt + timedelta(minutes=int(cfg["minutes"]))
+        ready_dt = now_dt + timedelta(minutes=build_minutes)
         ready_date = ready_dt.isoformat()
-        invested = float(cfg["invest"])
 
         clean_name = " ".join((project_name or "").strip().split())
         if not clean_name:
-            clean_name = f"{cfg['title']} #{now_dt.strftime('%H%M')}"
+            if str(tier or "").strip().lower() == "custom":
+                clean_name = f"{cfg['title']} custom ${invested:,.0f} #{now_dt.strftime('%H%M')}"
+            else:
+                clean_name = f"{cfg['title']} #{now_dt.strftime('%H%M')}"
         clean_name = clean_name[:80]
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
 
@@ -2605,7 +4871,10 @@ class AsyncDatabase:
                 except Exception:
                     inflation_index = 1.0
 
-            random_mult = random.uniform(float(cfg["mult_min"]), float(cfg["mult_max"]))
+            random_mult = random.uniform(
+                float(cfg["mult_min"]) + (mult_boost * 0.35),
+                float(cfg["mult_max"]) + mult_boost,
+            )
             inflation_bonus = 1.0 + ((inflation_index - 1.0) * 0.10)
             expected_payout = round(invested * random_mult * inflation_bonus, 2)
             new_balance = round(balance - invested, 2)
@@ -2639,13 +4908,87 @@ class AsyncDatabase:
             "invested": invested,
             "expected_payout": expected_payout,
             "ready_date": ready_date,
+            "build_minutes": build_minutes,
             "new_balance": new_balance,
         }
         text = (
             f"Проект запущен: {clean_name}. "
-            f"Инвестиция ${invested:,.2f}, ожидаемая выплата ${expected_payout:,.2f}."
+            f"Инвестиция ${invested:,.2f}, срок ~{build_minutes} мин, ожидаемая выплата ${expected_payout:,.2f}."
         )
         return True, text, result
+
+    def _developer_property_blueprint(
+        self,
+        project_row: Any,
+        project_id: int,
+        payout: float,
+    ) -> Dict[str, Any]:
+        tier_code = str(project_row["tier"] or "").strip().lower()
+        tier_rewards: Dict[str, Dict[str, Any]] = {
+            "small": {
+                "title": "Малый ЖК",
+                "location": "Пригород, жилой кластер",
+                "category": "residential",
+                "fallback_sale_price": 2_000.0,
+                "rent_mult": 0.0150,
+                "min_rent": 450.0,
+                "maint_mult": 0.0020,
+                "min_maint": 90.0,
+            },
+            "district": {
+                "title": "Квартал",
+                "location": "Центральный район, деловой квартал",
+                "category": "commercial",
+                "fallback_sale_price": 3_000.0,
+                "rent_mult": 0.0155,
+                "min_rent": 620.0,
+                "maint_mult": 0.0022,
+                "min_maint": 120.0,
+            },
+            "mega": {
+                "title": "Сити-проект",
+                "location": "Ташкент-Сити, Премиум сектор",
+                "category": "commercial",
+                "fallback_sale_price": 4_000.0,
+                "rent_mult": 0.0160,
+                "min_rent": 840.0,
+                "maint_mult": 0.0025,
+                "min_maint": 160.0,
+            },
+        }
+        cfg = tier_rewards.get(tier_code) or {
+            "title": "Инвест-объект",
+            "location": "Развивающийся район",
+            "category": "residential",
+            "fallback_sale_price": 2_500.0,
+            "rent_mult": 0.0150,
+            "min_rent": 500.0,
+            "maint_mult": 0.0020,
+            "min_maint": 100.0,
+        }
+        base_name = str(project_row["project_name"] or f"{cfg['title']} #{int(project_id)}").strip()
+        property_name = f"{base_name[:44]} #{int(project_id)}"
+        try:
+            developer_sale_price = round(float(project_row["invested"] or 0), 2)
+        except Exception:
+            developer_sale_price = 0.0
+        if developer_sale_price <= 0:
+            developer_sale_price = round(float(cfg["fallback_sale_price"]), 2)
+
+        # По требованию игрового баланса: цена объекта в недвижимости = цена застройщика * 20.
+        property_price = round(developer_sale_price * 20.0, 2)
+        property_rent = round(max(float(cfg["min_rent"]), property_price * float(cfg["rent_mult"])), 2)
+        maintenance = round(max(float(cfg["min_maint"]), property_price * float(cfg["maint_mult"])), 2)
+        return {
+            "name": property_name,
+            "price": property_price,
+            "rent": property_rent,
+            "location": str(cfg["location"]),
+            "category": str(cfg["category"]),
+            "maintenance_daily": maintenance,
+            "developer_sale_price": developer_sale_price,
+            "tier": tier_code or "fallback",
+        }
 
     async def claim_developer_project(
         self,
@@ -2656,8 +4999,9 @@ class AsyncDatabase:
         safe_project = int(project_id)
         now_dt = datetime.now()
         now = now_dt.isoformat()
+        created_property: Optional[Dict[str, Any]] = None
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
 
@@ -2682,11 +5026,14 @@ class AsyncDatabase:
 
             ready_date_raw = str(project["ready_date"] or "")
             try:
-                ready_dt = datetime.fromisoformat(ready_date_raw) if ready_date_raw else now_dt
+                ready_dt = datetime.fromisoformat(ready_date_raw.replace("Z", "+00:00")) if ready_date_raw else now_dt
+                if ready_dt.tzinfo is not None:
+                    ready_dt = ready_dt.astimezone().replace(tzinfo=None)
             except Exception:
                 ready_dt = now_dt
 
-            if now_dt < ready_dt:
+            # Совместимость: проекты со статусом ready считаются готовыми даже при старом/битом формате даты.
+            if status != "ready" and now_dt < ready_dt:
                 await db.rollback()
                 remain = ready_dt - now_dt
                 remain_minutes = max(1, int(remain.total_seconds() // 60))
@@ -2711,6 +5058,60 @@ class AsyncDatabase:
                 """,
                 (now, safe_project),
             )
+
+            blueprint = self._developer_property_blueprint(project, safe_project, payout)
+            async with db.execute(
+                "SELECT id FROM properties WHERE name = ? LIMIT 1",
+                (str(blueprint["name"]),),
+            ) as cursor:
+                existing_property = await cursor.fetchone()
+            property_id = int(existing_property["id"] or 0) if existing_property else 0
+
+            if property_id <= 0:
+                cursor = await db.execute(
+                    """
+                    INSERT INTO properties
+                    (name, price, rent, location, status, category, maintenance_daily, condition)
+                    VALUES (?, ?, ?, ?, 'owned', ?, ?, 100)
+                    """,
+                    (
+                        str(blueprint["name"]),
+                        float(blueprint["price"]),
+                        float(blueprint["rent"]),
+                        str(blueprint["location"]),
+                        str(blueprint["category"]),
+                        float(blueprint["maintenance_daily"]),
+                    ),
+                )
+                property_id = int(cursor.lastrowid or 0)
+
+            if property_id > 0:
+                async with db.execute(
+                    "SELECT owner_id FROM property_ownership WHERE property_id = ? LIMIT 1",
+                    (property_id,),
+                ) as cursor:
+                    owner_row = await cursor.fetchone()
+                owner_id_for_property = int(owner_row["owner_id"] or 0) if owner_row else 0
+                if owner_id_for_property <= 0:
+                    await db.execute(
+                        """
+                        INSERT INTO property_ownership (property_id, owner_id, acquired_date, last_rent_claimed)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (property_id, safe_owner, now, now),
+                    )
+                    await db.execute("UPDATE properties SET status = 'owned' WHERE id = ?", (property_id,))
+                    owner_id_for_property = safe_owner
+
+                if owner_id_for_property == safe_owner:
+                    await db.execute("UPDATE users SET property_owner = 1 WHERE user_id = ?", (safe_owner,))
+                    created_property = {
+                        "property_id": property_id,
+                        "property_name": str(blueprint["name"]),
+                        "property_price": float(blueprint["price"]),
+                        "tier": str(blueprint["tier"]),
+                    }
+
             await db.commit()
 
         try:
@@ -2728,9 +5129,95 @@ class AsyncDatabase:
             "payout": payout,
             "new_balance": new_balance,
             "project_name": str(project["project_name"] or ""),
+            "created_property": created_property,
         }
         text = f"Проект завершен. Выплата: +${payout:,.2f}."
+        if created_property:
+            text += (
+                f" В недвижимость добавлен объект '{created_property['property_name']}' "
+                f"(оценка ${float(created_property['property_price']):,.2f})."
+            )
         return True, text, result
+
+    async def sync_missing_developer_properties(self, owner_id: int, limit: int = 40) -> Dict[str, Any]:
+        """
+        Восстановить недвижимость по уже завершенным проектам, если в прошлых версиях она не была создана.
+        """
+        safe_owner = int(owner_id or 0)
+        safe_limit = max(1, min(int(limit or 40), 200))
+        if safe_owner <= 0:
+            return {"created": 0, "properties": []}
+
+        created_names: List[str] = []
+        now = datetime.now().isoformat()
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+
+            async with db.execute(
+                """
+                SELECT id, project_name, tier, expected_payout, claimed_date
+                FROM developer_projects
+                WHERE owner_id = ? AND status = 'claimed'
+                ORDER BY claimed_date DESC, id DESC
+                LIMIT ?
+                """,
+                (safe_owner, safe_limit),
+            ) as cursor:
+                projects = await cursor.fetchall()
+
+            for row in projects:
+                project_id = int(row["id"] or 0)
+                if project_id <= 0:
+                    continue
+                payout = round(float(row["expected_payout"] or 0), 2)
+                blueprint = self._developer_property_blueprint(row, project_id, payout)
+                property_name = str(blueprint["name"])
+                async with db.execute(
+                    "SELECT id FROM properties WHERE name = ? LIMIT 1",
+                    (property_name,),
+                ) as cursor:
+                    prop_row = await cursor.fetchone()
+                if prop_row:
+                    continue
+
+                acquired_date = str(row["claimed_date"] or now)
+                cursor = await db.execute(
+                    """
+                    INSERT INTO properties
+                    (name, price, rent, location, status, category, maintenance_daily, condition)
+                    VALUES (?, ?, ?, ?, 'owned', ?, ?, 100)
+                    """,
+                    (
+                        property_name,
+                        float(blueprint["price"]),
+                        float(blueprint["rent"]),
+                        str(blueprint["location"]),
+                        str(blueprint["category"]),
+                        float(blueprint["maintenance_daily"]),
+                    ),
+                )
+                property_id = int(cursor.lastrowid or 0)
+                if property_id <= 0:
+                    continue
+                await db.execute(
+                    """
+                    INSERT INTO property_ownership (property_id, owner_id, acquired_date, last_rent_claimed)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (property_id, safe_owner, acquired_date, acquired_date),
+                )
+                created_names.append(property_name)
+
+            if created_names:
+                await db.execute("UPDATE users SET property_owner = 1 WHERE user_id = ?", (safe_owner,))
+            await db.commit()
+
+        return {
+            "created": len(created_names),
+            "properties": created_names[:20],
+        }
 
     async def get_inflation_snapshot(self) -> Dict[str, Any]:
         values = {
@@ -2743,7 +5230,7 @@ class AsyncDatabase:
             FROM system_state
             WHERE key IN ('inflation_index', 'inflation_daily_rate', 'inflation_last_date')
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(query) as cursor:
                 rows = await cursor.fetchall()
                 for row in rows:
@@ -2771,7 +5258,7 @@ class AsyncDatabase:
             return {"applied": False, "date": today, **snapshot}
 
         index_before = float(snapshot.get("inflation_index") or 1.0)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
 
@@ -2849,7 +5336,7 @@ class AsyncDatabase:
         """Подать заявку в организацию"""
         now = datetime.now().isoformat()
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             # Проверяем существующую заявку
@@ -2859,7 +5346,7 @@ class AsyncDatabase:
             ) as cursor:
                 if await cursor.fetchone():
                     await db.rollback()
-                    return False, "📭 Вы уже подали заявку в эту организацию!"
+                    return False, "?? Вы уже подали заявку в эту организацию!"
             
             # Проверяем членство
             async with db.execute(
@@ -2868,7 +5355,7 @@ class AsyncDatabase:
             ) as cursor:
                 if await cursor.fetchone():
                     await db.rollback()
-                    return False, "👥 Вы уже являетесь членом этой организации!"
+                    return False, "?? Вы уже являетесь членом этой организации!"
 
             async with db.execute(
                 "SELECT id, name, requirements FROM organizations WHERE id = ? LIMIT 1",
@@ -2877,7 +5364,7 @@ class AsyncDatabase:
                 org = await cursor.fetchone()
             if not org:
                 await db.rollback()
-                return False, "❌ Организация не найдена."
+                return False, "? Организация не найдена."
             org_name = str(org["name"] or "")
             org_requirements = str(org["requirements"] or "")
 
@@ -2888,17 +5375,17 @@ class AsyncDatabase:
                 user_row = await cursor.fetchone()
             if not user_row:
                 await db.rollback()
-                return False, "❌ Игрок не найден."
+                return False, "? Игрок не найден."
 
             user_edu = int(user_row["education"] or 1)
             user_rep = float(user_row["reputation"] or 0.0)
             req_edu, req_rep = _parse_org_requirement_thresholds(org_requirements)
             if user_edu < req_edu:
                 await db.rollback()
-                return False, f"❌ Требуется образование {req_edu}+."
+                return False, f"? Требуется образование {req_edu}+."
             if user_rep < req_rep:
                 await db.rollback()
-                return False, f"❌ Требуется репутация {req_rep:.1f}+."
+                return False, f"? Требуется репутация {req_rep:.1f}+."
               
             # Создаем заявку
             cursor = await db.execute(
@@ -2976,11 +5463,11 @@ class AsyncDatabase:
                 (members_count, int(org_id)),
             )
             await db.commit()
-            return True, "✅ Заявка одобрена автоматически по требованиям организации."
+            return True, "? Заявка одобрена автоматически по требованиям организации."
     
     async def get_government_system(self) -> Optional[Dict[str, Any]]:
         """Получить текущую систему правления"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute('SELECT * FROM government_system ORDER BY id DESC LIMIT 1') as cursor:
                 row = await cursor.fetchone()
@@ -2992,7 +5479,7 @@ class AsyncDatabase:
 
     async def get_election(self, election_id: int) -> Optional[Dict[str, Any]]:
         """Получить выборы по ID"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute('SELECT * FROM elections WHERE id = ?', (election_id,)) as cursor:
                 row = await cursor.fetchone()
@@ -3002,7 +5489,7 @@ class AsyncDatabase:
 
     async def get_active_presidential_election(self) -> Optional[Dict[str, Any]]:
         """Получить активные выборы президента"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 '''SELECT e.* FROM elections e
@@ -3042,10 +5529,10 @@ class AsyncDatabase:
         now = datetime.now().isoformat()
         clean_name = " ".join((party_name or "").strip().split())
         if not clean_name:
-            return False, "❌ Укажите корректное название партии.", -1
+            return False, "? Укажите корректное название партии.", -1
 
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect() as db:
                 db.row_factory = aiosqlite.Row
                 await db.execute("BEGIN IMMEDIATE")
 
@@ -3057,21 +5544,21 @@ class AsyncDatabase:
 
                 if not election:
                     await db.rollback()
-                    return False, "❌ Выборы не найдены.", -1
+                    return False, "? Выборы не найдены.", -1
 
                 if election['status'] != 'active':
                     await db.rollback()
-                    return False, "❌ Эти выборы уже завершены.", -1
+                    return False, "? Эти выборы уже завершены.", -1
 
                 stage = _normalize_election_stage(election["stage"])
                 if stage in {"voting", "finished"}:
                     await db.rollback()
-                    return False, "❌ Создание партий закрыто на текущем этапе выборов.", -1
+                    return False, "? Создание партий закрыто на текущем этапе выборов.", -1
 
                 end_dt = _parse_iso_datetime(election["end_date"])
                 if end_dt and end_dt <= _now_for_datetime(end_dt):
                     await db.rollback()
-                    return False, "❌ Регистрация на эти выборы уже закрыта.", -1
+                    return False, "? Регистрация на эти выборы уже закрыта.", -1
 
                 async with db.execute(
                     '''SELECT p.id
@@ -3083,7 +5570,7 @@ class AsyncDatabase:
                 ) as cursor:
                     if await cursor.fetchone():
                         await db.rollback()
-                        return False, "❌ Вы уже состоите в партии на этих выборах.", -1
+                        return False, "? Вы уже состоите в партии на этих выборах.", -1
 
                 async with db.execute(
                     'SELECT id FROM parties WHERE election_id = ? AND lower(name) = lower(?)',
@@ -3091,7 +5578,7 @@ class AsyncDatabase:
                 ) as cursor:
                     if await cursor.fetchone():
                         await db.rollback()
-                        return False, "❌ Партия с таким названием уже зарегистрирована.", -1
+                        return False, "? Партия с таким названием уже зарегистрирована.", -1
 
                 async with db.execute(
                     '''INSERT INTO parties (name, leader_id, election_id, created_date, members_count, status, votes_total)
@@ -3120,16 +5607,16 @@ class AsyncDatabase:
                 )
 
                 await db.commit()
-                return True, f"✅ Партия '{clean_name}' успешно создана. Лидер добавлен в кандидаты.", party_id
+                return True, f"? Партия '{clean_name}' успешно создана. Лидер добавлен в кандидаты.", party_id
 
         except aiosqlite.IntegrityError:
-            return False, "❌ Не удалось создать партию: дублирующиеся данные.", -1
+            return False, "? Не удалось создать партию: дублирующиеся данные.", -1
         except Exception as e:
-            return False, f"❌ Ошибка при создании партии: {str(e)}", -1
+            return False, f"? Ошибка при создании партии: {str(e)}", -1
 
     async def get_party_by_leader(self, leader_id: int, election_id: int) -> Optional[Dict[str, Any]]:
         """Получить партию лидера в рамках конкретных выборов"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 'SELECT * FROM parties WHERE leader_id = ? AND election_id = ? LIMIT 1',
@@ -3142,7 +5629,7 @@ class AsyncDatabase:
 
     async def get_user_party_for_election(self, user_id: int, election_id: int) -> Optional[Dict[str, Any]]:
         """Получить партию пользователя (как лидера или участника) в текущих выборах"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 '''SELECT p.* FROM parties p
@@ -3158,7 +5645,7 @@ class AsyncDatabase:
 
     async def get_party(self, party_id: int) -> Optional[Dict[str, Any]]:
         """Получить партию по ID"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute('SELECT * FROM parties WHERE id = ?', (party_id,)) as cursor:
                 row = await cursor.fetchone()
@@ -3168,7 +5655,7 @@ class AsyncDatabase:
 
     async def get_party_members(self, party_id: int) -> List[Dict[str, Any]]:
         """Получить всех членов партии"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 '''SELECT pm.*,
@@ -3189,7 +5676,7 @@ class AsyncDatabase:
 
     async def count_invitable_players_for_party(self, election_id: int, party_id: int, leader_id: int) -> int:
         """Посчитать игроков, которых можно пригласить в партию на текущих выборах."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 '''SELECT COUNT(*)
                    FROM users u
@@ -3224,7 +5711,7 @@ class AsyncDatabase:
         """Получить страницу игроков, которых можно пригласить в партию."""
         safe_limit = max(1, min(int(limit or 8), 30))
         safe_offset = max(0, int(offset or 0))
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 '''SELECT u.user_id,
@@ -3258,7 +5745,7 @@ class AsyncDatabase:
         """Добавить члена в партию"""
         now = datetime.now().isoformat()
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect() as db:
                 db.row_factory = aiosqlite.Row
                 await db.execute("BEGIN IMMEDIATE")
 
@@ -3270,7 +5757,7 @@ class AsyncDatabase:
 
                 if not party_row:
                     await db.rollback()
-                    return False, "❌ Партия не найдена."
+                    return False, "? Партия не найдена."
 
                 election_id = party_row['election_id']
 
@@ -3284,7 +5771,7 @@ class AsyncDatabase:
                 ) as cursor:
                     if await cursor.fetchone():
                         await db.rollback()
-                        return False, "❌ Игрок уже состоит в партии на этих выборах."
+                        return False, "? Игрок уже состоит в партии на этих выборах."
 
                 await db.execute(
                     '''INSERT INTO party_members (party_id, user_id, joined_date, role)
@@ -3296,12 +5783,12 @@ class AsyncDatabase:
                     (party_id,)
                 )
                 await db.commit()
-                return True, "✅ Игрок добавлен в партию."
+                return True, "? Игрок добавлен в партию."
 
         except aiosqlite.IntegrityError:
-            return False, "❌ Этот игрок уже состоит в партии."
+            return False, "? Этот игрок уже состоит в партии."
         except Exception as e:
-            return False, f"❌ Ошибка: {str(e)}"
+            return False, f"? Ошибка: {str(e)}"
 
     async def leave_party_for_election(self, user_id: int, election_id: int) -> tuple[bool, str]:
         """
@@ -3310,9 +5797,8 @@ class AsyncDatabase:
         - передает лидерство старшему участнику, если он есть;
         - иначе партия автоматически распускается.
         """
-        now = datetime.now().isoformat()
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect() as db:
                 db.row_factory = aiosqlite.Row
                 await db.execute("BEGIN IMMEDIATE")
 
@@ -3330,7 +5816,7 @@ class AsyncDatabase:
 
                 if not membership:
                     await db.rollback()
-                    return False, "❌ Вы не состоите в партии на этих выборах."
+                    return False, "? Вы не состоите в партии на этих выборах."
 
                 party_id = int(membership["party_id"])
                 party_name = membership["name"] or "Партия"
@@ -3368,14 +5854,14 @@ class AsyncDatabase:
                             (party_id,),
                         )
                         await db.commit()
-                        return True, f"✅ Вы вышли из партии '{party_name}'. Лидерство передано участнику ID {successor_id}."
+                        return True, f"? Вы вышли из партии '{party_name}'. Лидерство передано участнику ID {successor_id}."
 
                     # Лидер последний участник — распускаем партию
                     await db.execute("DELETE FROM party_invitations WHERE party_id = ?", (party_id,))
                     await db.execute("DELETE FROM party_members WHERE party_id = ?", (party_id,))
                     await db.execute("DELETE FROM parties WHERE id = ?", (party_id,))
                     await db.commit()
-                    return True, f"✅ Вы вышли из партии '{party_name}'. Партия распущена."
+                    return True, f"? Вы вышли из партии '{party_name}'. Партия распущена."
 
                 await db.execute(
                     "DELETE FROM party_members WHERE party_id = ? AND user_id = ?",
@@ -3386,14 +5872,14 @@ class AsyncDatabase:
                     (party_id,),
                 )
                 await db.commit()
-                return True, f"✅ Вы вышли из партии '{party_name}'."
+                return True, f"? Вы вышли из партии '{party_name}'."
 
         except Exception as e:
-            return False, f"❌ Ошибка выхода из партии: {str(e)}"
+            return False, f"? Ошибка выхода из партии: {str(e)}"
 
     async def get_election_parties(self, election_id: int) -> List[Dict[str, Any]]:
         """Получить все партии на выборах"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 '''SELECT p.*,
@@ -3410,7 +5896,7 @@ class AsyncDatabase:
     async def register_candidate(self, election_id: int, user_id: int, program: str = "Моя программа") -> tuple:
         """Зарегистрировать кандидата на выборах"""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect() as db:
                 db.row_factory = aiosqlite.Row
                 await db.execute("BEGIN IMMEDIATE")
 
@@ -3422,21 +5908,21 @@ class AsyncDatabase:
 
                 if not election:
                     await db.rollback()
-                    return False, "❌ Выборы не найдены."
+                    return False, "? Выборы не найдены."
 
                 if election['status'] != 'active':
                     await db.rollback()
-                    return False, "❌ Регистрация завершена: выборы неактивны."
+                    return False, "? Регистрация завершена: выборы неактивны."
 
                 stage = _normalize_election_stage(election["stage"])
                 if stage in {"voting", "finished"}:
                     await db.rollback()
-                    return False, "❌ Регистрация кандидатов закрыта."
+                    return False, "? Регистрация кандидатов закрыта."
 
                 end_dt = _parse_iso_datetime(election["end_date"])
                 if end_dt and end_dt <= _now_for_datetime(end_dt):
                     await db.rollback()
-                    return False, "❌ Регистрация завершена: срок выборов истек."
+                    return False, "? Регистрация завершена: срок выборов истек."
 
                 await db.execute(
                     '''INSERT INTO election_candidates (election_id, candidate_id, votes, program, promises)
@@ -3444,16 +5930,16 @@ class AsyncDatabase:
                     (election_id, user_id, program, "")
                 )
                 await db.commit()
-                return True, "✅ Вы успешно зарегистрированы кандидатом."
+                return True, "? Вы успешно зарегистрированы кандидатом."
 
         except aiosqlite.IntegrityError:
-            return False, "❌ Вы уже зарегистрированы кандидатом на этих выборах."
+            return False, "? Вы уже зарегистрированы кандидатом на этих выборах."
         except Exception as e:
-            return False, f"❌ Ошибка при регистрации кандидата: {str(e)}"
+            return False, f"? Ошибка при регистрации кандидата: {str(e)}"
 
     async def get_election_candidates(self, election_id: int) -> List[Dict[str, Any]]:
         """Список кандидатов на выборах с именами"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 '''SELECT ec.id,
@@ -3480,7 +5966,7 @@ class AsyncDatabase:
 
     async def has_user_voted(self, election_id: int, user_id: int) -> bool:
         """Проверить, голосовал ли пользователь на этих выборах"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 'SELECT 1 FROM election_votes WHERE election_id = ? AND voter_id = ? LIMIT 1',
                 (election_id, user_id)
@@ -3491,7 +5977,7 @@ class AsyncDatabase:
         """Проголосовать за кандидата"""
         now = datetime.now().isoformat()
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect() as db:
                 db.row_factory = aiosqlite.Row
                 await db.execute("BEGIN IMMEDIATE")
 
@@ -3503,21 +5989,21 @@ class AsyncDatabase:
 
                 if not election:
                     await db.rollback()
-                    return False, "❌ Выборы не найдены."
+                    return False, "? Выборы не найдены."
 
                 if election['status'] != 'active':
                     await db.rollback()
-                    return False, "❌ Выборы уже завершены."
+                    return False, "? Выборы уже завершены."
 
                 stage = _normalize_election_stage(election["stage"])
                 if stage != "voting":
                     await db.rollback()
-                    return False, "❌ Голосование на текущем этапе недоступно."
+                    return False, "? Голосование на текущем этапе недоступно."
 
                 end_dt = _parse_iso_datetime(election["end_date"])
                 if end_dt and end_dt <= _now_for_datetime(end_dt):
                     await db.rollback()
-                    return False, "❌ Голосование завершено."
+                    return False, "? Голосование завершено."
 
                 async with db.execute(
                     '''SELECT 1 FROM election_candidates
@@ -3527,7 +6013,7 @@ class AsyncDatabase:
                 ) as cursor:
                     if not await cursor.fetchone():
                         await db.rollback()
-                        return False, "❌ Кандидат не найден."
+                        return False, "? Кандидат не найден."
 
                 try:
                     await db.execute(
@@ -3537,7 +6023,7 @@ class AsyncDatabase:
                     )
                 except aiosqlite.IntegrityError:
                     await db.rollback()
-                    return False, "❌ Вы уже голосовали на этих выборах."
+                    return False, "? Вы уже голосовали на этих выборах."
 
                 await db.execute(
                     '''UPDATE election_candidates
@@ -3565,17 +6051,17 @@ class AsyncDatabase:
                 )
 
                 await db.commit()
-                return True, "✅ Ваш голос учтен."
+                return True, "? Ваш голос учтен."
 
         except Exception as e:
-            return False, f"❌ Ошибка при голосовании: {str(e)}"
+            return False, f"? Ошибка при голосовании: {str(e)}"
 
     async def start_election(self, org_id: int, position: str, duration_hours: int = 15) -> int:
         """Начать выборы. Если уже есть активные по этой должности в этой организации - вернуть существующие."""
         start_date = datetime.now()
         end_date = start_date + timedelta(hours=duration_hours)
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 '''SELECT id FROM elections
@@ -3601,7 +6087,7 @@ class AsyncDatabase:
 
     async def get_active_elections(self, org_id: int) -> List[Dict[str, Any]]:
         """Получить активные выборы в организации"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 '''SELECT * FROM elections
@@ -3622,7 +6108,7 @@ class AsyncDatabase:
             return parsed if parsed > 0 else 0
 
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
 
             async with db.execute(
@@ -3783,13 +6269,13 @@ class AsyncDatabase:
 
     async def advance_election_stage(self, election_id: int, new_stage: str):
         """Обновить stage у выборов (служебный метод)"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute('UPDATE elections SET stage = ? WHERE id = ?', (new_stage, election_id))
             await db.commit()
 
     async def get_active_elections_full(self) -> List[Dict[str, Any]]:
         """Вернуть все активные выборы"""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 "SELECT * FROM elections WHERE status = 'active' ORDER BY start_date ASC"
@@ -3815,7 +6301,7 @@ class AsyncDatabase:
                 return "debates"
             return "voting"
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -3877,7 +6363,7 @@ class AsyncDatabase:
         now_iso = now_dt.isoformat()
         results: List[Dict[str, Any]] = []
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
 
@@ -3996,7 +6482,7 @@ class AsyncDatabase:
         for key, value in kwargs.items():
             normalized[field_aliases.get(key, key)] = value
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 "SELECT id FROM government_system ORDER BY id DESC LIMIT 1"
@@ -4056,7 +6542,7 @@ class AsyncDatabase:
             )
 
         query = f"SELECT COUNT(*) FROM users u WHERE {' AND '.join(where_parts)}"
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(query, tuple(params)) as cursor:
                 row = await cursor.fetchone()
                 return int((row[0] if row else 0) or 0)
@@ -4107,7 +6593,7 @@ class AsyncDatabase:
             LIMIT ? OFFSET ?
         """
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, tuple(params)) as cursor:
                 rows = await cursor.fetchall()
@@ -4154,8 +6640,34 @@ class AsyncDatabase:
         now = datetime.now().isoformat()
         role_lc = role_text.lower()
         is_government_org = str(org.get("type") or "").lower() == "government"
-        is_head_role = role_lc in {"leader", "лидер", "президент"} or ("президент" in role_lc and "вице" not in role_lc)
-        is_deputy_role = role_lc in {"deputy", "заместитель", "вице-президент", "вице президент"} or ("вице" in role_lc and "президент" in role_lc)
+        head_tokens = ("лидер", "leader", "президент", "директор", "начальник", "глав", "председатель", "ректор")
+        deputy_tokens = ("deputy", "замест", "вице")
+        is_head_role = (
+            role_lc in {"leader", "лидер", "президент"}
+            or any(token in role_lc for token in head_tokens)
+        ) and not ("вице" in role_lc or "замест" in role_lc or "deputy" in role_lc)
+        is_deputy_role = (
+            role_lc in {"deputy", "заместитель", "вице-президент", "вице президент"}
+            or any(token in role_lc for token in deputy_tokens)
+        )
+
+        org_type = str(org.get("type") or "").strip().lower()
+        if is_head_role:
+            role_salary = 6500.0 if is_government_org else 4750.0
+        elif is_deputy_role:
+            role_salary = 4750.0 if is_government_org else 3625.0
+        elif "министр финансов" in role_lc:
+            role_salary = 5250.0
+        elif "министр" in role_lc:
+            role_salary = 4250.0
+        elif any(token in role_lc for token in ("директор", "начальник", "глав", "председатель", "ректор")):
+            role_salary = 4375.0
+        elif org_type in {"fbi", "police"}:
+            role_salary = 2750.0
+        elif org_type in {"court", "hospital", "bank", "education", "tax"}:
+            role_salary = 2450.0
+        else:
+            role_salary = 2050.0
 
         authority_to_grant: Optional[str] = None
         if is_government_org and is_head_role:
@@ -4172,7 +6684,7 @@ class AsyncDatabase:
             appointing_authority = await self.get_government_authority(int(appointed_by_id))
         appointed_by_president = appointing_authority == "president"
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
 
@@ -4214,24 +6726,24 @@ class AsyncDatabase:
                 await db.execute(
                     """
                     UPDATE organization_members
-                    SET role = ?, last_promotion = ?
+                    SET role = ?, salary = ?, last_promotion = ?
                     WHERE id = ?
                     """,
-                    (role_text, now, member_row["id"]),
+                    (role_text, role_salary, now, member_row["id"]),
                 )
             else:
                 await db.execute(
                     """
                     INSERT INTO organization_members
                     (org_id, user_id, role, salary, join_date, last_promotion)
-                    VALUES (?, ?, ?, 0, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (org_id, target_user_id, role_text, now, now),
+                    (org_id, target_user_id, role_text, role_salary, now, now),
                 )
 
             await db.execute(
-                "UPDATE users SET organization = ?, role = ? WHERE user_id = ?",
-                (org["name"], role_text, target_user_id),
+                "UPDATE users SET organization = ?, role = ?, salary = ? WHERE user_id = ?",
+                (org["name"], role_text, role_salary, target_user_id),
             )
 
             if is_head_role:
@@ -4407,7 +6919,7 @@ class AsyncDatabase:
         actor_name = self.get_user_public_name(actor, fallback_id=safe_actor_id)
         leader_name = self.get_user_public_name(leader, fallback_id=leader_id)
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
 
@@ -4531,7 +7043,7 @@ class AsyncDatabase:
         await self.send_private_message(
             sender_id=safe_actor_id,
             recipient_id=leader_id,
-            subject=f"🔔 Снятие с лидерской должности ({org_name})",
+            subject=f"?? Снятие с лидерской должности ({org_name})",
             content=notice_text,
             message_type="system",
         )
@@ -4554,7 +7066,7 @@ class AsyncDatabase:
     ) -> List[Dict[str, Any]]:
         """Получить ленту дебатов по выборам."""
         safe_limit = max(1, min(int(limit or 20), 100))
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 """
@@ -4601,7 +7113,7 @@ class AsyncDatabase:
             return False, "Дебаты закрыты: выборы неактивны."
 
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
 
             async with db.execute(
@@ -4669,7 +7181,7 @@ class AsyncDatabase:
         next_index = min(stages.index(current_stage) + 1, len(stages) - 1)
         next_stage = stages[next_index]
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             if next_stage == "finished":
                 await db.execute(
                     "UPDATE elections SET stage = ?, status = 'finished' WHERE id = ?",
@@ -4683,6 +7195,346 @@ class AsyncDatabase:
             await db.commit()
 
         return True, "Этап выборов обновлен.", next_stage
+
+    async def leave_organization(self, user_id: int, org_id: Optional[int] = None) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        """Покинуть государственную организацию (если игрок не лидер/зам)."""
+        safe_user_id = int(user_id or 0)
+        if safe_user_id <= 0:
+            return False, "Некорректный пользователь.", None
+
+        now = datetime.now().isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+
+            if org_id is not None and int(org_id or 0) > 0:
+                async with db.execute(
+                    "SELECT * FROM organizations WHERE id = ? LIMIT 1",
+                    (int(org_id),),
+                ) as cursor:
+                    org = await cursor.fetchone()
+            else:
+                async with db.execute(
+                    """
+                    SELECT o.*
+                    FROM organizations o
+                    JOIN organization_members om ON om.org_id = o.id
+                    WHERE om.user_id = ?
+                    ORDER BY o.id ASC
+                    LIMIT 1
+                    """,
+                    (safe_user_id,),
+                ) as cursor:
+                    org = await cursor.fetchone()
+                if not org:
+                    async with db.execute("SELECT organization FROM users WHERE user_id = ? LIMIT 1", (safe_user_id,)) as cursor:
+                        user_org = await cursor.fetchone()
+                    org_name = str((user_org["organization"] if user_org else "") or "").strip()
+                    if org_name:
+                        async with db.execute("SELECT * FROM organizations WHERE name = ? LIMIT 1", (org_name,)) as cursor:
+                            org = await cursor.fetchone()
+
+            if not org:
+                await db.rollback()
+                return False, "Вы не состоите в госорганизации.", None
+
+            safe_org_id = int(org["id"] or 0)
+            if safe_org_id <= 0:
+                await db.rollback()
+                return False, "Организация не найдена.", None
+
+            if int(org["leader_id"] or 0) == safe_user_id:
+                await db.rollback()
+                return False, "Лидер не может выйти сам. Нужна передача/снятие должности.", None
+            if int(org["deputy_id"] or 0) == safe_user_id:
+                await db.rollback()
+                return False, "Заместитель не может выйти сам. Нужно снять должность.", None
+
+            await db.execute(
+                "DELETE FROM organization_members WHERE org_id = ? AND user_id = ?",
+                (safe_org_id, safe_user_id),
+            )
+            await db.execute(
+                """
+                UPDATE users
+                SET organization = NULL,
+                    role = 'Гражданин',
+                    salary = CASE
+                        WHEN COALESCE(citizen_job, '') <> '' THEN COALESCE(citizen_salary, 0)
+                        ELSE 0
+                    END
+                WHERE user_id = ?
+                """,
+                (safe_user_id,),
+            )
+            async with db.execute(
+                "SELECT COUNT(*) AS c FROM organization_members WHERE org_id = ?",
+                (safe_org_id,),
+            ) as cursor:
+                count_row = await cursor.fetchone()
+            members_count = int((count_row["c"] if count_row else 0) or 0)
+            await db.execute(
+                "UPDATE organizations SET members = ? WHERE id = ?",
+                (members_count, safe_org_id),
+            )
+            await db.commit()
+
+        org_name = str(org["name"] or f"Организация #{safe_org_id}")
+        await self.log_player_activity(
+            user_id=safe_user_id,
+            activity_type="organization_leave",
+            details=f"Выход из организации: {org_name}",
+            value=0,
+        )
+        return True, "Вы покинули организацию.", {
+            "org_id": safe_org_id,
+            "org_name": org_name,
+            "left_at": now,
+        }
+
+    async def set_organization_member_profile(
+        self,
+        actor_id: int,
+        org_id: int,
+        target_user_id: int,
+        role: Optional[str] = None,
+        salary: Optional[float] = None,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        """
+        Обновить должность/зарплату сотрудника организации.
+        Для лидерских ролей используйте отдельный контур назначений/снятия.
+        """
+        safe_actor = int(actor_id or 0)
+        safe_org_id = int(org_id or 0)
+        safe_target = int(target_user_id or 0)
+        if safe_actor <= 0 or safe_org_id <= 0 or safe_target <= 0:
+            return False, "Некорректные параметры.", None
+
+        role_text = None
+        if role is not None:
+            role_text = " ".join(str(role or "").strip().split())[:64]
+            if not role_text:
+                role_text = None
+        salary_value = None
+        if salary is not None:
+            salary_value = round(float(salary or 0), 2)
+            if salary_value < 0:
+                return False, "Зарплата не может быть отрицательной.", None
+            if salary_value > 10_000_000_000:
+                return False, "Слишком большая зарплата.", None
+
+        if role_text is None and salary_value is None:
+            return False, "Нет данных для обновления.", None
+
+        if not await self.can_manage_organization(safe_actor, safe_org_id):
+            return False, "Недостаточно прав для управления сотрудниками.", None
+
+        now = datetime.now().isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+
+            async with db.execute(
+                "SELECT id, name, leader_id, deputy_id FROM organizations WHERE id = ? LIMIT 1",
+                (safe_org_id,),
+            ) as cursor:
+                org = await cursor.fetchone()
+            if not org:
+                await db.rollback()
+                return False, "Организация не найдена.", None
+
+            async with db.execute(
+                "SELECT id, role, salary FROM organization_members WHERE org_id = ? AND user_id = ? LIMIT 1",
+                (safe_org_id, safe_target),
+            ) as cursor:
+                member = await cursor.fetchone()
+            if not member:
+                await db.rollback()
+                return False, "Игрок не состоит в этой организации.", None
+
+            if safe_target in {int(org["leader_id"] or 0), int(org["deputy_id"] or 0)}:
+                await db.rollback()
+                return False, "Лидер/заместитель меняются только через контур назначений.", None
+
+            old_role = str(member["role"] or "Сотрудник")
+            old_salary = round(float(member["salary"] or 0), 2)
+            new_role = role_text or old_role
+            new_salary = salary_value if salary_value is not None else old_salary
+
+            await db.execute(
+                """
+                UPDATE organization_members
+                SET role = ?, salary = ?, last_promotion = ?
+                WHERE id = ?
+                """,
+                (new_role, new_salary, now, int(member["id"])),
+            )
+
+            await db.execute(
+                """
+                UPDATE users
+                SET role = ?, salary = ?
+                WHERE user_id = ? AND LOWER(COALESCE(organization, '')) = LOWER(?)
+                """,
+                (new_role, new_salary, safe_target, str(org["name"] or "")),
+            )
+
+            await db.commit()
+
+        org_name = str(org["name"] or f"Организация #{safe_org_id}")
+        await self.log_player_activity(
+            user_id=safe_actor,
+            activity_type="org_member_profile_update",
+            details=f"Изменен профиль сотрудника #{safe_target} в {org_name}",
+            value=new_salary,
+        )
+        await self.log_player_activity(
+            user_id=safe_target,
+            activity_type="org_member_profile_changed",
+            details=f"Обновлены должность/зарплата в {org_name}",
+            value=new_salary,
+        )
+        await self.send_private_message(
+            sender_id=safe_actor,
+            recipient_id=safe_target,
+            subject=f"?? Кадровое обновление ({org_name})",
+            content=(
+                f"Должность: {old_role} -> {new_role}\n"
+                f"Зарплата: {old_salary:,.2f} -> {new_salary:,.2f} люмов"
+            ),
+            message_type="system",
+        )
+        return True, "Профиль сотрудника обновлен.", {
+            "org_id": safe_org_id,
+            "org_name": org_name,
+            "target_user_id": safe_target,
+            "old_role": old_role,
+            "new_role": new_role,
+            "old_salary": old_salary,
+            "new_salary": new_salary,
+            "updated_at": now,
+        }
+
+    async def remove_organization_member(
+        self,
+        actor_id: int,
+        org_id: int,
+        target_user_id: int,
+        reason: str = "",
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        """Снять сотрудника с должности в организации (кроме лидера/зама)."""
+        safe_actor = int(actor_id or 0)
+        safe_org_id = int(org_id or 0)
+        safe_target = int(target_user_id or 0)
+        if safe_actor <= 0 or safe_org_id <= 0 or safe_target <= 0:
+            return False, "Некорректные параметры.", None
+
+        if not await self.can_manage_organization(safe_actor, safe_org_id):
+            return False, "Недостаточно прав для увольнения сотрудника.", None
+
+        clean_reason = " ".join((reason or "").strip().split())[:180]
+        if not clean_reason:
+            clean_reason = "Решение руководства"
+        now = datetime.now().isoformat()
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+
+            async with db.execute(
+                "SELECT id, name, leader_id, deputy_id FROM organizations WHERE id = ? LIMIT 1",
+                (safe_org_id,),
+            ) as cursor:
+                org = await cursor.fetchone()
+            if not org:
+                await db.rollback()
+                return False, "Организация не найдена.", None
+
+            if safe_target in {int(org["leader_id"] or 0), int(org["deputy_id"] or 0)}:
+                await db.rollback()
+                return False, "Для лидера/заместителя используйте отдельный механизм снятия.", None
+
+            async with db.execute(
+                "SELECT id, role FROM organization_members WHERE org_id = ? AND user_id = ? LIMIT 1",
+                (safe_org_id, safe_target),
+            ) as cursor:
+                member = await cursor.fetchone()
+            if not member:
+                await db.rollback()
+                return False, "Игрок не состоит в этой организации.", None
+
+            await db.execute(
+                "DELETE FROM organization_members WHERE id = ?",
+                (int(member["id"]),),
+            )
+            await db.execute(
+                """
+                UPDATE users
+                SET organization = CASE
+                        WHEN LOWER(COALESCE(organization, '')) = LOWER(?) THEN NULL
+                        ELSE organization
+                    END,
+                    role = CASE
+                        WHEN LOWER(COALESCE(organization, '')) = LOWER(?) THEN 'Гражданин'
+                        ELSE role
+                    END,
+                    salary = CASE
+                        WHEN LOWER(COALESCE(organization, '')) = LOWER(?) THEN
+                            CASE
+                                WHEN COALESCE(citizen_job, '') <> '' THEN COALESCE(citizen_salary, 0)
+                                ELSE 0
+                            END
+                        ELSE salary
+                    END
+                WHERE user_id = ?
+                """,
+                (str(org["name"] or ""), str(org["name"] or ""), str(org["name"] or ""), safe_target),
+            )
+            async with db.execute(
+                "SELECT COUNT(*) AS c FROM organization_members WHERE org_id = ?",
+                (safe_org_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            members_count = int((row["c"] if row else 0) or 0)
+            await db.execute(
+                "UPDATE organizations SET members = ? WHERE id = ?",
+                (members_count, safe_org_id),
+            )
+            await db.commit()
+
+        org_name = str(org["name"] or f"Организация #{safe_org_id}")
+        old_role = str(member["role"] or "Сотрудник")
+        await self.log_player_activity(
+            user_id=safe_actor,
+            activity_type="org_member_removed",
+            details=f"Сотрудник #{safe_target} снят с должности в {org_name}",
+            value=0,
+        )
+        await self.log_player_activity(
+            user_id=safe_target,
+            activity_type="org_member_removed_self",
+            details=f"Снят с должности в {org_name}",
+            value=0,
+        )
+        await self.send_private_message(
+            sender_id=safe_actor,
+            recipient_id=safe_target,
+            subject=f"?? Снятие с должности ({org_name})",
+            content=(
+                f"Вы сняты с должности: {old_role}\n"
+                f"Основание: {clean_reason}"
+            ),
+            message_type="system",
+        )
+        return True, "Сотрудник снят с должности.", {
+            "org_id": safe_org_id,
+            "org_name": org_name,
+            "target_user_id": safe_target,
+            "old_role": old_role,
+            "members_after": members_count,
+            "reason": clean_reason,
+            "removed_at": now,
+        }
 
     async def send_private_message(
         self,
@@ -4712,7 +7564,7 @@ class AsyncDatabase:
             clean_subject = "Сообщение"
 
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cursor = await db.execute(
                 """
                 INSERT INTO messages
@@ -4747,7 +7599,7 @@ class AsyncDatabase:
             return False, "Только сотрудники организации могут писать в этот чат."
 
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT INTO organization_chats (org_id, user_id, content, message_type, is_hidden, created_date)
@@ -4806,7 +7658,7 @@ class AsyncDatabase:
             ORDER BY oc.created_date DESC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (org_id, safe_limit)) as cursor:
                 rows = await cursor.fetchall()
@@ -4844,7 +7696,7 @@ class AsyncDatabase:
             "top_chat_members": [],
         }
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
 
             async with db.execute(
@@ -4972,7 +7824,7 @@ class AsyncDatabase:
             return False, "Не удалось опубликовать новость.", 0
 
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT INTO organization_chats (org_id, user_id, content, message_type, is_hidden, created_date)
@@ -5035,7 +7887,7 @@ class AsyncDatabase:
             ORDER BY oc.created_date DESC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (gov_org_id, safe_limit)) as cursor:
                 rows = await cursor.fetchall()
@@ -5067,7 +7919,7 @@ class AsyncDatabase:
             return False, "Ошибка данных правительства."
 
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT INTO organization_chats (org_id, user_id, content, message_type, is_hidden, created_date)
@@ -5114,7 +7966,7 @@ class AsyncDatabase:
             ORDER BY last_activity DESC
             LIMIT 1
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query) as cursor:
                 row = await cursor.fetchone()
@@ -5131,7 +7983,7 @@ class AsyncDatabase:
             ORDER BY last_activity DESC
             LIMIT 1
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query) as cursor:
                 row = await cursor.fetchone()
@@ -5168,7 +8020,7 @@ class AsyncDatabase:
 
         status = "pending_vice" if vice_id else "pending_president"
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cursor = await db.execute(
                 """
                 INSERT INTO citizen_appeals
@@ -5209,7 +8061,7 @@ class AsyncDatabase:
         else:
             return 0
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(query, params) as cursor:
                 row = await cursor.fetchone()
                 return int((row[0] if row else 0) or 0)
@@ -5234,7 +8086,7 @@ class AsyncDatabase:
             ORDER BY ca.created_date ASC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (int(reviewer_id), safe_limit)) as cursor:
                 rows = await cursor.fetchall()
@@ -5249,7 +8101,7 @@ class AsyncDatabase:
             ORDER BY created_date DESC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (int(citizen_id), safe_limit)) as cursor:
                 rows = await cursor.fetchall()
@@ -5264,7 +8116,7 @@ class AsyncDatabase:
     ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
         safe_note = " ".join((note or "").strip().split())[:400]
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute("SELECT * FROM citizen_appeals WHERE id = ? LIMIT 1", (int(appeal_id),)) as cursor:
@@ -5379,7 +8231,7 @@ class AsyncDatabase:
             ORDER BY created_date DESC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             params = (
                 player_id,
@@ -5419,7 +8271,7 @@ class AsyncDatabase:
             ORDER BY c.msg_count DESC, c.last_contact DESC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             params = (player_id, player_id, player_id, player_id, safe_limit)
             async with db.execute(query, params) as cursor:
@@ -5490,7 +8342,7 @@ class AsyncDatabase:
             ORDER BY created_date DESC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (safe_limit,)) as cursor:
                 rows = await cursor.fetchall()
@@ -5508,7 +8360,7 @@ class AsyncDatabase:
 
         assignment = None
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect() as db:
                 db.row_factory = aiosqlite.Row
                 async with db.execute(
                     """
@@ -5552,7 +8404,7 @@ class AsyncDatabase:
             now = datetime.now().isoformat()
             granted_by = int(gov.get("current_leader_id") or 0) or None
             try:
-                async with aiosqlite.connect(self.db_path) as db:
+                async with self._connect() as db:
                     await db.execute(
                         """
                         INSERT INTO government_authority_assignments
@@ -5607,7 +8459,7 @@ class AsyncDatabase:
         if is_shadow:
             risk = min(100, risk + 20)
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
 
@@ -5705,6 +8557,141 @@ class AsyncDatabase:
         }
         return True, "Перевод выполнен.", details
 
+    async def pay_organization_bonus(
+        self,
+        actor_id: int,
+        org_id: int,
+        target_user_id: int,
+        amount: float,
+        reason: str = "",
+    ) -> tuple[bool, str, Dict[str, Any]]:
+        """
+        Выплата игроку из бюджета организации.
+        Доступ: лидер/заместитель организации (или президент/вице через can_manage_organization).
+        """
+        safe_actor = int(actor_id or 0)
+        safe_org_id = int(org_id or 0)
+        safe_target = int(target_user_id or 0)
+        safe_amount = round(float(amount or 0), 2)
+        if safe_actor <= 0 or safe_org_id <= 0 or safe_target <= 0:
+            return False, "Некорректные параметры выплаты.", {}
+        if safe_amount <= 0:
+            return False, "Сумма должна быть больше нуля.", {}
+        if safe_amount > 10_000_000_000:
+            return False, "Слишком большая сумма выплаты.", {}
+
+        if not await self.can_manage_organization(safe_actor, safe_org_id):
+            return False, "Недостаточно прав для выплаты из бюджета организации.", {}
+
+        clean_reason = " ".join((reason or "").strip().split())[:180]
+        if not clean_reason:
+            clean_reason = "Служебная выплата сотруднику"
+        now = datetime.now().isoformat()
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+
+            async with db.execute(
+                "SELECT id, name, type, budget FROM organizations WHERE id = ? LIMIT 1",
+                (safe_org_id,),
+            ) as cursor:
+                org = await cursor.fetchone()
+            if not org:
+                await db.rollback()
+                return False, "Организация не найдена.", {}
+
+            async with db.execute(
+                "SELECT user_id, balance FROM users WHERE user_id = ? LIMIT 1",
+                (safe_target,),
+            ) as cursor:
+                target = await cursor.fetchone()
+            if not target:
+                await db.rollback()
+                return False, "Игрок не найден.", {}
+
+            budget_before = round(float(org["budget"] or 0), 2)
+            if budget_before < safe_amount:
+                await db.rollback()
+                return (
+                    False,
+                    f"Недостаточно средств в бюджете организации. Доступно: {budget_before:,.2f} люмов.",
+                    {"budget_available": budget_before},
+                )
+
+            target_balance_before = round(float(target["balance"] or 0), 2)
+            budget_after = round(budget_before - safe_amount, 2)
+            target_balance_after = round(target_balance_before + safe_amount, 2)
+
+            await db.execute(
+                "UPDATE organizations SET budget = ? WHERE id = ?",
+                (budget_after, safe_org_id),
+            )
+            await db.execute(
+                "UPDATE users SET balance = ? WHERE user_id = ?",
+                (target_balance_after, safe_target),
+            )
+
+            org_type = str(org["type"] or "").strip().lower()
+            risk = min(100, max(3, int(safe_amount // 12_500)))
+            if org_type not in {"government", "bank", "hospital", "education"}:
+                risk = min(100, risk + 6)
+
+            await db.execute(
+                """
+                INSERT INTO corruption_ops
+                (actor_id, target_id, op_type, amount, risk, status, details, created_date)
+                VALUES (?, ?, 'org_bonus', ?, ?, 'logged', ?, ?)
+                """,
+                (
+                    safe_actor,
+                    safe_target,
+                    safe_amount,
+                    risk,
+                    f"[{str(org['name'] or 'organization')}] {clean_reason}",
+                    now,
+                ),
+            )
+            await db.commit()
+
+        org_name = str(org["name"] or f"Организация #{safe_org_id}")
+        await self.log_player_activity(
+            user_id=safe_actor,
+            activity_type="org_bonus_issue",
+            details=f"Выплата игроку #{safe_target} из бюджета '{org_name}'",
+            value=safe_amount,
+        )
+        await self.log_player_activity(
+            user_id=safe_target,
+            activity_type="org_bonus_received",
+            details=f"Получена выплата из бюджета '{org_name}'",
+            value=safe_amount,
+        )
+        await self.send_private_message(
+            sender_id=safe_actor,
+            recipient_id=safe_target,
+            subject=f"?? Выплата от организации {org_name}",
+            content=(
+                f"Вам перечислено {safe_amount:,.2f} люмов.\n"
+                f"Основание: {clean_reason}\n"
+                f"Текущий баланс: {target_balance_after:,.2f} люмов"
+            ),
+            message_type="system",
+        )
+
+        details = {
+            "org_id": safe_org_id,
+            "org_name": org_name,
+            "amount": safe_amount,
+            "target_user_id": safe_target,
+            "budget_before": budget_before,
+            "budget_after": budget_after,
+            "target_balance_before": target_balance_before,
+            "target_balance_after": target_balance_after,
+            "reason": clean_reason,
+        }
+        return True, "Выплата выполнена.", details
+
     async def withdraw_state_funds(
         self,
         actor_id: int,
@@ -5754,7 +8741,7 @@ class AsyncDatabase:
         clean_reason = " ".join((reason or "").strip().split()) or "Пополнение из госбюджета"
         now = datetime.now().isoformat()
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
 
@@ -5833,7 +8820,7 @@ class AsyncDatabase:
             ORDER BY sot.created_date DESC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (safe_limit,)) as cursor:
                 rows = await cursor.fetchall()
@@ -5870,7 +8857,7 @@ class AsyncDatabase:
         ready_at_dt = now_dt + timedelta(minutes=duration_minutes)
         ready_at = ready_at_dt.isoformat()
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
 
@@ -5947,7 +8934,8 @@ class AsyncDatabase:
             if authority not in {"president", "finance_minister"}:
                 return {"claimed_jobs": 0, "minted_total": 0.0, "government_budget_after": 0.0, "error": "forbidden"}
 
-        now = datetime.now().isoformat()
+        now_dt = datetime.now()
+        now = now_dt.isoformat()
         gov_org = await self.get_government_organization()
         if not gov_org:
             return {"claimed_jobs": 0, "minted_total": 0.0, "government_budget_after": 0.0, "error": "no_gov_org"}
@@ -5959,20 +8947,49 @@ class AsyncDatabase:
         minted_total = 0.0
         new_budget = round(float(gov_org.get("budget") or 0), 2)
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
 
             async with db.execute(
                 """
-                SELECT id, amount
+                SELECT id, amount, status, ready_at
                 FROM state_money_print_jobs
-                WHERE status = 'printing' AND ready_at <= ?
+                WHERE status IN ('printing', 'ready')
                 ORDER BY ready_at ASC, id ASC
-                """,
-                (now,),
+                """
             ) as cursor:
-                ready_jobs = await cursor.fetchall()
+                job_rows = await cursor.fetchall()
+
+            def _parse_ready_dt(raw_value: Any) -> Optional[datetime]:
+                raw = str(raw_value or "").strip()
+                if not raw:
+                    return None
+                variants = [
+                    raw,
+                    raw.replace(" ", "T"),
+                    raw.replace("Z", "+00:00"),
+                    raw.replace(" ", "T").replace("Z", "+00:00"),
+                ]
+                for candidate in variants:
+                    try:
+                        parsed = datetime.fromisoformat(candidate)
+                        if parsed.tzinfo is not None:
+                            parsed = parsed.astimezone().replace(tzinfo=None)
+                        return parsed
+                    except Exception:
+                        continue
+                return None
+
+            ready_jobs: List[aiosqlite.Row] = []
+            for row in job_rows:
+                status_lc = str(row["status"] or "").strip().lower()
+                ready_dt = _parse_ready_dt(row["ready_at"])
+                is_ready = bool(ready_dt and ready_dt <= now_dt)
+                if not is_ready and status_lc == "ready":
+                    is_ready = True
+                if is_ready:
+                    ready_jobs.append(row)
 
             if not ready_jobs:
                 await db.rollback()
@@ -5993,9 +9010,13 @@ class AsyncDatabase:
                 return {"claimed_jobs": 0, "minted_total": 0.0, "government_budget_after": 0.0, "error": "no_gov_org"}
 
             new_budget = round(float(gov_row["budget"] or 0), 2)
+            ready_ids: List[int] = []
             claimed_ids: List[int] = []
             for row in ready_jobs:
                 job_id = int(row["id"])
+                if job_id <= 0:
+                    continue
+                ready_ids.append(job_id)
                 amount_value = round(float(row["amount"] or 0), 2)
                 if amount_value <= 0:
                     continue
@@ -6004,22 +9025,30 @@ class AsyncDatabase:
                 claimed_jobs += 1
                 claimed_ids.append(job_id)
 
+            if not ready_ids:
+                await db.rollback()
+                return {
+                    "claimed_jobs": 0,
+                    "minted_total": 0.0,
+                    "government_budget_after": new_budget,
+                    "claimed_job_ids": [],
+                }
+
+            placeholders = ",".join(["?"] * len(ready_ids))
             if claimed_jobs > 0:
                 await db.execute(
                     "UPDATE organizations SET budget = ? WHERE id = ?",
                     (new_budget, gov_org_id),
                 )
-                await db.execute(
-                    """
-                    UPDATE state_money_print_jobs
-                    SET status = 'completed', completed_date = ?
-                    WHERE status = 'printing' AND ready_at <= ?
-                    """,
-                    (now, now),
-                )
-                await db.commit()
-            else:
-                await db.rollback()
+            await db.execute(
+                f"""
+                UPDATE state_money_print_jobs
+                SET status = 'completed', completed_date = ?
+                WHERE id IN ({placeholders})
+                """,
+                (now, *ready_ids),
+            )
+            await db.commit()
 
         if claimed_jobs > 0 and int(actor_id or 0) > 0:
             await self.log_player_activity(
@@ -6045,7 +9074,7 @@ class AsyncDatabase:
             ORDER BY smpj.created_date DESC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (safe_limit,)) as cursor:
                 rows = await cursor.fetchall()
@@ -6064,7 +9093,7 @@ class AsyncDatabase:
             ORDER BY pt.created_date DESC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (safe_limit,)) as cursor:
                 rows = await cursor.fetchall()
@@ -6083,7 +9112,7 @@ class AsyncDatabase:
             ORDER BY co.created_date DESC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (safe_limit,)) as cursor:
                 rows = await cursor.fetchall()
@@ -6099,13 +9128,14 @@ class AsyncDatabase:
         created = 0
         total_due = 0.0
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
 
             async with db.execute(
                 """
-                SELECT user_id, balance, tax_debt, shadow_balance, citizen_job, citizen_salary, role
+                SELECT user_id, balance, bank, cash, tax_debt, shadow_balance, citizen_job, citizen_salary, role,
+                       tax_disabled, is_ai_agent
                 FROM users
                 ORDER BY user_id ASC
                 """
@@ -6116,52 +9146,146 @@ class AsyncDatabase:
                 gov_row = await cursor.fetchone()
                 current_leader_id = int((gov_row[0] if gov_row else 0) or 0)
 
-            property_values: Dict[int, float] = {}
+            property_values_by_category: Dict[int, Dict[str, float]] = {}
+            property_total_values: Dict[int, float] = {}
             async with db.execute(
                 """
-                SELECT po.owner_id AS user_id, COALESCE(SUM(COALESCE(p.price, 0)), 0) AS total_value
+                SELECT
+                    po.owner_id AS user_id,
+                    LOWER(COALESCE(p.category, 'residential')) AS category,
+                    COALESCE(SUM(COALESCE(p.price, 0)), 0) AS total_value
                 FROM property_ownership po
                 JOIN properties p ON p.id = po.property_id
-                GROUP BY po.owner_id
+                GROUP BY po.owner_id, LOWER(COALESCE(p.category, 'residential'))
                 """
             ) as cursor:
                 rows = await cursor.fetchall()
                 for row in rows:
-                    property_values[int(row["user_id"] or 0)] = float(row["total_value"] or 0.0)
+                    user_id = int(row["user_id"] or 0)
+                    if user_id <= 0:
+                        continue
+                    category = str(row["category"] or "residential").strip().lower() or "residential"
+                    total_value = max(0.0, float(row["total_value"] or 0.0))
+                    user_categories = property_values_by_category.setdefault(user_id, {})
+                    user_categories[category] = round(float(user_categories.get(category, 0.0)) + total_value, 2)
+                    property_total_values[user_id] = round(float(property_total_values.get(user_id, 0.0)) + total_value, 2)
 
-            business_budgets: Dict[int, float] = {}
+            business_tax_values: Dict[int, float] = {}
+            business_total_values: Dict[int, float] = {}
             async with db.execute(
                 """
-                SELECT owner_id AS user_id, COALESCE(SUM(COALESCE(budget, 0)), 0) AS total_budget
+                SELECT
+                    owner_id AS user_id,
+                    COALESCE(type, '') AS business_type,
+                    COALESCE(budget, 0) AS budget
                 FROM businesses
                 WHERE status = 'active'
-                GROUP BY owner_id
                 """
             ) as cursor:
                 rows = await cursor.fetchall()
                 for row in rows:
-                    business_budgets[int(row["user_id"] or 0)] = float(row["total_budget"] or 0.0)
+                    user_id = int(row["user_id"] or 0)
+                    if user_id <= 0:
+                        continue
+                    budget = max(0.0, float(row["budget"] or 0.0))
+                    rate = _business_daily_tax_rate(row["business_type"])
+                    business_total_values[user_id] = round(float(business_total_values.get(user_id, 0.0)) + budget, 2)
+                    business_tax_values[user_id] = round(
+                        float(business_tax_values.get(user_id, 0.0)) + (budget * rate),
+                        2,
+                    )
 
-            private_org_budgets: Dict[int, float] = {}
+            private_org_tax_values: Dict[int, float] = {}
+            private_org_total_values: Dict[int, float] = {}
             async with db.execute(
                 """
-                SELECT leader_id AS user_id, COALESCE(SUM(COALESCE(budget, 0)), 0) AS total_budget
+                SELECT leader_id AS user_id, COALESCE(budget, 0) AS budget
                 FROM private_orgs
                 WHERE status = 'active'
-                GROUP BY leader_id
                 """
             ) as cursor:
                 rows = await cursor.fetchall()
                 for row in rows:
-                    private_org_budgets[int(row["user_id"] or 0)] = float(row["total_budget"] or 0.0)
+                    user_id = int(row["user_id"] or 0)
+                    if user_id <= 0:
+                        continue
+                    budget = max(0.0, float(row["budget"] or 0.0))
+                    rate = _pick_progressive_tier(budget, PRIVATE_ORG_TAX_RATE_TIERS, DAILY_PRIVATE_ORG_TAX_RATE)
+                    private_org_total_values[user_id] = round(
+                        float(private_org_total_values.get(user_id, 0.0)) + budget,
+                        2,
+                    )
+                    private_org_tax_values[user_id] = round(
+                        float(private_org_tax_values.get(user_id, 0.0)) + (budget * rate),
+                        2,
+                    )
+
+            stock_values: Dict[int, float] = {}
+            try:
+                async with db.execute(
+                    """
+                    SELECT p.user_id, COALESCE(SUM(COALESCE(p.quantity, 0) * COALESCE(a.price, 0)), 0) AS total_value
+                    FROM stock_exchange_portfolio p
+                    JOIN stock_exchange_assets a ON a.symbol = p.symbol
+                    GROUP BY p.user_id
+                    """
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                    for row in rows:
+                        stock_values[int(row["user_id"] or 0)] = float(row["total_value"] or 0.0)
+            except Exception:
+                stock_values = {}
+
+            gang_assets: Dict[int, float] = {}
+            try:
+                async with db.execute(
+                    """
+                    SELECT
+                        g.leader_id AS user_id,
+                        COALESCE(g.reputation, 50) AS gang_reputation,
+                        COALESCE(gm.members_count, 1) AS members_count,
+                        COALESCE(dc.stock, 0) AS cartel_stock,
+                        COALESCE(dc.purity, 50) AS cartel_purity,
+                        COALESCE(dc.laundering_level, 1) AS laundering_level
+                    FROM gangs g
+                    LEFT JOIN (
+                        SELECT gang_id, COUNT(*) AS members_count
+                        FROM gang_members
+                        GROUP BY gang_id
+                    ) gm ON gm.gang_id = g.id
+                    LEFT JOIN drug_cartels dc ON dc.gang_id = g.id AND dc.status = 'active'
+                    WHERE g.status = 'active'
+                    """
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                    for row in rows:
+                        uid = int(row["user_id"] or 0)
+                        if uid <= 0:
+                            continue
+                        reputation_score = float(row["gang_reputation"] or 50.0)
+                        members_count = int(row["members_count"] or 1)
+                        stock = float(row["cartel_stock"] or 0.0)
+                        purity = float(row["cartel_purity"] or 50.0)
+                        laundering = int(row["laundering_level"] or 1)
+                        base_value = 25_000.0 + max(0.0, reputation_score) * 180.0 + max(1, members_count) * 2_000.0
+                        cartel_value = max(0.0, stock) * (120.0 + max(0.0, purity) * 2.2) + max(0, laundering) * 2_500.0
+                        gang_assets[uid] = round(max(0.0, base_value + cartel_value), 2)
+            except Exception:
+                gang_assets = {}
 
             for user in users:
                 processed += 1
                 user_id = int(user["user_id"] or 0)
                 if user_id <= 0:
                     continue
+                if int(user["is_ai_agent"] or 0) == 1:
+                    continue
+                if int(user["tax_disabled"] or 0) == 1:
+                    continue
 
                 balance = float(user["balance"] or 0.0)
+                bank = float(user["bank"] or 0.0)
+                cash = float(user["cash"] or 0.0)
                 debt = float(user["tax_debt"] or 0.0)
                 role_lc = str(user["role"] or "").strip().lower()
                 is_president_role = "президент" in role_lc and "вице" not in role_lc
@@ -6177,22 +9301,27 @@ class AsyncDatabase:
                     )
                     continue
 
-                living_tax = 5000.0
-                has_job = bool(str(user["citizen_job"] or "").strip())
-                work_salary = float(user["citizen_salary"] or 0.0)
-                if has_job and work_salary <= 0:
-                    work_salary = 220.0
-                work_tax = round(max(300.0, work_salary * 0.35), 2) if has_job else 0.0
+                property_total = max(0.0, float(property_total_values.get(user_id, 0.0)))
+                business_total = max(0.0, float(business_total_values.get(user_id, 0.0)))
+                private_org_total = max(0.0, float(private_org_total_values.get(user_id, 0.0)))
+                stock_total = max(0.0, float(stock_values.get(user_id, 0.0)))
+                gang_total = max(0.0, float(gang_assets.get(user_id, 0.0)))
+                liquid_total = max(0.0, balance) + max(0.0, bank) + max(0.0, cash) + max(
+                    0.0, float(user["shadow_balance"] or 0.0)
+                )
+                net_worth = round(
+                    liquid_total + property_total + business_total + private_org_total + stock_total + gang_total,
+                    2,
+                )
 
-                property_total = max(0.0, float(property_values.get(user_id, 0.0)))
-                business_total = max(0.0, float(business_budgets.get(user_id, 0.0)))
-                private_org_total = max(0.0, float(private_org_budgets.get(user_id, 0.0)))
-
-                property_tax = round(property_total * 0.0006, 2)
-                business_tax = round(business_total * 0.0018, 2)
-                private_org_tax = round(private_org_total * 0.0015, 2)
-
-                citizen_tax = round(living_tax + work_tax + property_tax + business_tax + private_org_tax, 2)
+                # Единый налог: 15% от общего имущества игрока (все активы).
+                asset_tax = round(max(0.0, net_worth) * TOTAL_ASSET_DAILY_TAX_RATE, 2)
+                living_tax = 0.0
+                work_tax = 0.0
+                property_tax = asset_tax
+                business_tax = 0.0
+                private_org_tax = 0.0
+                citizen_tax = asset_tax
                 debt_interest = round(max(0.0, debt * 0.03), 2)
                 scheduled_payment = round(min(max(0.0, debt * 0.12), max(0.0, balance * 0.25)), 2)
                 total = round(citizen_tax + debt_interest + scheduled_payment, 2)
@@ -6241,7 +9370,11 @@ class AsyncDatabase:
             "total_due_created": total_due,
         }
 
-    async def settle_overdue_daily_tax_invoices(self, cycle_date: Optional[str] = None) -> Dict[str, Any]:
+    async def settle_overdue_daily_tax_invoices(
+        self,
+        cycle_date: Optional[str] = None,
+        apply_balance_penalty: bool = False,
+    ) -> Dict[str, Any]:
         """Перевести неоплаченные счета прошлых дней в налоговый долг."""
         now_dt = datetime.now()
         now_iso = now_dt.isoformat()
@@ -6249,8 +9382,11 @@ class AsyncDatabase:
 
         debtors = 0
         total_new_debt = 0.0
+        penalized_users = 0
+        total_balance_penalty = 0.0
+        newly_disabled_users = 0
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
 
@@ -6258,7 +9394,8 @@ class AsyncDatabase:
                 """
                 SELECT dti.id, dti.user_id, dti.cycle_date, dti.citizen_tax, dti.debt_interest,
                        dti.living_tax, dti.work_tax, dti.property_tax, dti.business_tax, dti.private_org_tax,
-                       u.tax_debt, u.reputation, u.role
+                       u.tax_debt, u.reputation, u.role, u.balance,
+                       u.tax_unpaid_streak, u.tax_disabled, u.is_ai_agent
                 FROM daily_tax_invoices dti
                 JOIN users u ON u.user_id = dti.user_id
                 WHERE dti.status = 'pending' AND dti.cycle_date < ?
@@ -6272,100 +9409,180 @@ class AsyncDatabase:
                 gov_row = await cursor.fetchone()
                 current_leader_id = int((gov_row[0] if gov_row else 0) or 0)
 
+            overdue_by_user: Dict[int, Dict[str, Any]] = {}
             for row in overdue:
-                invoice_id = int(row["id"] or 0)
                 user_id = int(row["user_id"] or 0)
-                if invoice_id <= 0 or user_id <= 0:
+                invoice_id = int(row["id"] or 0)
+                if user_id <= 0 or invoice_id <= 0:
+                    continue
+                if user_id not in overdue_by_user:
+                    overdue_by_user[user_id] = {
+                        "role": str(row["role"] or ""),
+                        "tax_debt": round(float(row["tax_debt"] or 0), 2),
+                        "reputation": float(row["reputation"] or 50.0),
+                        "balance": round(float(row["balance"] or 0), 2),
+                        "tax_unpaid_streak": int(row["tax_unpaid_streak"] or 0),
+                        "tax_disabled": int(row["tax_disabled"] or 0),
+                        "is_ai_agent": int(row["is_ai_agent"] or 0),
+                        "rows": [],
+                    }
+                overdue_by_user[user_id]["rows"].append(row)
+
+            for user_id, payload in overdue_by_user.items():
+                rows = list(payload.get("rows") or [])
+                if not rows:
+                    continue
+                if int(payload.get("is_ai_agent") or 0) == 1:
+                    for row in rows:
+                        await db.execute(
+                            "UPDATE daily_tax_invoices SET status = 'paid', paid_total = 0, paid_date = ? WHERE id = ?",
+                            (now_iso, int(row["id"] or 0)),
+                        )
                     continue
 
-                role_lc = str(row["role"] or "").strip().lower()
+                role_lc = str(payload.get("role") or "").strip().lower()
                 is_president_role = "президент" in role_lc and "вице" not in role_lc
                 is_president = bool(user_id == current_leader_id or is_president_role)
                 if is_president:
-                    await db.execute(
-                        "UPDATE daily_tax_invoices SET status = 'paid', paid_total = 0, paid_date = ? WHERE id = ?",
-                        (now_iso, invoice_id),
-                    )
+                    for row in rows:
+                        await db.execute(
+                            "UPDATE daily_tax_invoices SET status = 'paid', paid_total = 0, paid_date = ? WHERE id = ?",
+                            (now_iso, int(row["id"] or 0)),
+                        )
                     continue
 
-                living_tax = round(float(row["living_tax"] or 0), 2)
-                work_tax = round(float(row["work_tax"] or 0), 2)
-                property_tax = round(float(row["property_tax"] or 0), 2)
-                business_tax = round(float(row["business_tax"] or 0), 2)
-                private_org_tax = round(float(row["private_org_tax"] or 0), 2)
-                citizen_tax_total = round(living_tax + work_tax + property_tax + business_tax + private_org_tax, 2)
-                if citizen_tax_total <= 0:
-                    citizen_tax_total = round(float(row["citizen_tax"] or 0), 2)
-                citizen_tax_log = round(living_tax + work_tax, 2) if (living_tax > 0 or work_tax > 0) else citizen_tax_total
-                debt_interest = round(float(row["debt_interest"] or 0), 2)
-                debt_add = round(max(0.0, citizen_tax_total + debt_interest), 2)
-                if debt_add <= 0:
+                debt_before = round(float(payload.get("tax_debt") or 0), 2)
+                debt_running = debt_before
+                reputation_before = float(payload.get("reputation") or 50.0)
+                balance_before = round(float(payload.get("balance") or 0), 2)
+                user_debt_add = 0.0
+
+                for row in rows:
+                    invoice_id = int(row["id"] or 0)
+                    if invoice_id <= 0:
+                        continue
+
+                    living_tax = round(float(row["living_tax"] or 0), 2)
+                    work_tax = round(float(row["work_tax"] or 0), 2)
+                    property_tax = round(float(row["property_tax"] or 0), 2)
+                    business_tax = round(float(row["business_tax"] or 0), 2)
+                    private_org_tax = round(float(row["private_org_tax"] or 0), 2)
+                    citizen_tax_total = round(living_tax + work_tax + property_tax + business_tax + private_org_tax, 2)
+                    if citizen_tax_total <= 0:
+                        citizen_tax_total = round(float(row["citizen_tax"] or 0), 2)
+                    citizen_tax_log = round(living_tax + work_tax, 2) if (living_tax > 0 or work_tax > 0) else citizen_tax_total
+                    debt_interest = round(float(row["debt_interest"] or 0), 2)
+                    debt_add = round(max(0.0, citizen_tax_total + debt_interest), 2)
+
                     await db.execute(
                         "UPDATE daily_tax_invoices SET status = 'debt', paid_total = 0, paid_date = ? WHERE id = ?",
                         (now_iso, invoice_id),
                     )
+
+                    if debt_add <= 0:
+                        continue
+
+                    debt_running = round(max(0.0, debt_running + debt_add), 2)
+                    user_debt_add = round(user_debt_add + debt_add, 2)
+                    await db.execute(
+                        """
+                        INSERT INTO tax_logs
+                        (user_id, cycle_date, citizen_tax, property_tax, business_tax, org_tax, paid_total, debt_total, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+                        """,
+                        (
+                            user_id,
+                            str(row["cycle_date"] or cycle),
+                            citizen_tax_log,
+                            property_tax,
+                            business_tax,
+                            private_org_tax,
+                            debt_running,
+                            now_iso,
+                        ),
+                    )
+
+                if user_debt_add <= 0:
                     continue
 
-                debt_before = round(float(row["tax_debt"] or 0), 2)
-                reputation_before = float(row["reputation"] or 50.0)
-                debt_after = round(max(0.0, debt_before + debt_add), 2)
-                reputation_after = round(max(0.0, reputation_before - min(4.0, debt_add / 5000.0)), 2)
-
-                # Получаем current total_tax_paid, чтобы обновить его
-                async with db.execute(
-                    "SELECT total_tax_paid FROM users WHERE user_id = ? LIMIT 1",
-                    (user_id,),
-                ) as cursor_tax:
-                    user_tax_row = await cursor_tax.fetchone()
-                    total_tax_paid_before = round(float((user_tax_row[0] if user_tax_row else 0) or 0), 2)
-                
-                # Include the debt_add in total_tax_paid to track all taxes charged (paid + unpaid)
-                total_tax_paid_after = round(total_tax_paid_before + debt_add, 2)
+                debt_after = debt_running
+                reputation_after = round(max(0.0, reputation_before - min(4.0, user_debt_add / 5000.0)), 2)
+                penalty_charged = 0.0
+                unpaid_streak_before = int(payload.get("tax_unpaid_streak") or 0)
+                tax_disabled_before = int(payload.get("tax_disabled") or 0)
+                unpaid_streak_after = max(1, unpaid_streak_before + 1)
+                tax_disabled_after = 1 if (tax_disabled_before == 1 or unpaid_streak_after >= 3) else 0
+                if apply_balance_penalty:
+                    # Опциональный режим (legacy): списание 1.5% от текущего налогового долга.
+                    penalty_due = round(max(0.0, debt_after * TAX_NONPAYMENT_PENALTY_RATE), 2)
+                    penalty_charged = round(min(max(0.0, balance_before), penalty_due), 2)
+                balance_after = round(max(0.0, balance_before - penalty_charged), 2)
 
                 if debt_after >= 200_000:
-                    ban_until = (now_dt + timedelta(hours=12)).isoformat()
+                    ban_until = (now_dt + timedelta(minutes=MAX_PUNISHMENT_MINUTES)).isoformat()
                     await db.execute(
                         """
                         UPDATE users
-                        SET tax_debt = ?, reputation = ?, action_banned_until = ?, total_tax_paid = ?
+                        SET tax_debt = ?,
+                            reputation = ?,
+                            balance = ?,
+                            action_banned_until = ?,
+                            tax_unpaid_streak = ?,
+                            tax_disabled = ?
                         WHERE user_id = ?
                         """,
-                        (debt_after, reputation_after, ban_until, total_tax_paid_after, user_id),
+                        (
+                            debt_after,
+                            reputation_after,
+                            balance_after,
+                            ban_until,
+                            unpaid_streak_after,
+                            tax_disabled_after,
+                            user_id,
+                        ),
                     )
                 else:
                     await db.execute(
-                        "UPDATE users SET tax_debt = ?, reputation = ?, total_tax_paid = ? WHERE user_id = ?",
-                        (debt_after, reputation_after, total_tax_paid_after, user_id),
+                        """
+                        UPDATE users
+                        SET tax_debt = ?,
+                            reputation = ?,
+                            balance = ?,
+                            tax_unpaid_streak = ?,
+                            tax_disabled = ?
+                        WHERE user_id = ?
+                        """,
+                        (
+                            debt_after,
+                            reputation_after,
+                            balance_after,
+                            unpaid_streak_after,
+                            tax_disabled_after,
+                            user_id,
+                        ),
                     )
 
-                await db.execute(
-                    """
-                    UPDATE daily_tax_invoices
-                    SET status = 'debt', paid_total = 0, paid_date = ?
-                    WHERE id = ?
-                    """,
-                    (now_iso, invoice_id),
-                )
-                await db.execute(
-                    """
-                    INSERT INTO tax_logs
-                    (user_id, cycle_date, citizen_tax, property_tax, business_tax, org_tax, paid_total, debt_total, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
-                    """,
-                    (
-                        user_id,
-                        str(row["cycle_date"] or cycle),
-                        citizen_tax_log,
-                        property_tax,
-                        business_tax,
-                        private_org_tax,
-                        debt_after,
-                        now_iso,
-                    ),
-                )
+                if penalty_charged > 0:
+                    penalized_users += 1
+                    total_balance_penalty = round(total_balance_penalty + penalty_charged, 2)
+                    await db.execute(
+                        """
+                        INSERT INTO player_activity_log
+                        (user_id, activity_type, details, value, created_date)
+                        VALUES (?, 'tax_balance_penalty', ?, ?, ?)
+                        """,
+                        (
+                            user_id,
+                            f"Штраф за неуплату налогов 1.5%: ${penalty_charged:,.2f}",
+                            penalty_charged,
+                            now_iso,
+                        ),
+                    )
 
                 debtors += 1
-                total_new_debt = round(total_new_debt + debt_add, 2)
+                total_new_debt = round(total_new_debt + user_debt_add, 2)
+                if tax_disabled_after == 1 and tax_disabled_before == 0:
+                    newly_disabled_users += 1
 
             await db.commit()
 
@@ -6373,6 +9590,141 @@ class AsyncDatabase:
             "cycle_date": cycle,
             "debtors": debtors,
             "total_new_debt": total_new_debt,
+            "penalized_users": penalized_users,
+            "total_balance_penalty": total_balance_penalty,
+            "newly_disabled_users": newly_disabled_users,
+        }
+
+    async def apply_daily_tax_nonpayment_penalty(self, cycle_date: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Ежедневное списание штрафа за неуплату налогов: 1.5% от текущего налогового долга.
+        Применяется не чаще одного раза за календарный день.
+        """
+        now_dt = datetime.now()
+        now_iso = now_dt.isoformat()
+        cycle = (cycle_date or now_dt.date().isoformat()).strip()
+        checkpoint_key = "tax_nonpayment_penalty_cycle_date"
+
+        already_done = await self.get_system_state(checkpoint_key)
+        if already_done == cycle:
+            return {
+                "status": "already_applied",
+                "cycle_date": cycle,
+                "processed_debtors": 0,
+                "penalized_users": 0,
+                "total_penalty_due": 0.0,
+                "total_balance_penalty": 0.0,
+            }
+
+        processed_debtors = 0
+        penalized_users = 0
+        total_penalty_due = 0.0
+        total_balance_penalty = 0.0
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+
+            async with db.execute(
+                "SELECT value FROM system_state WHERE key = ? LIMIT 1",
+                (checkpoint_key,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row and str(row[0] or "") == cycle:
+                    await db.rollback()
+                    return {
+                        "status": "already_applied",
+                        "cycle_date": cycle,
+                        "processed_debtors": 0,
+                        "penalized_users": 0,
+                        "total_penalty_due": 0.0,
+                        "total_balance_penalty": 0.0,
+                    }
+
+            async with db.execute("SELECT current_leader_id FROM government_system LIMIT 1") as cursor:
+                gov_row = await cursor.fetchone()
+                current_leader_id = int((gov_row[0] if gov_row else 0) or 0)
+
+            async with db.execute(
+                """
+                SELECT user_id,
+                       COALESCE(tax_debt, 0) AS tax_debt,
+                       COALESCE(balance, 0) AS balance,
+                       COALESCE(role, '') AS role,
+                       COALESCE(tax_disabled, 0) AS tax_disabled
+                FROM users
+                WHERE COALESCE(tax_debt, 0) > 0
+                ORDER BY user_id ASC
+                """
+            ) as cursor:
+                debtors = await cursor.fetchall()
+
+            for row in debtors:
+                user_id = int(row["user_id"] or 0)
+                if user_id <= 0:
+                    continue
+                if int(row["tax_disabled"] or 0) == 1:
+                    continue
+
+                role_lc = str(row["role"] or "").strip().lower()
+                is_president_role = "президент" in role_lc and "вице" not in role_lc
+                is_president = bool(user_id == current_leader_id or is_president_role)
+                if is_president:
+                    continue
+
+                debt = round(float(row["tax_debt"] or 0), 2)
+                if debt <= 0:
+                    continue
+
+                processed_debtors += 1
+                penalty_due = round(max(0.0, debt * TAX_NONPAYMENT_PENALTY_RATE), 2)
+                total_penalty_due = round(total_penalty_due + penalty_due, 2)
+                if penalty_due <= 0:
+                    continue
+
+                balance_before = round(float(row["balance"] or 0), 2)
+                penalty_charged = round(min(max(0.0, balance_before), penalty_due), 2)
+                if penalty_charged <= 0:
+                    continue
+
+                balance_after = round(max(0.0, balance_before - penalty_charged), 2)
+                await db.execute(
+                    "UPDATE users SET balance = ? WHERE user_id = ?",
+                    (balance_after, user_id),
+                )
+                await db.execute(
+                    """
+                    INSERT INTO player_activity_log
+                    (user_id, activity_type, details, value, created_date)
+                    VALUES (?, 'tax_balance_penalty', ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        f"Штраф за неуплату налогов 1.5%: ${penalty_charged:,.2f}",
+                        penalty_charged,
+                        now_iso,
+                    ),
+                )
+                penalized_users += 1
+                total_balance_penalty = round(total_balance_penalty + penalty_charged, 2)
+
+            await db.execute(
+                """
+                INSERT INTO system_state (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (checkpoint_key, cycle),
+            )
+            await db.commit()
+
+        return {
+            "status": "applied",
+            "cycle_date": cycle,
+            "processed_debtors": processed_debtors,
+            "penalized_users": penalized_users,
+            "total_penalty_due": total_penalty_due,
+            "total_balance_penalty": total_balance_penalty,
         }
 
     async def list_pending_daily_tax_invoices(
@@ -6399,7 +9751,7 @@ class AsyncDatabase:
             ORDER BY dti.user_id ASC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, tuple(params)) as cursor:
                 rows = await cursor.fetchall()
@@ -6410,7 +9762,7 @@ class AsyncDatabase:
         if int(user_id or 0) <= 0 or not safe_cycle:
             return False
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 UPDATE daily_tax_invoices
@@ -6445,7 +9797,7 @@ class AsyncDatabase:
             ORDER BY cycle_date ASC, id ASC
             LIMIT 1
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, tuple(params)) as cursor:
                 row = await cursor.fetchone()
@@ -6464,7 +9816,7 @@ class AsyncDatabase:
         now = datetime.now().isoformat()
         safe_cycle = (cycle_date or "").strip()
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
 
@@ -6497,7 +9849,7 @@ class AsyncDatabase:
                 return False, "Нет активного ежедневного налога для оплаты.", {}
 
             async with db.execute(
-                "SELECT balance, tax_debt, total_tax_paid, reputation, role FROM users WHERE user_id = ? LIMIT 1",
+                "SELECT balance, tax_debt, total_tax_paid, reputation, role, tax_unpaid_streak, tax_disabled FROM users WHERE user_id = ? LIMIT 1",
                 (safe_user_id,),
             ) as cursor:
                 user = await cursor.fetchone()
@@ -6557,15 +9909,13 @@ class AsyncDatabase:
             private_org_tax = round(float(invoice["private_org_tax"] or 0), 2)
             citizen_tax = round(float(invoice["citizen_tax"] or 0), 2)
             citizen_component = round(living_tax + work_tax, 2) if (living_tax > 0 or work_tax > 0) else citizen_tax
-            tax_components_total = round(citizen_component + property_tax + business_tax + private_org_tax, 2)
-            if tax_components_total <= 0:
-                tax_components_total = citizen_tax
 
-            debt_interest = round(float(invoice["debt_interest"] or 0), 2)
             scheduled_payment = round(float(invoice["scheduled_payment"] or 0), 2)
 
             new_balance = round(balance_before - due_total, 2)
-            debt_after = round(max(0.0, debt_before + tax_components_total + debt_interest - scheduled_payment), 2)
+            # Текущий налог и проценты уже оплачены текущим платежом due_total.
+            # В долговом балансе отражаем только движение старого долга: плановое погашение.
+            debt_after = round(max(0.0, debt_before - scheduled_payment), 2)
             total_tax_paid_after = round(total_tax_paid_before + due_total, 2)
             reputation_after = reputation_before
             if debt_before > 0 and debt_after < debt_before:
@@ -6574,7 +9924,12 @@ class AsyncDatabase:
             await db.execute(
                 """
                 UPDATE users
-                SET balance = ?, tax_debt = ?, total_tax_paid = ?, reputation = ?
+                SET balance = ?,
+                    tax_debt = ?,
+                    total_tax_paid = ?,
+                    reputation = ?,
+                    tax_unpaid_streak = 0,
+                    tax_disabled = 0
                 WHERE user_id = ?
                 """,
                 (new_balance, debt_after, total_tax_paid_after, reputation_after, safe_user_id),
@@ -6646,7 +10001,7 @@ class AsyncDatabase:
         if safe_user_id <= 0:
             return {"pending": None, "latest": None}
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 """
@@ -6680,14 +10035,16 @@ class AsyncDatabase:
     async def get_user_total_tax_charged(self, user_id: int) -> float:
         """
         Получить общую сумму начисленных налогов (включая уже уплаченные и в долг).
-        Рассчитывается из таблицы tax_logs.
+        Источник:
+        - tax_logs (исторические начисления);
+        - плюс текущие pending-счета (которые еще не попали в tax_logs).
         """
         safe_user_id = int(user_id or 0)
         if safe_user_id <= 0:
             return 0.0
         
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect() as db:
                 async with db.execute(
                     """
                     SELECT COALESCE(SUM(
@@ -6702,11 +10059,46 @@ class AsyncDatabase:
                     (safe_user_id,),
                 ) as cursor:
                     row = await cursor.fetchone()
+                    logged_total = round(float((row[0] if row else 0.0) or 0.0), 2)
+
+                async with db.execute(
+                    """
+                    SELECT COALESCE(SUM(COALESCE(total_due, 0)), 0.0)
+                    FROM daily_tax_invoices
+                    WHERE user_id = ? AND status = 'pending'
+                    """,
+                    (safe_user_id,),
+                ) as cursor_pending:
+                    row_pending = await cursor_pending.fetchone()
+                    pending_total = round(float((row_pending[0] if row_pending else 0.0) or 0.0), 2)
+
+                return round(logged_total + pending_total, 2)
+        except Exception:
+            pass
+        
+        return 0.0
+
+    async def get_user_total_tax_paid(self, user_id: int) -> float:
+        """Получить общую сумму фактически оплаченных налогов."""
+        safe_user_id = int(user_id or 0)
+        if safe_user_id <= 0:
+            return 0.0
+
+        try:
+            async with self._connect() as db:
+                async with db.execute(
+                    """
+                    SELECT COALESCE(SUM(COALESCE(paid_total, 0)), 0.0)
+                    FROM tax_logs
+                    WHERE user_id = ?
+                    """,
+                    (safe_user_id,),
+                ) as cursor:
+                    row = await cursor.fetchone()
                     if row:
                         return round(float(row[0] or 0.0), 2)
         except Exception:
             pass
-        
         return 0.0
 
     async def run_advanced_tax_cycle(self, cycle_date: Optional[str] = None) -> Dict[str, Any]:
@@ -6718,7 +10110,10 @@ class AsyncDatabase:
         now_dt = datetime.now()
         cycle_date = (cycle_date or now_dt.date().isoformat()).strip()
 
-        overdue_summary = await self.settle_overdue_daily_tax_invoices(cycle_date=cycle_date)
+        overdue_summary = await self.settle_overdue_daily_tax_invoices(
+            cycle_date=cycle_date,
+            apply_balance_penalty=False,
+        )
         invoices_summary = await self.create_daily_tax_invoices(cycle_date=cycle_date)
 
         return {
@@ -6726,6 +10121,8 @@ class AsyncDatabase:
             "debtors": int(overdue_summary.get("debtors") or 0),
             "total_collected": 0.0,
             "total_new_debt": round(float(overdue_summary.get("total_new_debt") or 0), 2),
+            "penalized_users": int(overdue_summary.get("penalized_users") or 0),
+            "total_balance_penalty": round(float(overdue_summary.get("total_balance_penalty") or 0), 2),
             "created_invoices": int(invoices_summary.get("created_invoices") or 0),
             "pending_invoices": int(invoices_summary.get("pending_invoices") or 0),
             "total_due_created": round(float(invoices_summary.get("total_due_created") or 0), 2),
@@ -6735,7 +10132,7 @@ class AsyncDatabase:
     async def bootstrap_world_data(self) -> None:
         """Заполнить стартовые данные мира (идемпотентно)."""
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute("SELECT id FROM government_system ORDER BY id DESC LIMIT 1") as cursor:
                 gov_row = await cursor.fetchone()
@@ -6851,7 +10248,7 @@ class AsyncDatabase:
         safe_details = (details or "").strip()[:600]
         if not safe_activity:
             return False
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT INTO player_activity_log (user_id, activity_type, details, value, created_date)
@@ -6861,6 +10258,198 @@ class AsyncDatabase:
             )
             await db.commit()
         return True
+
+    async def ensure_player_interactions_table(self) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS player_interactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    actor_id INTEGER NOT NULL,
+                    target_id INTEGER NOT NULL,
+                    action_key TEXT NOT NULL,
+                    action_title TEXT NOT NULL,
+                    public_text TEXT,
+                    cost REAL DEFAULT 0,
+                    target_reward REAL DEFAULT 0,
+                    actor_reputation_delta REAL DEFAULT 0,
+                    target_reputation_delta REAL DEFAULT 0,
+                    target_happiness_delta REAL DEFAULT 0,
+                    created_date TEXT NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_player_interactions_actor_date ON player_interactions(actor_id, created_date DESC)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_player_interactions_target_date ON player_interactions(target_id, created_date DESC)"
+            )
+            await db.commit()
+
+    async def record_player_interaction(
+        self,
+        actor_id: int,
+        target_id: int,
+        action_key: str,
+        action_title: str,
+        public_text: str,
+        cost: float = 0.0,
+        target_reward: float = 0.0,
+        actor_reputation_delta: float = 0.0,
+        target_reputation_delta: float = 0.0,
+        target_happiness_delta: float = 0.0,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        await self.ensure_player_interactions_table()
+        safe_actor_id = int(actor_id or 0)
+        safe_target_id = int(target_id or 0)
+        if safe_actor_id <= 0 or safe_target_id <= 0:
+            return False, "Некорректный игрок.", None
+        if safe_actor_id == safe_target_id:
+            return False, "Это действие нужно сделать другому игроку.", None
+
+        safe_cost = round(max(0.0, float(cost or 0.0)), 2)
+        safe_reward = round(max(0.0, float(target_reward or 0.0)), 2)
+        actor_rep_delta = round(float(actor_reputation_delta or 0.0), 2)
+        target_rep_delta = round(float(target_reputation_delta or 0.0), 2)
+        target_happy_delta = round(float(target_happiness_delta or 0.0), 2)
+        now = datetime.now().isoformat()
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT user_id, balance, reputation, happiness, nickname, full_name, username FROM users WHERE user_id = ? LIMIT 1",
+                (safe_actor_id,),
+            ) as cursor:
+                actor = await cursor.fetchone()
+            async with db.execute(
+                "SELECT user_id, balance, reputation, happiness, nickname, full_name, username FROM users WHERE user_id = ? LIMIT 1",
+                (safe_target_id,),
+            ) as cursor:
+                target = await cursor.fetchone()
+            if not actor or not target:
+                await db.rollback()
+                return False, "Игрок не найден.", None
+
+            actor_balance = round(float(actor["balance"] or 0.0), 2)
+            target_balance = round(float(target["balance"] or 0.0), 2)
+            if actor_balance < safe_cost:
+                await db.rollback()
+                return False, f"Не хватает денег. Нужно ${safe_cost:,.2f}.", None
+
+            actor_balance_after = round(actor_balance - safe_cost, 2)
+            target_balance_after = round(target_balance + safe_reward, 2)
+            actor_rep_after = round(max(0.0, min(100.0, float(actor["reputation"] or 50.0) + actor_rep_delta)), 2)
+            target_rep_after = round(max(0.0, min(100.0, float(target["reputation"] or 50.0) + target_rep_delta)), 2)
+            target_happy_after = int(max(0, min(100, round(float(target["happiness"] or 100.0) + target_happy_delta))))
+
+            await db.execute(
+                "UPDATE users SET balance = ?, reputation = ? WHERE user_id = ?",
+                (actor_balance_after, actor_rep_after, safe_actor_id),
+            )
+            await db.execute(
+                "UPDATE users SET balance = ?, reputation = ?, happiness = ? WHERE user_id = ?",
+                (target_balance_after, target_rep_after, target_happy_after, safe_target_id),
+            )
+            cursor = await db.execute(
+                """
+                INSERT INTO player_interactions
+                (actor_id, target_id, action_key, action_title, public_text, cost, target_reward,
+                 actor_reputation_delta, target_reputation_delta, target_happiness_delta, created_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    safe_actor_id,
+                    safe_target_id,
+                    str(action_key or "action")[:64],
+                    str(action_title or "Действие")[:120],
+                    str(public_text or "")[:700],
+                    safe_cost,
+                    safe_reward,
+                    actor_rep_delta,
+                    target_rep_delta,
+                    target_happy_delta,
+                    now,
+                ),
+            )
+            interaction_id = int(cursor.lastrowid or 0)
+            await db.commit()
+
+        actor_name = _compose_public_name(dict(actor), fallback_id=safe_actor_id)
+        target_name = _compose_public_name(dict(target), fallback_id=safe_target_id)
+        await self.log_player_activity(
+            user_id=safe_actor_id,
+            activity_type="player_interaction_sent",
+            details=f"{action_title}: {target_name}",
+            value=safe_cost,
+        )
+        await self.log_player_activity(
+            user_id=safe_target_id,
+            activity_type="player_interaction_received",
+            details=f"{action_title}: {actor_name}",
+            value=safe_reward,
+        )
+        return True, "Взаимодействие выполнено.", {
+            "interaction_id": interaction_id,
+            "actor_id": safe_actor_id,
+            "target_id": safe_target_id,
+            "actor_name": actor_name,
+            "target_name": target_name,
+            "cost": safe_cost,
+            "target_reward": safe_reward,
+            "actor_balance": actor_balance_after,
+            "target_balance": target_balance_after,
+            "actor_reputation": actor_rep_after,
+            "target_reputation": target_rep_after,
+            "target_happiness": target_happy_after,
+            "created_date": now,
+        }
+
+    async def get_recent_player_interactions(self, user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+        await self.ensure_player_interactions_table()
+        safe_user_id = int(user_id or 0)
+        safe_limit = max(1, min(int(limit or 10), 50))
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT pi.*,
+                       COALESCE(NULLIF(a.nickname, ''), NULLIF(a.full_name, ''), NULLIF(a.username, ''), CAST(pi.actor_id AS TEXT)) AS actor_name,
+                       COALESCE(NULLIF(t.nickname, ''), NULLIF(t.full_name, ''), NULLIF(t.username, ''), CAST(pi.target_id AS TEXT)) AS target_name
+                FROM player_interactions pi
+                LEFT JOIN users a ON a.user_id = pi.actor_id
+                LEFT JOIN users t ON t.user_id = pi.target_id
+                WHERE pi.actor_id = ? OR pi.target_id = ?
+                ORDER BY pi.created_date DESC, pi.id DESC
+                LIMIT ?
+                """,
+                (safe_user_id, safe_user_id, safe_limit),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+    async def get_bot_admin_overview(self) -> Dict[str, Any]:
+        async with self._connect() as db:
+            async def _one(query: str, params: tuple = ()) -> float:
+                try:
+                    async with db.execute(query, params) as cursor:
+                        row = await cursor.fetchone()
+                    return float((row[0] if row else 0) or 0)
+                except Exception:
+                    return 0.0
+
+            return {
+                "users_total": int(await _one("SELECT COUNT(*) FROM users")),
+                "users_today": int(await _one("SELECT COUNT(*) FROM users WHERE DATE(COALESCE(last_activity, created_date)) = DATE('now')")),
+                "active_promos": int(await _one("SELECT COUNT(*) FROM promo_codes WHERE is_active = 1")),
+                "promo_claims": int(await _one("SELECT COUNT(*) FROM promo_code_claims")),
+                "donation_count": int(await _one("SELECT COUNT(*) FROM donation_purchases WHERE status = 'paid'")),
+                "donation_stars": int(await _one("SELECT COALESCE(SUM(amount), 0) FROM donation_purchases WHERE status = 'paid' AND upper(currency) = 'XTR'")),
+                "pending_loans": int(await _one("SELECT COUNT(*) FROM loans WHERE status = 'pending'")),
+                "active_loans": int(await _one("SELECT COUNT(*) FROM loans WHERE status IN ('approved', 'active')")),
+                "money_in_game": round(await _one("SELECT COALESCE(SUM(balance + bank + cash + shadow_balance), 0) FROM users"), 2),
+            }
 
     async def create_media_news(
         self,
@@ -6877,7 +10466,7 @@ class AsyncDatabase:
             safe_severity = "normal"
         if not safe_title or not safe_body:
             return 0
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cursor = await db.execute(
                 """
                 INSERT INTO media_news (title, body, source_user_id, severity, created_date)
@@ -6915,7 +10504,7 @@ class AsyncDatabase:
         else:
             params = (safe_limit,)
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, params) as cursor:
                 rows = await cursor.fetchall()
@@ -6935,7 +10524,7 @@ class AsyncDatabase:
             "top_sources": [],
         }
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
 
             async with db.execute(
@@ -6989,7 +10578,7 @@ class AsyncDatabase:
             LIMIT 20
         """
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (since,)) as cursor:
                 rows = await cursor.fetchall()
@@ -7081,7 +10670,7 @@ class AsyncDatabase:
             ORDER BY id DESC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (safe_limit,)) as cursor:
                 rows = await cursor.fetchall()
@@ -7106,7 +10695,7 @@ class AsyncDatabase:
         safe_penalty = max(100.0, min(float(penalty or 1000.0), 2_000_000.0))
         now = datetime.now().isoformat()
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute("SELECT MAX(id) FROM government_rules") as cursor:
@@ -7162,7 +10751,7 @@ class AsyncDatabase:
 
         set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
         values = list(updates.values()) + [int(rule_id)]
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute("SELECT id FROM government_rules WHERE id = ?", (int(rule_id),)) as cursor:
                 row = await cursor.fetchone()
             if not row:
@@ -7197,7 +10786,7 @@ class AsyncDatabase:
             ORDER BY p.price ASC, p.id ASC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (safe_limit,)) as cursor:
                 rows = await cursor.fetchall()
@@ -7216,7 +10805,7 @@ class AsyncDatabase:
             WHERE po.owner_id = ?
             ORDER BY po.acquired_date DESC
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (int(user_id),)) as cursor:
                 rows = await cursor.fetchall()
@@ -7224,7 +10813,7 @@ class AsyncDatabase:
 
     async def buy_property(self, user_id: int, property_id: int) -> tuple[bool, str, Optional[Dict[str, Any]]]:
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute("SELECT * FROM users WHERE user_id = ?", (int(user_id),)) as cursor:
@@ -7275,15 +10864,176 @@ class AsyncDatabase:
         )
         return True, "Недвижимость успешно куплена.", {"property": prop_data, "new_balance": new_balance}
 
+    async def sell_property(self, user_id: int, property_id: int) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        """Продать свою недвижимость (если объект не занят бизнесом/частной организацией)."""
+        now = datetime.now().isoformat()
+        safe_user_id = int(user_id or 0)
+        safe_property_id = int(property_id or 0)
+        if safe_user_id <= 0 or safe_property_id <= 0:
+            return False, "Некорректные параметры продажи.", None
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+
+            async with db.execute("SELECT balance FROM users WHERE user_id = ? LIMIT 1", (safe_user_id,)) as cursor:
+                user_row = await cursor.fetchone()
+            if not user_row:
+                await db.rollback()
+                return False, "Игрок не найден.", None
+
+            async with db.execute(
+                """
+                SELECT p.*, po.id AS ownership_id
+                FROM property_ownership po
+                JOIN properties p ON p.id = po.property_id
+                WHERE po.owner_id = ? AND po.property_id = ?
+                LIMIT 1
+                """,
+                (safe_user_id, safe_property_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if not row:
+                await db.rollback()
+                return False, "Этот объект не принадлежит вам.", None
+
+            async with db.execute(
+                "SELECT 1 FROM businesses WHERE property_id = ? AND status = 'active' LIMIT 1",
+                (safe_property_id,),
+            ) as cursor:
+                has_business = await cursor.fetchone() is not None
+            async with db.execute(
+                "SELECT 1 FROM private_orgs WHERE property_id = ? AND status = 'active' LIMIT 1",
+                (safe_property_id,),
+            ) as cursor:
+                has_private_org = await cursor.fetchone() is not None
+            if has_business or has_private_org:
+                await db.rollback()
+                return False, "Нельзя продать объект: в нем активен бизнес или частная организация.", None
+
+            base_price = round(float(row["price"] or 0), 2)
+            sell_price = round(max(0.0, base_price * 0.50), 2)
+            balance_after = round(float(user_row["balance"] or 0) + sell_price, 2)
+
+            await db.execute("DELETE FROM property_ownership WHERE id = ?", (int(row["ownership_id"]),))
+            await db.execute(
+                "UPDATE properties SET status = 'available' WHERE id = ?",
+                (safe_property_id,),
+            )
+            await db.execute(
+                "UPDATE users SET balance = ? WHERE user_id = ?",
+                (balance_after, safe_user_id),
+            )
+
+            async with db.execute(
+                "SELECT COUNT(*) FROM property_ownership WHERE owner_id = ?",
+                (safe_user_id,),
+            ) as cursor:
+                own_count_row = await cursor.fetchone()
+            own_count = int((own_count_row[0] if own_count_row else 0) or 0)
+            await db.execute(
+                "UPDATE users SET property_owner = ? WHERE user_id = ?",
+                (1 if own_count > 0 else 0, safe_user_id),
+            )
+            await db.commit()
+
+        prop_name = str(row["name"] or f"Объект #{safe_property_id}")
+        await self.log_player_activity(
+            user_id=safe_user_id,
+            activity_type="property_sale",
+            details=f"Продана недвижимость: {prop_name}",
+            value=sell_price,
+        )
+        return True, "Недвижимость продана.", {
+            "property_id": safe_property_id,
+            "property_name": prop_name,
+            "sale_price": sell_price,
+            "new_balance": balance_after,
+            "sold_at": now,
+        }
+
     async def get_business_by_id(self, business_id: int) -> Optional[Dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute("SELECT * FROM businesses WHERE id = ?", (int(business_id),)) as cursor:
                 row = await cursor.fetchone()
                 return dict(row) if row else None
 
+    async def upgrade_business_equipment(
+        self,
+        owner_id: int,
+        business_id: int,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_owner = int(owner_id or 0)
+        safe_business = int(business_id or 0)
+        if safe_owner <= 0 or safe_business <= 0:
+            return False, "Некорректные параметры.", None
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT * FROM businesses WHERE id = ? LIMIT 1",
+                (safe_business,),
+            ) as cursor:
+                biz = await cursor.fetchone()
+            if not biz:
+                await db.rollback()
+                return False, "Бизнес не найден.", None
+            if int(biz["owner_id"] or 0) != safe_owner:
+                await db.rollback()
+                return False, "Только владелец может улучшать бизнес.", None
+
+            level = int(biz["equipment_level"] or 1)
+            budget = round(float(biz["budget"] or 0), 2)
+            income_daily = round(float(biz["income_daily"] or 0), 2)
+            expense_daily = round(float(biz["expense_daily"] or 0), 2)
+            upgrade_cost = round(max(3_000.0, 2_500.0 * (level + 1)), 2)
+
+            if budget < upgrade_cost:
+                await db.rollback()
+                return False, f"Недостаточно бюджета бизнеса. Нужно {upgrade_cost:,.2f} люмов.", None
+
+            new_level = level + 1
+            income_bonus = round(max(120.0, income_daily * 0.08), 2)
+            expense_bonus = round(max(60.0, expense_daily * 0.04), 2)
+            new_income = round(income_daily + income_bonus, 2)
+            new_expense = round(expense_daily + expense_bonus, 2)
+            new_budget = round(budget - upgrade_cost, 2)
+
+            await db.execute(
+                """
+                UPDATE businesses
+                SET equipment_level = ?,
+                    income_daily = ?,
+                    expense_daily = ?,
+                    budget = ?
+                WHERE id = ?
+                """,
+                (new_level, new_income, new_expense, new_budget, safe_business),
+            )
+            await db.commit()
+
+        await self.log_player_activity(
+            user_id=safe_owner,
+            activity_type="business_upgrade",
+            details=f"Улучшено оборудование бизнеса #{safe_business} до ур. {new_level}",
+            value=upgrade_cost,
+        )
+        return True, "Оборудование улучшено.", {
+            "business_id": safe_business,
+            "level_before": level,
+            "level_after": new_level,
+            "upgrade_cost": upgrade_cost,
+            "income_before": income_daily,
+            "income_after": new_income,
+            "expense_before": expense_daily,
+            "expense_after": new_expense,
+            "budget_after": new_budget,
+        }
+
     async def list_user_businesses(self, owner_id: int) -> List[Dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 """
@@ -7292,12 +11042,155 @@ class AsyncDatabase:
                 FROM businesses b
                 LEFT JOIN properties p ON p.id = b.property_id
                 WHERE b.owner_id = ?
+                  AND COALESCE(b.status, 'active') = 'active'
                 ORDER BY b.created_date DESC
                 """,
                 (int(owner_id),),
             ) as cursor:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
+
+    async def sell_business_to_system(
+        self,
+        owner_id: int,
+        business_id: int,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_owner = int(owner_id or 0)
+        safe_business = int(business_id or 0)
+        if safe_owner <= 0 or safe_business <= 0:
+            return False, "Некорректные параметры.", None
+
+        now = datetime.now().isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+
+            async with db.execute(
+                "SELECT * FROM businesses WHERE id = ? AND COALESCE(status, 'active') = 'active' LIMIT 1",
+                (safe_business,),
+            ) as cursor:
+                biz = await cursor.fetchone()
+            if not biz:
+                await db.rollback()
+                return False, "Бизнес не найден или уже закрыт.", None
+            if int(biz["owner_id"] or 0) != safe_owner:
+                await db.rollback()
+                return False, "Продать бизнес может только владелец.", None
+
+            async with db.execute(
+                "SELECT balance FROM users WHERE user_id = ? LIMIT 1",
+                (safe_owner,),
+            ) as cursor:
+                owner_row = await cursor.fetchone()
+            if not owner_row:
+                await db.rollback()
+                return False, "Игрок не найден.", None
+
+            # Продажа системе за 50% оценочной стоимости бизнеса.
+            budget = round(float(biz["budget"] or 0.0), 2)
+            income_daily = round(float(biz["income_daily"] or 0.0), 2)
+            expense_daily = round(float(biz["expense_daily"] or 0.0), 2)
+            level = int(max(1, biz["equipment_level"] or 1))
+            valuation = round(
+                max(0.0, budget)
+                + max(0.0, income_daily - expense_daily) * 18.0
+                + level * 7_500.0,
+                2,
+            )
+            sale_price = round(max(1_000.0, valuation * 0.5), 2)
+
+            async with db.execute(
+                """
+                SELECT id, COALESCE(budget, 0) AS budget
+                FROM organizations
+                WHERE lower(COALESCE(type, '')) = 'government'
+                ORDER BY id ASC
+                LIMIT 1
+                """
+            ) as cursor:
+                gov_row = await cursor.fetchone()
+            if not gov_row:
+                async with db.execute(
+                    "SELECT id, COALESCE(budget, 0) AS budget FROM organizations WHERE name = 'Правительство' ORDER BY id ASC LIMIT 1"
+                ) as cursor:
+                    gov_row = await cursor.fetchone()
+            if not gov_row:
+                await db.rollback()
+                return False, "Правительство не найдено.", None
+
+            gov_id = int(gov_row["id"] or 0)
+            gov_budget_before = round(float(gov_row["budget"] or 0.0), 2)
+            if gov_budget_before < sale_price:
+                await db.rollback()
+                return False, "В госбюджете недостаточно средств для выкупа бизнеса.", {
+                    "required": sale_price,
+                    "government_budget": gov_budget_before,
+                }
+
+            owner_balance_before = round(float(owner_row["balance"] or 0.0), 2)
+            owner_balance_after = round(owner_balance_before + sale_price, 2)
+            gov_budget_after = round(gov_budget_before - sale_price, 2)
+
+            await db.execute(
+                "UPDATE users SET balance = ? WHERE user_id = ?",
+                (owner_balance_after, safe_owner),
+            )
+            await db.execute(
+                "UPDATE organizations SET budget = ? WHERE id = ?",
+                (gov_budget_after, gov_id),
+            )
+            await db.execute(
+                """
+                UPDATE businesses
+                SET status = 'sold_system',
+                    budget = 0,
+                    income_daily = 0,
+                    expense_daily = 0,
+                    last_income_date = ?
+                WHERE id = ?
+                """,
+                (now, safe_business),
+            )
+
+            property_id = int(biz["property_id"] or 0)
+            if property_id > 0:
+                await db.execute(
+                    "UPDATE properties SET status = 'owned' WHERE id = ?",
+                    (property_id,),
+                )
+
+            async with db.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM businesses
+                WHERE owner_id = ?
+                  AND COALESCE(status, 'active') = 'active'
+                """,
+                (safe_owner,),
+            ) as cursor:
+                active_left = int((await cursor.fetchone())["c"] or 0)
+            await db.execute(
+                "UPDATE users SET business_owner = ? WHERE user_id = ?",
+                (1 if active_left > 0 else 0, safe_owner),
+            )
+            await db.commit()
+
+        await self.log_player_activity(
+            user_id=safe_owner,
+            activity_type="business_sell_system",
+            details=f"Бизнес #{safe_business} продан системе",
+            value=sale_price,
+        )
+        return True, "Бизнес продан системе.", {
+            "business_id": safe_business,
+            "business_name": str(biz["name"] or f"Бизнес #{safe_business}"),
+            "sale_price": sale_price,
+            "valuation": valuation,
+            "owner_balance_before": owner_balance_before,
+            "owner_balance_after": owner_balance_after,
+            "government_budget_before": gov_budget_before,
+            "government_budget_after": gov_budget_after,
+        }
 
     async def check_and_set_user_cooldown(
         self,
@@ -7313,7 +11206,7 @@ class AsyncDatabase:
         now_dt = datetime.now()
         now = now_dt.isoformat()
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -7365,7 +11258,7 @@ class AsyncDatabase:
             return 0
         safe_cooldown = max(1, min(int(cooldown_minutes or 1), 24 * 60))
         now_dt = datetime.now()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 """
@@ -7387,7 +11280,7 @@ class AsyncDatabase:
 
     async def get_business_resources(self, business_id: int) -> Dict[str, Any]:
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 "SELECT id FROM businesses WHERE id = ? LIMIT 1",
@@ -7443,7 +11336,7 @@ class AsyncDatabase:
         unit_price = 95.0
         total_cost = round(safe_amount * unit_price, 2)
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -7503,7 +11396,7 @@ class AsyncDatabase:
         if safe_direction not in {"to_business", "to_owner"}:
             return False, "Некорректное направление перевода.", None
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute("SELECT * FROM businesses WHERE id = ? LIMIT 1", (int(business_id),)) as cursor:
@@ -7566,7 +11459,7 @@ class AsyncDatabase:
             return False, f"Кулдаун операции: еще {remain} мин.", {"cooldown_minutes": remain}
 
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -7661,6 +11554,13 @@ class AsyncDatabase:
             details=f"Операция {op} для бизнеса #{int(business_id)}",
             value=delta_budget,
         )
+        try:
+            await self.increment_business_daily_task_progress(
+                business_id=int(business_id),
+                increment=1,
+            )
+        except Exception:
+            pass
         return True, "Операция бизнеса выполнена.", {
             "operation": op,
             "delta_budget": delta_budget,
@@ -7682,7 +11582,7 @@ class AsyncDatabase:
             ORDER BY b.created_date DESC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (safe_limit,)) as cursor:
                 rows = await cursor.fetchall()
@@ -7707,7 +11607,7 @@ class AsyncDatabase:
             type_code = "service"
 
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute("SELECT * FROM users WHERE user_id = ?", (int(owner_id),)) as cursor:
@@ -7809,10 +11709,11 @@ class AsyncDatabase:
             FROM private_orgs po
             LEFT JOIN users u ON u.user_id = po.leader_id
             LEFT JOIN properties p ON p.id = po.property_id
+            WHERE COALESCE(po.status, 'active') = 'active'
             ORDER BY po.created_date DESC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (safe_limit,)) as cursor:
                 rows = await cursor.fetchall()
@@ -7832,7 +11733,7 @@ class AsyncDatabase:
             return False, "Название организации слишком длинное.", None
 
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute("SELECT * FROM users WHERE user_id = ?", (int(leader_id),)) as cursor:
@@ -7920,11 +11821,155 @@ class AsyncDatabase:
             WHERE po.id = ?
             LIMIT 1
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (int(org_id),)) as cursor:
                 row = await cursor.fetchone()
                 return dict(row) if row else None
+
+    async def sell_private_org_to_system(
+        self,
+        leader_id: int,
+        org_id: int,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_leader = int(leader_id or 0)
+        safe_org = int(org_id or 0)
+        if safe_leader <= 0 or safe_org <= 0:
+            return False, "Некорректные параметры.", None
+
+        now = datetime.now().isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+
+            async with db.execute(
+                "SELECT * FROM private_orgs WHERE id = ? AND COALESCE(status, 'active') = 'active' LIMIT 1",
+                (safe_org,),
+            ) as cursor:
+                org = await cursor.fetchone()
+            if not org:
+                await db.rollback()
+                return False, "Организация не найдена или уже закрыта.", None
+            if int(org["leader_id"] or 0) != safe_leader:
+                await db.rollback()
+                return False, "Продать организацию может только лидер.", None
+
+            async with db.execute(
+                "SELECT balance FROM users WHERE user_id = ? LIMIT 1",
+                (safe_leader,),
+            ) as cursor:
+                leader_row = await cursor.fetchone()
+            if not leader_row:
+                await db.rollback()
+                return False, "Лидер не найден.", None
+
+            async with db.execute(
+                "SELECT COUNT(*) AS c FROM private_org_members WHERE org_id = ?",
+                (safe_org,),
+            ) as cursor:
+                members_count = int((await cursor.fetchone())["c"] or 0)
+
+            budget = round(float(org["budget"] or 0.0), 2)
+            level = int(max(1, org["equipment_level"] or 1))
+            valuation = round(
+                max(0.0, budget)
+                + level * 9_000.0
+                + max(0, members_count) * 2_200.0,
+                2,
+            )
+            sale_price = round(max(1_500.0, valuation * 0.5), 2)
+
+            async with db.execute(
+                """
+                SELECT id, COALESCE(budget, 0) AS budget
+                FROM organizations
+                WHERE lower(COALESCE(type, '')) = 'government'
+                ORDER BY id ASC
+                LIMIT 1
+                """
+            ) as cursor:
+                gov_row = await cursor.fetchone()
+            if not gov_row:
+                async with db.execute(
+                    "SELECT id, COALESCE(budget, 0) AS budget FROM organizations WHERE name = 'Правительство' ORDER BY id ASC LIMIT 1"
+                ) as cursor:
+                    gov_row = await cursor.fetchone()
+            if not gov_row:
+                await db.rollback()
+                return False, "Правительство не найдено.", None
+
+            gov_id = int(gov_row["id"] or 0)
+            gov_budget_before = round(float(gov_row["budget"] or 0.0), 2)
+            if gov_budget_before < sale_price:
+                await db.rollback()
+                return False, "В госбюджете недостаточно средств для выкупа организации.", {
+                    "required": sale_price,
+                    "government_budget": gov_budget_before,
+                }
+
+            leader_balance_before = round(float(leader_row["balance"] or 0.0), 2)
+            leader_balance_after = round(leader_balance_before + sale_price, 2)
+            gov_budget_after = round(gov_budget_before - sale_price, 2)
+
+            await db.execute(
+                "UPDATE users SET balance = ? WHERE user_id = ?",
+                (leader_balance_after, safe_leader),
+            )
+            await db.execute(
+                "UPDATE organizations SET budget = ? WHERE id = ?",
+                (gov_budget_after, gov_id),
+            )
+            await db.execute(
+                """
+                UPDATE private_orgs
+                SET status = 'sold_system',
+                    budget = 0
+                WHERE id = ?
+                """,
+                (safe_org,),
+            )
+
+            property_id = int(org["property_id"] or 0)
+            if property_id > 0:
+                await db.execute(
+                    "UPDATE properties SET status = 'owned' WHERE id = ?",
+                    (property_id,),
+                )
+
+            await db.execute(
+                "DELETE FROM private_org_members WHERE org_id = ?",
+                (safe_org,),
+            )
+            await db.execute(
+                """
+                UPDATE private_org_applications
+                SET status = 'cancelled',
+                    reviewed_by = ?,
+                    reviewed_date = ?
+                WHERE org_id = ?
+                  AND status = 'pending'
+                """,
+                (safe_leader, now, safe_org),
+            )
+            await db.commit()
+
+        await self.log_player_activity(
+            user_id=safe_leader,
+            activity_type="private_org_sell_system",
+            details=f"Частная организация #{safe_org} продана системе",
+            value=sale_price,
+        )
+        return True, "Частная организация продана системе.", {
+            "org_id": safe_org,
+            "org_name": str(org["name"] or f"Организация #{safe_org}"),
+            "sale_price": sale_price,
+            "valuation": valuation,
+            "leader_balance_before": leader_balance_before,
+            "leader_balance_after": leader_balance_after,
+            "government_budget_before": gov_budget_before,
+            "government_budget_after": gov_budget_after,
+            "members_count": members_count,
+        }
 
     async def get_user_private_org_membership(self, user_id: int) -> Optional[Dict[str, Any]]:
         query = """
@@ -7937,7 +11982,7 @@ class AsyncDatabase:
             ORDER BY pom.join_date DESC
             LIMIT 1
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (int(user_id),)) as cursor:
                 row = await cursor.fetchone()
@@ -7958,7 +12003,7 @@ class AsyncDatabase:
                      pom.join_date ASC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (int(org_id), safe_limit)) as cursor:
                 rows = await cursor.fetchall()
@@ -7972,7 +12017,7 @@ class AsyncDatabase:
             return False, "Заявление слишком длинное (максимум 900 символов).", None
 
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
 
@@ -8036,7 +12081,7 @@ class AsyncDatabase:
             ORDER BY poa.applied_date ASC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (int(org_id), str(status), safe_limit)) as cursor:
                 rows = await cursor.fetchall()
@@ -8049,7 +12094,7 @@ class AsyncDatabase:
         approve: bool,
     ) -> tuple[bool, str]:
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
 
@@ -8101,7 +12146,7 @@ class AsyncDatabase:
 
     async def get_private_org_resources(self, org_id: int) -> Dict[str, Any]:
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 "SELECT id FROM private_orgs WHERE id = ? LIMIT 1",
@@ -8154,7 +12199,7 @@ class AsyncDatabase:
         unit_price = 115.0
         total_cost = round(safe_amount * unit_price, 2)
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
 
@@ -8217,7 +12262,7 @@ class AsyncDatabase:
         if safe_direction not in {"to_org", "to_user"}:
             return False, "Некорректное направление перевода.", None
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -8283,7 +12328,7 @@ class AsyncDatabase:
             return False, f"Кулдаун операции: еще {remain} мин.", {"cooldown_minutes": remain}
 
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -8361,6 +12406,13 @@ class AsyncDatabase:
             details=f"Операция {op} в частной организации #{int(org_id)}",
             value=delta_budget,
         )
+        try:
+            await self.increment_private_org_daily_task_progress(
+                org_id=int(org_id),
+                increment=1,
+            )
+        except Exception:
+            pass
         return True, "Операция частной организации выполнена.", {
             "operation": op,
             "delta_budget": delta_budget,
@@ -8411,7 +12463,7 @@ class AsyncDatabase:
         end_date = (now_dt + timedelta(days=safe_days)).isoformat()
         now = now_dt.isoformat()
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             await db.execute(
                 """
@@ -8453,7 +12505,7 @@ class AsyncDatabase:
         total_tax_paid = 0.0
         unpaid_count = 0
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             await db.execute(
@@ -8593,7 +12645,7 @@ class AsyncDatabase:
             ORDER BY btr.created_at DESC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, tuple(params)) as cursor:
                 rows = await cursor.fetchall()
@@ -8605,7 +12657,7 @@ class AsyncDatabase:
             FROM users
             WHERE (organization = 'Налоговая служба' OR lower(COALESCE(role, '')) LIKE '%налог%')
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(query) as cursor:
                 rows = await cursor.fetchall()
                 return [int(row[0]) for row in rows if row and row[0] is not None]
@@ -8620,64 +12672,64 @@ class AsyncDatabase:
             {
                 "name": "Базовая грамотность управления",
                 "description": "Экономика для новичков: бюджет, налоги, финансовая дисциплина.",
-                "duration_days": 4,
-                "tuition_fee": 1200.0,
+                "duration_days": 5,
+                "tuition_fee": 1800.0,
                 "min_education": 1,
-                "min_reputation": 0.0,
+                "min_reputation": 4.0,
             },
             {
                 "name": "Финансовая аналитика",
                 "description": "Расчеты, инвестиции, риск-менеджмент и базовые отчеты.",
-                "duration_days": 6,
-                "tuition_fee": 2800.0,
+                "duration_days": 7,
+                "tuition_fee": 3900.0,
                 "min_education": 2,
-                "min_reputation": 8.0,
+                "min_reputation": 12.0,
             },
             {
                 "name": "Юридический интенсив",
                 "description": "Законодательство, ответственность и правовые процедуры.",
-                "duration_days": 7,
-                "tuition_fee": 4200.0,
-                "min_education": 3,
-                "min_reputation": 14.0,
-            },
-            {
-                "name": "Государственный менеджмент",
-                "description": "Управление структурами, KPI, кадровые процессы и контроль.",
-                "duration_days": 8,
-                "tuition_fee": 5600.0,
+                "duration_days": 9,
+                "tuition_fee": 5800.0,
                 "min_education": 4,
                 "min_reputation": 20.0,
             },
             {
+                "name": "Государственный менеджмент",
+                "description": "Управление структурами, KPI, кадровые процессы и контроль.",
+                "duration_days": 10,
+                "tuition_fee": 7800.0,
+                "min_education": 5,
+                "min_reputation": 28.0,
+            },
+            {
                 "name": "Инженерный практикум инфраструктуры",
                 "description": "Городская инфраструктура, логистика, оптимизация процессов.",
-                "duration_days": 9,
-                "tuition_fee": 6900.0,
-                "min_education": 4,
-                "min_reputation": 24.0,
+                "duration_days": 11,
+                "tuition_fee": 9200.0,
+                "min_education": 5,
+                "min_reputation": 33.0,
             },
             {
                 "name": "Магистратура: Геоэкономика",
                 "description": "Сложные макромодели, кризисы и стратегические решения.",
-                "duration_days": 11,
-                "tuition_fee": 8900.0,
-                "min_education": 5,
-                "min_reputation": 30.0,
+                "duration_days": 13,
+                "tuition_fee": 12600.0,
+                "min_education": 6,
+                "min_reputation": 42.0,
             },
             {
                 "name": "Доктрина антикризисного управления",
                 "description": "Высший курс для лидеров: госбюджет, реформы, устойчивость.",
-                "duration_days": 12,
-                "tuition_fee": 12000.0,
-                "min_education": 7,
-                "min_reputation": 40.0,
+                "duration_days": 15,
+                "tuition_fee": 17800.0,
+                "min_education": 8,
+                "min_reputation": 55.0,
             },
         ]
 
         created = 0
         updated = 0
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             for item in catalog:
@@ -8748,7 +12800,7 @@ class AsyncDatabase:
             ORDER BY ep.tuition_fee ASC, ep.duration_days ASC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (safe_limit,)) as cursor:
                 rows = await cursor.fetchall()
@@ -8757,7 +12809,7 @@ class AsyncDatabase:
     async def get_user_education_status(self, user_id: int) -> Dict[str, Any]:
         user = await self.get_user(user_id) or {}
         result: Dict[str, Any] = {"user": user, "active_enrollment": None, "completed_count": 0}
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 """
@@ -8796,7 +12848,7 @@ class AsyncDatabase:
         if choice not in {"theory", "practice"}:
             choice = "theory"
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute("SELECT * FROM users WHERE user_id = ?", (int(user_id),)) as cursor:
@@ -8821,11 +12873,15 @@ class AsyncDatabase:
 
             current_education = int(user["education"] or 1)
             current_reputation = float(user["reputation"] or 50)
+            current_tax_debt = float(user["tax_debt"] or 0)
             min_education = int(program["min_education"] or 1)
             min_reputation = float(program["min_reputation"] or 0)
             tuition_fee = float(program["tuition_fee"] or 0)
             balance = float(user["balance"] or 0)
 
+            if current_tax_debt > 5000:
+                await db.rollback()
+                return False, "Сначала погасите налоговый долг (лимит для учебы: 5,000)."
             if current_education < min_education:
                 await db.rollback()
                 return False, f"Требуется уровень образования {min_education}+."
@@ -8870,7 +12926,7 @@ class AsyncDatabase:
         if safe_mode not in {"theory", "practice"}:
             safe_mode = "theory"
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -8946,10 +13002,18 @@ class AsyncDatabase:
                 rep_delta = 1.5 if safe_mode == "practice" else 1.0
 
             await db.execute(
-                "UPDATE users SET education = ?, reputation = ? WHERE user_id = ?",
+                """
+                UPDATE users
+                SET education = ?,
+                    reputation = ?,
+                    last_education_activity_at = ?,
+                    education_last_reminder_date = NULL
+                WHERE user_id = ?
+                """,
                 (
                     new_education,
                     round(min(100.0, current_reputation + rep_delta), 2),
+                    now,
                     int(user_id),
                 ),
             )
@@ -8994,7 +13058,7 @@ class AsyncDatabase:
         safe_score = max(0, min(int(score or (1 if passed else 0)), safe_total))
         safe_difficulty = max(1.0, min(float(difficulty or 1.0), 5.0))
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -9045,10 +13109,15 @@ class AsyncDatabase:
             await db.execute(
                 """
                 UPDATE users
-                SET education = ?, reputation = ?, balance = ?, last_education_test_at = ?
+                SET education = ?,
+                    reputation = ?,
+                    balance = ?,
+                    last_education_test_at = ?,
+                    last_education_activity_at = ?,
+                    education_last_reminder_date = NULL
                 WHERE user_id = ?
                 """,
-                (education, round(reputation, 2), balance, now, int(user_id)),
+                (education, round(reputation, 2), balance, now, now, int(user_id)),
             )
             await db.commit()
 
@@ -9072,14 +13141,134 @@ class AsyncDatabase:
             "difficulty": round(safe_difficulty, 2),
         }
 
+    async def apply_daily_education_decay(self, max_drop_per_cycle: int = 1) -> Dict[str, Any]:
+        """
+        Ежедневная проверка дисциплины по образованию.
+        Правило:
+        - если сегодня не занимались обучением, игроку отправляется напоминание;
+        - если после вчерашнего напоминания игрок так и не занимался, образование падает на 1.
+        """
+        today_dt = datetime.now().date()
+        yesterday_dt = today_dt - timedelta(days=1)
+        today = today_dt.isoformat()
+        checkpoint_key = "education_decay_last_date"
+        last = await self.get_system_state(checkpoint_key)
+        if last == today:
+            return {
+                "status": "already_processed",
+                "date": today,
+                "decreased_users": 0,
+                "reminded_users": 0,
+                "decreased_user_ids": [],
+                "reminder_user_ids": [],
+            }
+
+        safe_drop = max(1, min(int(max_drop_per_cycle or 1), 3))
+        decreased = 0
+        reminded = 0
+        decreased_user_ids: List[int] = []
+        reminder_user_ids: List[int] = []
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                """
+                SELECT user_id,
+                       education,
+                       last_education_test_at,
+                       last_education_activity_at,
+                       education_last_reminder_date
+                FROM users
+                """
+            ) as cursor:
+                users = await cursor.fetchall()
+
+            for user in users:
+                user_id = int(user["user_id"] or 0)
+                if user_id <= 0:
+                    continue
+
+                current_edu = int(user["education"] or 1)
+
+                activity_dt = _parse_iso_datetime(user["last_education_activity_at"])
+                if not activity_dt:
+                    activity_dt = _parse_iso_datetime(user["last_education_test_at"])
+                activity_date = activity_dt.date() if activity_dt else None
+                reminder_date = _parse_iso_date(user["education_last_reminder_date"])
+
+                studied_today = bool(activity_date and activity_date >= today_dt)
+                studied_yesterday_or_today = bool(activity_date and activity_date >= yesterday_dt)
+                should_remind_today = not studied_today and reminder_date != today_dt
+
+                if should_remind_today:
+                    await db.execute(
+                        "UPDATE users SET education_last_reminder_date = ? WHERE user_id = ?",
+                        (today, user_id),
+                    )
+                    reminded += 1
+                    reminder_user_ids.append(user_id)
+
+                # Если вчера было напоминание и после этого не было учебы, снимаем уровень.
+                if current_edu <= 1:
+                    continue
+
+                if reminder_date != yesterday_dt:
+                    continue
+                if studied_yesterday_or_today:
+                    continue
+
+                new_edu = max(1, current_edu - safe_drop)
+                if new_edu < current_edu:
+                    await db.execute(
+                        """
+                        UPDATE users
+                        SET education = ?,
+                            education_last_reminder_date = ?
+                        WHERE user_id = ?
+                        """,
+                        (new_edu, today, user_id),
+                    )
+                    decreased += 1
+                    decreased_user_ids.append(user_id)
+
+            await db.commit()
+
+        await self.set_system_state(checkpoint_key, today)
+        return {
+            "status": "processed",
+            "date": today,
+            "decreased_users": decreased,
+            "reminded_users": reminded,
+            "decreased_user_ids": decreased_user_ids,
+            "reminder_user_ids": reminder_user_ids,
+        }
+
     def list_citizen_jobs(self) -> List[Dict[str, Any]]:
-        return [dict(job) for job in JOB_CATALOG]
+        jobs: List[Dict[str, Any]] = []
+        for job in JOB_CATALOG:
+            clone = dict(job)
+            clone["salary"] = round(max(MIN_CITIZEN_HOURLY_SALARY, float(clone.get("salary") or 0.0)), 2)
+            jobs.append(clone)
+        return jobs
 
     def get_citizen_job(self, job_code: str) -> Optional[Dict[str, Any]]:
         code = (job_code or "").strip().lower()
         for job in JOB_CATALOG:
             if str(job.get("code") or "").lower() == code:
-                return dict(job)
+                clone = dict(job)
+                clone["salary"] = round(max(MIN_CITIZEN_HOURLY_SALARY, float(clone.get("salary") or 0.0)), 2)
+                return clone
+        return None
+
+    def get_citizen_job_by_title(self, job_title: str) -> Optional[Dict[str, Any]]:
+        title = " ".join(str(job_title or "").split()).strip().lower()
+        if not title:
+            return None
+        for job in JOB_CATALOG:
+            if " ".join(str(job.get("title") or "").split()).strip().lower() == title:
+                clone = dict(job)
+                clone["salary"] = round(max(MIN_CITIZEN_HOURLY_SALARY, float(clone.get("salary") or 0.0)), 2)
+                return clone
         return None
 
     async def get_user_pending_job_application(self, user_id: int) -> Optional[Dict[str, Any]]:
@@ -9090,11 +13279,62 @@ class AsyncDatabase:
             ORDER BY applied_date DESC
             LIMIT 1
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (int(user_id),)) as cursor:
                 row = await cursor.fetchone()
                 return dict(row) if row else None
+
+    async def resign_citizen_job(self, user_id: int) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        """Уволиться с гражданской работы."""
+        safe_user_id = int(user_id or 0)
+        if safe_user_id <= 0:
+            return False, "Некорректный пользователь.", None
+
+        now = datetime.now().isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT citizen_job, citizen_salary, organization, salary FROM users WHERE user_id = ? LIMIT 1",
+                (safe_user_id,),
+            ) as cursor:
+                user = await cursor.fetchone()
+            if not user:
+                await db.rollback()
+                return False, "Игрок не найден.", None
+
+            current_job = str(user["citizen_job"] or "").strip()
+            if not current_job:
+                await db.rollback()
+                return False, "Вы не трудоустроены на гражданской работе.", None
+
+            has_org = bool(str(user["organization"] or "").strip())
+            org_salary = float(user["salary"] or 0.0)
+            new_common_salary = org_salary if has_org else 0.0
+            await db.execute(
+                """
+                UPDATE users
+                SET citizen_job = NULL,
+                    citizen_salary = 0,
+                    last_job_shift = NULL,
+                    salary = ?
+                WHERE user_id = ?
+                """,
+                (new_common_salary, safe_user_id),
+            )
+            await db.commit()
+
+        await self.log_player_activity(
+            user_id=safe_user_id,
+            activity_type="citizen_job_resign",
+            details=f"Увольнение с должности: {current_job}",
+            value=0,
+        )
+        return True, "Вы уволились с гражданской работы.", {
+            "old_job": current_job,
+            "resigned_at": now,
+        }
 
     async def apply_for_citizen_job(
         self,
@@ -9107,13 +13347,13 @@ class AsyncDatabase:
             return False, "Вакансия не найдена.", None
 
         clean_text = " ".join((application_text or "").strip().split())
-        if len(clean_text) < 12:
-            return False, "Заявление слишком короткое (минимум 12 символов).", None
+        if len(clean_text) < 18:
+            return False, "Заявление слишком короткое (минимум 18 символов).", None
         if len(clean_text) > 900:
             return False, "Заявление слишком длинное (максимум 900 символов).", None
 
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -9137,6 +13377,8 @@ class AsyncDatabase:
                 await db.rollback()
                 return False, f"Требуется репутация {float(job['rep_required']):.1f}+.", None
 
+            salary_offer = round(max(MIN_CITIZEN_HOURLY_SALARY, float(job["salary"] or 0.0)), 2)
+
             async with db.execute(
                 "SELECT id FROM job_applications WHERE user_id = ? AND status = 'pending' LIMIT 1",
                 (int(user_id),),
@@ -9149,36 +13391,21 @@ class AsyncDatabase:
                 """
                 INSERT INTO job_applications
                 (user_id, job_code, job_title, expected_salary, application_text, status, applied_date, reviewed_by, reviewed_date, review_note)
-                VALUES (?, ?, ?, ?, ?, 'approved', ?, 0, ?, ?)
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, NULL, NULL, NULL)
                 """,
                 (
                     int(user_id),
                     str(job["code"]),
                     str(job["title"]),
-                    float(job["salary"]),
+                    salary_offer,
                     clean_text,
                     now,
-                    now,
-                    "Автоодобрение: соответствует требованиям вакансии",
                 ),
             )
             app_id = int(cursor.lastrowid or 0)
-            await db.execute(
-                """
-                UPDATE users
-                SET citizen_job = ?, citizen_salary = ?, salary = ?, last_job_shift = NULL
-                WHERE user_id = ?
-                """,
-                (
-                    str(job["title"]),
-                    float(job["salary"]),
-                    float(job["salary"]),
-                    int(user_id),
-                ),
-            )
             await db.commit()
 
-        return True, "HR-заявление одобрено автоматически: вы приняты на должность.", app_id
+        return True, "HR-заявление отправлено. Дождитесь решения отдела кадров.", app_id
 
     async def get_pending_job_applications(self, limit: int = 20) -> List[Dict[str, Any]]:
         safe_limit = max(1, min(int(limit or 20), 120))
@@ -9194,7 +13421,7 @@ class AsyncDatabase:
             ORDER BY ja.applied_date ASC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (safe_limit,)) as cursor:
                 rows = await cursor.fetchall()
@@ -9212,7 +13439,7 @@ class AsyncDatabase:
             gov_org = await self.get_government_organization()
             gov_ok = False
             if gov_org:
-                async with aiosqlite.connect(self.db_path) as db:
+                async with self._connect() as db:
                     db.row_factory = aiosqlite.Row
                     async with db.execute(
                         "SELECT leader_id, deputy_id FROM organizations WHERE id = ? LIMIT 1",
@@ -9226,7 +13453,7 @@ class AsyncDatabase:
 
         now = datetime.now().isoformat()
         clean_note = " ".join((note or "").strip().split())[:500]
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -9264,6 +13491,7 @@ class AsyncDatabase:
             )
 
             if approve:
+                expected_salary = round(max(MIN_CITIZEN_HOURLY_SALARY, float(app["expected_salary"] or 0.0)), 2)
                 await db.execute(
                     """
                     UPDATE users
@@ -9272,8 +13500,8 @@ class AsyncDatabase:
                     """,
                     (
                         str(app["job_title"] or "Госслужащий"),
-                        float(app["expected_salary"] or 0),
-                        float(app["expected_salary"] or 0),
+                        expected_salary,
+                        expected_salary,
                         int(app["user_id"]),
                     ),
                 )
@@ -9289,7 +13517,7 @@ class AsyncDatabase:
             ORDER BY assigned_date DESC
             LIMIT 1
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (int(user_id),)) as cursor:
                 row = await cursor.fetchone()
@@ -9299,9 +13527,9 @@ class AsyncDatabase:
     async def work_citizen_shift(self, user_id: int) -> tuple[bool, str, Optional[Dict[str, Any]]]:
         now_dt = datetime.now()
         now = now_dt.isoformat()
-        cooldown_minutes = 120
+        cooldown_minutes = 180
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -9334,15 +13562,18 @@ class AsyncDatabase:
 
             salary = float(user["citizen_salary"] or 0)
             if salary <= 0:
-                salary = 180.0
+                salary = MIN_CITIZEN_HOURLY_SALARY
+            job_meta = self.get_citizen_job_by_title(str(user["citizen_job"] or "")) or {}
+            shift_events = list(job_meta.get("shift_events") or [])
+            shift_event = random.choice(shift_events) if shift_events else "Смена прошла спокойно и принесла стабильный доход."
             education = int(user["education"] or 1)
             reputation = float(user["reputation"] or 50)
             base = salary
-            edu_bonus = min(0.4, education * 0.02)
-            rep_bonus = min(0.25, max(0.0, reputation / 500.0))
+            edu_bonus = min(0.25, education * 0.012)
+            rep_bonus = min(0.16, max(0.0, reputation / 800.0))
             payout = round(base * (1.0 + edu_bonus + rep_bonus), 2)
             new_balance = round(float(user["balance"] or 0) + payout, 2)
-            new_reputation = round(min(100.0, reputation + 0.15), 2)
+            new_reputation = round(min(100.0, reputation + 0.08), 2)
 
             await db.execute(
                 "UPDATE users SET balance = ?, reputation = ?, last_job_shift = ? WHERE user_id = ?",
@@ -9384,7 +13615,7 @@ class AsyncDatabase:
                         (task_goal, now, int(task["id"])),
                     )
                     next_task_goal = min(task_goal + 1, 8)
-                    next_reward = round(max(1500.0, salary * (1.2 + next_task_goal * 0.08)), 2)
+                    next_reward = round(max(1000.0, salary * (1.05 + next_task_goal * 0.06)), 2)
                     await db.execute(
                         """
                         INSERT INTO player_tasks
@@ -9408,7 +13639,7 @@ class AsyncDatabase:
             else:
                 task_goal = 3
                 task_progress = 1
-                starter_reward = round(max(1200.0, salary * 1.4), 2)
+                starter_reward = round(max(900.0, salary * 1.25), 2)
                 await db.execute(
                     """
                     INSERT INTO player_tasks
@@ -9443,11 +13674,13 @@ class AsyncDatabase:
             "next_task_goal": next_task_goal,
             "cooldown_minutes": cooldown_minutes,
             "job_title": str(user["citizen_job"] or ""),
+            "job_department": str(job_meta.get("department") or ""),
+            "shift_event": shift_event,
         }
 
     async def cancel_user_pending_job_application(self, user_id: int) -> tuple[bool, str]:
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -9481,10 +13714,12 @@ class AsyncDatabase:
         user_id: int,
         min_wait_minutes: int = 1,
     ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        return False, "Авто-рассмотрение отключено. Дождитесь решения отдела кадров.", None
+
         safe_wait = max(0, min(int(1 if min_wait_minutes is None else min_wait_minutes), 60))
         now_dt = datetime.now()
         now = now_dt.isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -9567,6 +13802,7 @@ class AsyncDatabase:
                 ),
             )
             if approved:
+                expected_salary = round(max(MIN_CITIZEN_HOURLY_SALARY, float(app["expected_salary"] or 0.0)), 2)
                 await db.execute(
                     """
                     UPDATE users
@@ -9575,8 +13811,8 @@ class AsyncDatabase:
                     """,
                     (
                         str(app["job_title"] or "Госслужащий"),
-                        float(app["expected_salary"] or 0),
-                        float(app["expected_salary"] or 0),
+                        expected_salary,
+                        expected_salary,
                         int(user_id),
                     ),
                 )
@@ -9595,15 +13831,15 @@ class AsyncDatabase:
     ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
         safe_key = (job_key or "").strip().lower()
         jobs = {
-            "courier": {"title": "Курьерский рейс", "min": 900, "max": 2200, "cooldown": 7, "rep": 0.18},
-            "taxi": {"title": "Ночная смена такси", "min": 1100, "max": 2500, "cooldown": 9, "rep": 0.15},
-            "repair": {"title": "Срочный ремонт", "min": 1200, "max": 2800, "cooldown": 10, "rep": 0.2},
-            "freelance": {"title": "Фриланс-заказ", "min": 1300, "max": 3100, "cooldown": 11, "rep": 0.22},
-            "street_trade": {"title": "Уличная торговля", "min": 1000, "max": 2400, "cooldown": 8, "rep": 0.12},
-            "delivery_plus": {"title": "Экспресс-доставка", "min": 1400, "max": 3300, "cooldown": 12, "rep": 0.24},
-            "warehouse": {"title": "Складская инвентаризация", "min": 1150, "max": 2650, "cooldown": 9, "rep": 0.17},
-            "stream": {"title": "Локальный стрим", "min": 800, "max": 3600, "cooldown": 13, "rep": 0.21},
-            "assistant": {"title": "Персональный ассистент", "min": 1250, "max": 2950, "cooldown": 10, "rep": 0.19},
+            "courier": {"title": "Курьерский рейс", "min": 350, "max": 900, "cooldown": 20, "rep": 0.08},
+            "taxi": {"title": "Ночная смена такси", "min": 420, "max": 980, "cooldown": 24, "rep": 0.07},
+            "repair": {"title": "Срочный ремонт", "min": 480, "max": 1_100, "cooldown": 26, "rep": 0.09},
+            "freelance": {"title": "Фриланс-заказ", "min": 520, "max": 1_200, "cooldown": 28, "rep": 0.10},
+            "street_trade": {"title": "Уличная торговля", "min": 360, "max": 860, "cooldown": 22, "rep": 0.06},
+            "delivery_plus": {"title": "Экспресс-доставка", "min": 600, "max": 1_350, "cooldown": 30, "rep": 0.11},
+            "warehouse": {"title": "Складская инвентаризация", "min": 430, "max": 1_020, "cooldown": 24, "rep": 0.08},
+            "stream": {"title": "Локальный стрим", "min": 280, "max": 1_250, "cooldown": 32, "rep": 0.09},
+            "assistant": {"title": "Персональный ассистент", "min": 500, "max": 1_150, "cooldown": 27, "rep": 0.09},
         }
         cfg = jobs.get(safe_key)
         if not cfg:
@@ -9624,7 +13860,7 @@ class AsyncDatabase:
         payout = float(random.randint(int(cfg["min"]), int(cfg["max"])))
         critical = random.random() < 0.12
         if critical:
-            payout = round(payout * 1.55, 2)
+            payout = round(payout * 1.28, 2)
         reputation = float(user.get("reputation") or 50)
         new_reputation = round(min(100.0, reputation + float(cfg["rep"])), 2)
         new_balance = round(float(user.get("balance") or 0) + payout, 2)
@@ -9662,11 +13898,398 @@ class AsyncDatabase:
             ORDER BY c.casino_type ASC, c.name ASC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, tuple(params)) as cursor:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
+
+    async def get_casino(self, casino_id: int) -> Optional[Dict[str, Any]]:
+        query = """
+            SELECT c.*,
+                   COALESCE(NULLIF(u.nickname, ''), NULLIF(u.full_name, ''), NULLIF(u.username, ''), CAST(c.owner_id AS TEXT)) AS owner_name
+            FROM casinos c
+            LEFT JOIN users u ON u.user_id = c.owner_id
+            WHERE c.id = ? AND c.status = 'active'
+            LIMIT 1
+        """
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, (int(casino_id),)) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def get_casino_recent_games(self, casino_id: int, limit: int = 18) -> List[Dict[str, Any]]:
+        safe_limit = max(1, min(int(limit or 18), 60))
+        query = """
+            SELECT cg.*,
+                   COALESCE(NULLIF(u.nickname, ''), NULLIF(u.full_name, ''), NULLIF(u.username, ''), CAST(cg.user_id AS TEXT)) AS user_name
+            FROM casino_games cg
+            LEFT JOIN users u ON u.user_id = cg.user_id
+            WHERE cg.casino_id = ?
+            ORDER BY cg.created_date DESC, cg.id DESC
+            LIMIT ?
+        """
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, (int(casino_id), safe_limit)) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+    async def get_casino_dashboard(self, casino_id: int, hours: int = 24) -> Optional[Dict[str, Any]]:
+        safe_hours = max(1, min(int(hours or 24), 24 * 30))
+        now_dt = datetime.now()
+        since = (now_dt - timedelta(hours=safe_hours)).isoformat()
+        base = await self.get_casino(casino_id)
+        if not base:
+            return None
+
+        stats: Dict[str, Any] = {
+            "casino": base,
+            "hours": safe_hours,
+            "from": since,
+            "to": now_dt.isoformat(),
+            "games": 0,
+            "players": 0,
+            "turnover": 0.0,
+            "payouts": 0.0,
+            "avg_bet": 0.0,
+            "house_profit": 0.0,
+            "rtp_percent": 0.0,
+            "margin_percent": 0.0,
+            "win_games": 0,
+            "break_even_or_win_games": 0,
+            "by_game": [],
+            "top_players": [],
+        }
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT
+                    COUNT(*) AS games,
+                    COUNT(DISTINCT user_id) AS players,
+                    COALESCE(SUM(bet_amount), 0) AS turnover,
+                    COALESCE(SUM(payout), 0) AS payouts,
+                    COALESCE(AVG(bet_amount), 0) AS avg_bet,
+                    COALESCE(SUM(CASE WHEN payout > bet_amount THEN 1 ELSE 0 END), 0) AS win_games,
+                    COALESCE(SUM(CASE WHEN payout >= bet_amount THEN 1 ELSE 0 END), 0) AS break_even_or_win_games
+                FROM casino_games
+                WHERE casino_id = ?
+                  AND created_date >= ?
+                """,
+                (int(casino_id), since),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row:
+                turnover = round(float(row["turnover"] or 0.0), 2)
+                payouts = round(float(row["payouts"] or 0.0), 2)
+                house_profit = round(turnover - payouts, 2)
+                stats.update(
+                    {
+                        "games": int(row["games"] or 0),
+                        "players": int(row["players"] or 0),
+                        "turnover": turnover,
+                        "payouts": payouts,
+                        "avg_bet": round(float(row["avg_bet"] or 0.0), 2),
+                        "house_profit": house_profit,
+                        "rtp_percent": round((payouts / turnover * 100.0), 2) if turnover > 0 else 0.0,
+                        "margin_percent": round((house_profit / turnover * 100.0), 2) if turnover > 0 else 0.0,
+                        "win_games": int(row["win_games"] or 0),
+                        "break_even_or_win_games": int(row["break_even_or_win_games"] or 0),
+                    }
+                )
+
+            async with db.execute(
+                """
+                SELECT
+                    game_type,
+                    COUNT(*) AS games,
+                    COALESCE(SUM(bet_amount), 0) AS turnover,
+                    COALESCE(SUM(payout), 0) AS payouts
+                FROM casino_games
+                WHERE casino_id = ?
+                  AND created_date >= ?
+                GROUP BY game_type
+                ORDER BY turnover DESC, games DESC
+                LIMIT 8
+                """,
+                (int(casino_id), since),
+            ) as cursor:
+                by_game_rows = await cursor.fetchall()
+            by_game: List[Dict[str, Any]] = []
+            for row in by_game_rows:
+                turnover = round(float(row["turnover"] or 0.0), 2)
+                payouts = round(float(row["payouts"] or 0.0), 2)
+                by_game.append(
+                    {
+                        "game_type": str(row["game_type"] or "unknown"),
+                        "games": int(row["games"] or 0),
+                        "turnover": turnover,
+                        "payouts": payouts,
+                        "house_profit": round(turnover - payouts, 2),
+                        "rtp_percent": round((payouts / turnover * 100.0), 2) if turnover > 0 else 0.0,
+                    }
+                )
+            stats["by_game"] = by_game
+
+            async with db.execute(
+                """
+                SELECT
+                    cg.user_id,
+                    COALESCE(NULLIF(u.nickname, ''), NULLIF(u.full_name, ''), NULLIF(u.username, ''), CAST(cg.user_id AS TEXT)) AS player_name,
+                    COUNT(*) AS games,
+                    COALESCE(SUM(cg.bet_amount), 0) AS turnover,
+                    COALESCE(SUM(cg.payout), 0) AS payouts
+                FROM casino_games cg
+                LEFT JOIN users u ON u.user_id = cg.user_id
+                WHERE cg.casino_id = ?
+                  AND cg.created_date >= ?
+                GROUP BY cg.user_id
+                ORDER BY turnover DESC, games DESC
+                LIMIT 5
+                """,
+                (int(casino_id), since),
+            ) as cursor:
+                top_rows = await cursor.fetchall()
+            top_players: List[Dict[str, Any]] = []
+            for row in top_rows:
+                turnover = round(float(row["turnover"] or 0.0), 2)
+                payouts = round(float(row["payouts"] or 0.0), 2)
+                top_players.append(
+                    {
+                        "user_id": int(row["user_id"] or 0),
+                        "player_name": str(row["player_name"] or "Игрок"),
+                        "games": int(row["games"] or 0),
+                        "turnover": turnover,
+                        "net": round(payouts - turnover, 2),
+                    }
+                )
+            stats["top_players"] = top_players
+
+        return stats
+
+    async def update_private_casino_limits(
+        self,
+        owner_id: int,
+        casino_id: int,
+        min_bet: float,
+        max_bet: float,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_min = round(max(100.0, min(float(min_bet or 0.0), 200_000.0)), 2)
+        safe_max = round(max(safe_min * 4, min(float(max_bet or 0.0), 5_000_000.0)), 2)
+        if safe_max < safe_min:
+            return False, "Некорректные лимиты ставок.", None
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT id, owner_id, casino_type, min_bet, max_bet FROM casinos WHERE id = ? AND status = 'active' LIMIT 1",
+                (int(casino_id),),
+            ) as cursor:
+                casino = await cursor.fetchone()
+            if not casino:
+                await db.rollback()
+                return False, "Казино не найдено.", None
+            if str(casino["casino_type"] or "") != "private":
+                await db.rollback()
+                return False, "Настройка доступна только для частных казино.", None
+            if int(casino["owner_id"] or 0) != int(owner_id):
+                await db.rollback()
+                return False, "Только владелец может менять лимиты.", None
+
+            await db.execute(
+                "UPDATE casinos SET min_bet = ?, max_bet = ? WHERE id = ?",
+                (safe_min, safe_max, int(casino_id)),
+            )
+            await db.commit()
+
+        return True, "Лимиты ставок обновлены.", {
+            "casino_id": int(casino_id),
+            "min_bet": safe_min,
+            "max_bet": safe_max,
+        }
+
+    async def update_private_casino_house_edge(
+        self,
+        owner_id: int,
+        casino_id: int,
+        house_edge: float,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_edge = round(max(0.012, min(float(house_edge or 0.03), 0.09)), 4)
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT id, owner_id, casino_type FROM casinos WHERE id = ? AND status = 'active' LIMIT 1",
+                (int(casino_id),),
+            ) as cursor:
+                casino = await cursor.fetchone()
+            if not casino:
+                await db.rollback()
+                return False, "Казино не найдено.", None
+            if str(casino["casino_type"] or "") != "private":
+                await db.rollback()
+                return False, "Настройка доступна только для частных казино.", None
+            if int(casino["owner_id"] or 0) != int(owner_id):
+                await db.rollback()
+                return False, "Только владелец может менять маржу.", None
+
+            await db.execute(
+                "UPDATE casinos SET house_edge = ? WHERE id = ?",
+                (safe_edge, int(casino_id)),
+            )
+            await db.commit()
+
+        return True, "Маржа казино обновлена.", {
+            "casino_id": int(casino_id),
+            "house_edge": safe_edge,
+        }
+
+    async def transfer_private_casino_liquidity(
+        self,
+        owner_id: int,
+        casino_id: int,
+        amount: float,
+        direction: str,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_direction = (direction or "").strip().lower()
+        if safe_direction not in {"deposit", "withdraw"}:
+            return False, "Некорректное направление перевода.", None
+        safe_amount = round(float(amount or 0.0), 2)
+        if safe_amount <= 0:
+            return False, "Сумма должна быть больше нуля.", None
+        if safe_amount > 50_000_000:
+            return False, "Слишком большая сумма перевода.", None
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT id, owner_id, casino_type, balance, min_bet FROM casinos WHERE id = ? AND status = 'active' LIMIT 1",
+                (int(casino_id),),
+            ) as cursor:
+                casino = await cursor.fetchone()
+            if not casino:
+                await db.rollback()
+                return False, "Казино не найдено.", None
+            if str(casino["casino_type"] or "") != "private":
+                await db.rollback()
+                return False, "Операция доступна только для частных казино.", None
+            if int(casino["owner_id"] or 0) != int(owner_id):
+                await db.rollback()
+                return False, "Только владелец может переводить ликвидность.", None
+
+            async with db.execute("SELECT balance FROM users WHERE user_id = ? LIMIT 1", (int(owner_id),)) as cursor:
+                owner = await cursor.fetchone()
+            if not owner:
+                await db.rollback()
+                return False, "Владелец не найден.", None
+
+            owner_balance = round(float(owner["balance"] or 0.0), 2)
+            casino_balance = round(float(casino["balance"] or 0.0), 2)
+            min_bet = round(float(casino["min_bet"] or 100.0), 2)
+            reserve_floor = round(max(100_000.0, min_bet * 40), 2)
+
+            if safe_direction == "deposit":
+                if owner_balance < safe_amount:
+                    await db.rollback()
+                    return False, "Недостаточно средств на личном балансе.", None
+                owner_after = round(owner_balance - safe_amount, 2)
+                casino_after = round(casino_balance + safe_amount, 2)
+            else:
+                withdrawable = round(max(0.0, casino_balance - reserve_floor), 2)
+                if withdrawable <= 0:
+                    await db.rollback()
+                    return False, "Сейчас нельзя выводить: нужен резерв ликвидности.", None
+                if safe_amount > withdrawable:
+                    await db.rollback()
+                    return False, f"Максимум к выводу сейчас: ${withdrawable:,.2f}.", None
+                owner_after = round(owner_balance + safe_amount, 2)
+                casino_after = round(casino_balance - safe_amount, 2)
+
+            await db.execute(
+                "UPDATE users SET balance = ? WHERE user_id = ?",
+                (owner_after, int(owner_id)),
+            )
+            await db.execute(
+                "UPDATE casinos SET balance = ? WHERE id = ?",
+                (casino_after, int(casino_id)),
+            )
+            await db.commit()
+
+        details = (
+            f"Ликвидность казино #{int(casino_id)}: {'взнос' if safe_direction == 'deposit' else 'вывод'}"
+        )
+        await self.log_player_activity(
+            user_id=int(owner_id),
+            activity_type="casino_treasury",
+            details=details,
+            value=safe_amount if safe_direction == "deposit" else -safe_amount,
+        )
+        return True, "Перевод ликвидности выполнен.", {
+            "casino_id": int(casino_id),
+            "direction": safe_direction,
+            "amount": safe_amount,
+            "owner_balance_after": owner_after,
+            "casino_balance_after": casino_after,
+            "reserve_floor": reserve_floor,
+        }
+
+    async def apply_private_casino_profile(
+        self,
+        owner_id: int,
+        casino_id: int,
+        profile_key: str,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        presets: Dict[str, Dict[str, float]] = {
+            "safe": {"min_bet": 500.0, "max_bet": 85_000.0, "house_edge": 0.048},
+            "balanced": {"min_bet": 1_000.0, "max_bet": 350_000.0, "house_edge": 0.032},
+            "vip": {"min_bet": 5_000.0, "max_bet": 1_500_000.0, "house_edge": 0.022},
+        }
+        safe_key = (profile_key or "").strip().lower()
+        preset = presets.get(safe_key)
+        if not preset:
+            return False, "Неизвестный профиль казино.", None
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT id, owner_id, casino_type FROM casinos WHERE id = ? AND status = 'active' LIMIT 1",
+                (int(casino_id),),
+            ) as cursor:
+                casino = await cursor.fetchone()
+            if not casino:
+                await db.rollback()
+                return False, "Казино не найдено.", None
+            if str(casino["casino_type"] or "") != "private":
+                await db.rollback()
+                return False, "Профили доступны только для частных казино.", None
+            if int(casino["owner_id"] or 0) != int(owner_id):
+                await db.rollback()
+                return False, "Только владелец может менять профиль.", None
+
+            await db.execute(
+                "UPDATE casinos SET min_bet = ?, max_bet = ?, house_edge = ? WHERE id = ?",
+                (
+                    float(preset["min_bet"]),
+                    float(preset["max_bet"]),
+                    float(preset["house_edge"]),
+                    int(casino_id),
+                ),
+            )
+            await db.commit()
+
+        return True, "Профиль казино применен.", {
+            "casino_id": int(casino_id),
+            "profile": safe_key,
+            "min_bet": float(preset["min_bet"]),
+            "max_bet": float(preset["max_bet"]),
+            "house_edge": float(preset["house_edge"]),
+        }
 
     async def create_private_casino(
         self,
@@ -9687,7 +14310,7 @@ class AsyncDatabase:
         start_balance = 2_400_000.0
         now = datetime.now().isoformat()
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute("SELECT balance FROM users WHERE user_id = ?", (int(owner_id),)) as cursor:
@@ -9715,6 +14338,7 @@ class AsyncDatabase:
                 (clean_name, int(owner_id), safe_min_bet, safe_max_bet, start_balance, now),
             )
             casino_id = int(cursor.lastrowid or 0)
+            await self._credit_public_budgets(db, registration_fee)
             await db.commit()
 
         await self.log_player_activity(
@@ -9737,12 +14361,17 @@ class AsyncDatabase:
         if safe_bet <= 0:
             return False, "Ставка должна быть больше нуля.", None
         safe_game = (game_type or "").strip().lower()
-        if safe_game not in {"coin", "dice", "slots"}:
+        if safe_game not in {"coin", "dice", "slots", "roulette"}:
             return False, "Неизвестная игра.", None
         safe_prediction = (prediction or "").strip().lower()
         now = datetime.now().isoformat()
+        slot_info: Optional[Dict[str, Any]] = None
+        roulette_color = ""
+        display_roll = ""
+        turnover_tax = 0.0
+        budget_credit = {"government_credit": 0.0, "tax_service_credit": 0.0}
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute("SELECT * FROM users WHERE user_id = ?", (int(user_id),)) as cursor:
@@ -9761,6 +14390,7 @@ class AsyncDatabase:
             if safe_bet < min_bet or safe_bet > max_bet:
                 await db.rollback()
                 return False, f"Ставка должна быть от ${min_bet:,.0f} до ${max_bet:,.0f}.", None
+            house_edge = round(max(0.012, min(float(casino["house_edge"] or 0.03), 0.12)), 4)
             user_balance = float(user["balance"] or 0)
             if user_balance < safe_bet:
                 await db.rollback()
@@ -9769,6 +14399,8 @@ class AsyncDatabase:
             roll_value = random.randint(1, 100)
             payout = 0.0
             result = "lose"
+            even_probability = 0.5
+            even_multiplier = round((1.0 - house_edge) / even_probability, 4)
             if safe_game == "coin":
                 if safe_prediction not in {"heads", "tails"}:
                     await db.rollback()
@@ -9776,8 +14408,9 @@ class AsyncDatabase:
                 target = 1 if safe_prediction == "heads" else 0
                 coin_roll = random.randint(0, 1)
                 roll_value = coin_roll
-                if coin_roll == target and random.random() < 0.98:
-                    payout = round(safe_bet * 1.92, 2)
+                display_roll = "heads" if coin_roll == 1 else "tails"
+                if coin_roll == target:
+                    payout = round(safe_bet * even_multiplier, 2)
                     result = "win"
             elif safe_game == "dice":
                 if safe_prediction not in {"high", "low"}:
@@ -9785,30 +14418,61 @@ class AsyncDatabase:
                     return False, "Для кубика выберите high или low.", None
                 dice_roll = random.randint(1, 6)
                 roll_value = dice_roll
+                display_roll = str(dice_roll)
                 if (safe_prediction == "high" and dice_roll >= 4) or (safe_prediction == "low" and dice_roll <= 3):
-                    if random.random() < 0.96:
-                        payout = round(safe_bet * 1.88, 2)
-                        result = "win"
-            else:
-                if roll_value <= 6:
-                    payout = round(safe_bet * 6.0, 2)
-                    result = "jackpot"
-                elif roll_value <= 26:
-                    payout = round(safe_bet * 2.1, 2)
+                    payout = round(safe_bet * even_multiplier, 2)
                     result = "win"
+            elif safe_game == "roulette":
+                if safe_prediction not in {"red", "black"}:
+                    await db.rollback()
+                    return False, "Для рулетки выберите red или black.", None
+                roulette_number = random.randint(0, 36)
+                roll_value = roulette_number
+                roulette_color = _roulette_color_by_number(roulette_number)
+                display_roll = f"{roulette_number} ({roulette_color})"
+                roulette_win_probability = 18.0 / 37.0
+                roulette_multiplier = round((1.0 - house_edge) / roulette_win_probability, 4)
+                if roulette_color == safe_prediction:
+                    payout = round(safe_bet * roulette_multiplier, 2)
+                    result = "win"
+            else:
+                roll_value = random.randint(1, 64)
+                slot_info = _analyze_slots_roll(roll_value)
+                display_roll = str(slot_info.get("display") or roll_value)
+                combo = str(slot_info.get("combo") or "none")
+                top_symbol = int(slot_info.get("top_symbol") or 0)
+                slot_factor = max(0.75, min(1.15, 1.0 - (house_edge - 0.03) * 4.0))
+                if combo == "triple":
+                    multiplier = [8.0, 10.0, 14.0, 20.0][max(0, min(top_symbol, 3))]
+                    multiplier = round(max(3.0, multiplier * slot_factor), 3)
+                    payout = round(safe_bet * multiplier, 2)
+                    result = "jackpot"
+                elif combo == "pair":
+                    pair_multiplier = round(max(1.45, 2.3 * slot_factor), 3)
+                    payout = round(safe_bet * pair_multiplier, 2)
+                    result = "pair_win"
+                elif roll_value in {7, 28, 39, 52}:
+                    refund_multiplier = round(max(1.01, 1.15 * min(1.0, slot_factor)), 3)
+                    payout = round(safe_bet * refund_multiplier, 2)
+                    result = "refund"
 
             casino_balance = float(casino["balance"] or 0)
-            max_payout = round(casino_balance + safe_bet, 2)
+            planned_turnover_tax = round(safe_bet * CASINO_TURNOVER_GOV_RATE, 2)
+            max_payout = round(max(0.0, casino_balance + safe_bet - planned_turnover_tax), 2)
             if payout > max_payout:
                 payout = max_payout
                 result = "limited_win"
 
             new_user_balance = round(user_balance - safe_bet + payout, 2)
-            new_casino_balance = round(casino_balance + safe_bet - payout, 2)
+            casino_balance_before_tax = round(casino_balance + safe_bet - payout, 2)
+            turnover_tax = round(min(max(0.0, casino_balance_before_tax), planned_turnover_tax), 2)
+            new_casino_balance = round(max(0.0, casino_balance_before_tax - turnover_tax), 2)
             profit = round(payout - safe_bet, 2)
 
             await db.execute("UPDATE users SET balance = ? WHERE user_id = ?", (new_user_balance, int(user_id)))
             await db.execute("UPDATE casinos SET balance = ? WHERE id = ?", (new_casino_balance, int(casino_id)))
+            if turnover_tax > 0:
+                budget_credit = await self._credit_public_budgets(db, turnover_tax)
             await db.execute(
                 """
                 INSERT INTO casino_games
@@ -9840,10 +14504,18 @@ class AsyncDatabase:
         return True, "Игра завершена.", {
             "result": result,
             "roll_value": roll_value,
+            "display_roll": display_roll or str(roll_value),
             "bet": safe_bet,
             "payout": payout,
             "profit": profit,
             "new_balance": new_user_balance,
+            "turnover_tax": turnover_tax,
+            "house_edge": house_edge,
+            "government_credit": float(budget_credit.get("government_credit") or 0.0),
+            "tax_service_credit": float(budget_credit.get("tax_service_credit") or 0.0),
+            "slots_display": (slot_info or {}).get("display"),
+            "slots_combo": (slot_info or {}).get("combo"),
+            "roulette_color": roulette_color,
         }
 
     async def get_user_recent_casino_games(self, user_id: int, limit: int = 15) -> List[Dict[str, Any]]:
@@ -9857,7 +14529,7 @@ class AsyncDatabase:
             ORDER BY cg.created_date DESC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (int(user_id), safe_limit)) as cursor:
                 rows = await cursor.fetchall()
@@ -9877,8 +14549,10 @@ class AsyncDatabase:
         safe_game = (game_type or "").strip().lower()
         cfg = {
             "dice": {"min": 1, "max": 6},
-            "slots": {"min": 1, "max": 64},
+            "slots": {"min": 0, "max": 0},
+            "slots3": {"min": 0, "max": 0},
             "basketball": {"min": 1, "max": 5},
+            "roulette": {"min": 1, "max": 2},
         }.get(safe_game)
         if not cfg:
             return False, "Неизвестный тип игры.", None
@@ -9889,6 +14563,8 @@ class AsyncDatabase:
                 safe_target = int(target_value)
             except Exception:
                 safe_target = 0
+        elif safe_game in {"slots", "slots3"}:
+            safe_target = 0
         else:
             try:
                 safe_target = int(target_value)
@@ -9909,7 +14585,7 @@ class AsyncDatabase:
         now = now_dt.isoformat()
         expires_at = (now_dt + timedelta(minutes=max(1, min(int(expires_minutes or 5), 30)))).isoformat()
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -9990,7 +14666,7 @@ class AsyncDatabase:
             WHERE d.id = ?
             LIMIT 1
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (int(duel_id),)) as cursor:
                 row = await cursor.fetchone()
@@ -10002,7 +14678,7 @@ class AsyncDatabase:
         actor_id: int,
     ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute("SELECT * FROM group_casino_duels WHERE id = ? LIMIT 1", (int(duel_id),)) as cursor:
@@ -10041,7 +14717,7 @@ class AsyncDatabase:
     ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
         now = datetime.now().isoformat()
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute("SELECT * FROM group_casino_duels WHERE id = ? LIMIT 1", (int(duel_id),)) as cursor:
@@ -10090,6 +14766,13 @@ class AsyncDatabase:
                 await db.rollback()
                 return False, "У соперника недостаточно средств на ставку.", None
 
+            c_roll = None
+            o_roll = None
+            safe_roll = 0
+            challenger_wins = False
+            slots_meta: Dict[str, Any] = {}
+            roulette_color = ""
+
             if game_type == "dice":
                 try:
                     c_roll = int(challenger_roll)
@@ -10107,10 +14790,45 @@ class AsyncDatabase:
 
                 challenger_wins = c_roll > o_roll
                 safe_roll = c_roll if challenger_wins else o_roll
+            elif game_type in {"slots3", "slots"} and challenger_roll is not None and opponent_roll is not None:
+                try:
+                    c_roll = int(challenger_roll)
+                    o_roll = int(opponent_roll)
+                except Exception:
+                    await db.rollback()
+                    return False, "Некорректные вращения для слотов.", None
+                if not (1 <= c_roll <= 64 and 1 <= o_roll <= 64):
+                    await db.rollback()
+                    return False, "Значения слотов должны быть от 1 до 64.", None
+                c_slot = _analyze_slots_roll(c_roll)
+                o_slot = _analyze_slots_roll(o_roll)
+                c_score = int(c_slot.get("score") or 0)
+                o_score = int(o_slot.get("score") or 0)
+                if c_score == o_score:
+                    await db.rollback()
+                    return False, "Ничья. Требуется переброс.", None
+                challenger_wins = c_score > o_score
+                safe_roll = c_roll if challenger_wins else o_roll
+                slots_meta = {
+                    "challenger": c_slot,
+                    "opponent": o_slot,
+                }
+            elif game_type == "roulette":
+                try:
+                    safe_roll = int(roll_value)
+                except Exception:
+                    await db.rollback()
+                    return False, "Некорректное значение рулетки.", None
+                if safe_roll < 1 or safe_roll > 36:
+                    await db.rollback()
+                    return False, "Для red/black число рулетки должно быть от 1 до 36.", None
+                roulette_color = _roulette_color_by_number(safe_roll)
+                target_color = "red" if target == 1 else "black"
+                challenger_wins = roulette_color == target_color
             else:
                 cfg = {
-                    "slots": {"min": 1, "max": 64},
                     "basketball": {"min": 1, "max": 5},
+                    "slots": {"min": 1, "max": 64},
                 }.get(game_type, {"min": 1, "max": 64})
                 try:
                     safe_roll = int(roll_value)
@@ -10121,8 +14839,6 @@ class AsyncDatabase:
                     await db.rollback()
                     return False, f"Значение броска должно быть от {cfg['min']} до {cfg['max']}.", None
 
-                c_roll = None
-                o_roll = None
                 challenger_wins = safe_roll == target
 
             winner_id = challenger_id if challenger_wins else opponent_id
@@ -10148,31 +14864,9 @@ class AsyncDatabase:
             await db.execute("UPDATE users SET balance = ? WHERE user_id = ?", (c_balance, challenger_id))
             await db.execute("UPDATE users SET balance = ? WHERE user_id = ?", (o_balance, opponent_id))
 
-            government_budget_after: float | None = None
+            budget_credit = {"government_credit": 0.0, "tax_service_credit": 0.0}
             if house_fee > 0:
-                async with db.execute(
-                    """
-                    SELECT id, budget
-                    FROM organizations
-                    WHERE lower(COALESCE(type, '')) = 'government'
-                    ORDER BY id ASC
-                    LIMIT 1
-                    """
-                ) as cursor:
-                    gov_row = await cursor.fetchone()
-                if not gov_row:
-                    async with db.execute(
-                        "SELECT id, budget FROM organizations WHERE name = 'Правительство' ORDER BY id ASC LIMIT 1"
-                    ) as cursor:
-                        gov_row = await cursor.fetchone()
-                if gov_row:
-                    gov_org_id = int(gov_row["id"] or 0)
-                    gov_budget_before = round(float(gov_row["budget"] or 0), 2)
-                    government_budget_after = round(gov_budget_before + house_fee, 2)
-                    await db.execute(
-                        "UPDATE organizations SET budget = ? WHERE id = ?",
-                        (government_budget_after, gov_org_id),
-                    )
+                budget_credit = await self._credit_public_budgets(db, house_fee)
             await db.execute(
                 """
                 UPDATE group_casino_duels
@@ -10215,11 +14909,1332 @@ class AsyncDatabase:
             "loser_loss": loser_loss,
             "house_fee": house_fee,
             "commission_rate": 0.01,
-            "government_budget_after": government_budget_after,
+            "government_credit": float(budget_credit.get("government_credit") or 0.0),
+            "tax_service_credit": float(budget_credit.get("tax_service_credit") or 0.0),
             "target_value": target,
             "roll_value": safe_roll,
             "challenger_roll": c_roll,
             "opponent_roll": o_roll,
+            "challenger_slots": (slots_meta.get("challenger") or {}).get("display"),
+            "opponent_slots": (slots_meta.get("opponent") or {}).get("display"),
+            "challenger_slots_combo": (slots_meta.get("challenger") or {}).get("combo"),
+            "opponent_slots_combo": (slots_meta.get("opponent") or {}).get("combo"),
+            "roulette_color": roulette_color,
+        }
+
+    def list_relationship_actions(self) -> List[Dict[str, Any]]:
+        actions: List[Dict[str, Any]] = []
+        for key, cfg in RELATIONSHIP_ACTIONS.items():
+            actions.append(
+                {
+                    "key": key,
+                    "title": str(cfg.get("title") or key),
+                    "cost": round(max(1.0, float(cfg.get("cost") or 0.0)), 2),
+                    "points": max(1, int(cfg.get("points") or 0)),
+                    "description": str(cfg.get("description") or ""),
+                }
+            )
+        return actions
+
+    async def get_active_marriage(self, user_id: int) -> Optional[Dict[str, Any]]:
+        safe_user_id = int(user_id or 0)
+        if safe_user_id <= 0:
+            return None
+        query = """
+            SELECT fm.*,
+                   CASE WHEN fm.user1_id = ? THEN fm.user2_id ELSE fm.user1_id END AS spouse_id,
+                   CAST(MAX(0, julianday('now') - julianday(COALESCE(fm.approved_date, fm.created_date))) AS INTEGER) AS days_together
+            FROM family_marriages fm
+            WHERE fm.status = 'active'
+              AND (? = fm.user1_id OR ? = fm.user2_id)
+            ORDER BY COALESCE(fm.approved_date, fm.created_date) DESC, fm.id DESC
+            LIMIT 1
+        """
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, (safe_user_id, safe_user_id, safe_user_id)) as cursor:
+                row = await cursor.fetchone()
+                if not row:
+                    return None
+                marriage = dict(row)
+                marriage.update(_relationship_snapshot(marriage.get("relationship_points")))
+                return marriage
+
+    async def get_family_account(self, user_id: int) -> Dict[str, Any]:
+        safe_user_id = int(user_id or 0)
+        now = datetime.now().isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO family_accounts
+                (user_id, family_debt, total_family_charged, total_family_paid, updated_date)
+                VALUES (?, 0, 0, 0, ?)
+                """,
+                (safe_user_id, now),
+            )
+            await db.commit()
+            async with db.execute("SELECT * FROM family_accounts WHERE user_id = ? LIMIT 1", (safe_user_id,)) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else {
+                    "user_id": safe_user_id,
+                    "family_debt": 0.0,
+                    "total_family_charged": 0.0,
+                    "total_family_paid": 0.0,
+                    "updated_date": now,
+                }
+
+    async def estimate_daily_family_expense(self, user_id: int) -> Dict[str, Any]:
+        safe_user_id = int(user_id or 0)
+        marriage = await self.get_active_marriage(safe_user_id)
+        pet = await self.get_user_pet(safe_user_id)
+        relationship_level = int((marriage or {}).get("relationship_level") or 1)
+        relationship_multiplier = float((marriage or {}).get("relationship_upkeep_multiplier") or 1.0)
+        base_expense = (
+            round(max(FAMILY_DAILY_MIN_TOTAL_EXPENSE, FAMILY_DAILY_MARRIAGE_EXPENSE * relationship_multiplier), 2)
+            if marriage
+            else 0.0
+        )
+        pet_expense = FAMILY_DAILY_PET_EXPENSE if pet else 0.0
+        total = round(base_expense + pet_expense, 2)
+        bonus_type = str((pet or {}).get("bonus_type") or "").strip().lower()
+        bonus_value = float((pet or {}).get("bonus_value") or 0.0)
+        bonus_applied = 0.0
+        if bonus_type == "family_discount_pct" and bonus_value > 0:
+            bonus_applied = round(total * min(0.3, bonus_value), 2)
+            total = round(max(0.0, total - bonus_applied), 2)
+        if marriage:
+            total = round(max(FAMILY_DAILY_MIN_TOTAL_EXPENSE, total), 2)
+        return {
+            "user_id": safe_user_id,
+            "partner_id": int((marriage or {}).get("spouse_id") or 0) if marriage else None,
+            "has_marriage": bool(marriage),
+            "has_pet": bool(pet),
+            "relationship_level": relationship_level if marriage else 0,
+            "relationship_points": int((marriage or {}).get("relationship_points") or 0) if marriage else 0,
+            "relationship_multiplier": relationship_multiplier if marriage else 1.0,
+            "relationship_points_to_next": int((marriage or {}).get("relationship_points_to_next") or 0) if marriage else 0,
+            "base_expense": round(base_expense, 2),
+            "pet_expense": round(pet_expense, 2),
+            "bonus_applied": round(bonus_applied, 2),
+            "daily_total": total,
+        }
+
+    async def create_marriage_proposal(
+        self,
+        proposer_id: int,
+        target_id: int,
+        source_chat_id: Optional[int] = None,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_proposer = int(proposer_id or 0)
+        safe_target = int(target_id or 0)
+        if safe_proposer <= 0 or safe_target <= 0:
+            return False, "Некорректные участники.", None
+        if safe_proposer == safe_target:
+            return False, "Нельзя создать брак с самим собой.", None
+
+        user1, user2 = sorted((safe_proposer, safe_target))
+        now_dt = datetime.now()
+        now = now_dt.isoformat()
+        pending_cutoff = (now_dt - timedelta(minutes=MARRIAGE_PROPOSAL_TTL_MINUTES)).isoformat()
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+
+            # Чистим устаревшие pending-предложения, чтобы они не мешали новым.
+            await db.execute(
+                """
+                UPDATE family_marriages
+                SET status = 'rejected',
+                    ended_date = ?,
+                    ended_by = NULL,
+                    closure_note = 'expired_timeout'
+                WHERE status = 'pending'
+                  AND created_date < ?
+                """,
+                (now, pending_cutoff),
+            )
+
+            async with db.execute(
+                "SELECT user_id FROM users WHERE user_id IN (?, ?)",
+                (safe_proposer, safe_target),
+            ) as cursor:
+                users = await cursor.fetchall()
+            if len(users) < 2:
+                await db.rollback()
+                return False, "Оба игрока должны иметь профиль в боте.", None
+
+            async with db.execute(
+                """
+                SELECT id
+                FROM family_marriages
+                WHERE status = 'active'
+                  AND (user1_id IN (?, ?) OR user2_id IN (?, ?))
+                LIMIT 1
+                """,
+                (safe_proposer, safe_target, safe_proposer, safe_target),
+            ) as cursor:
+                if await cursor.fetchone():
+                    await db.rollback()
+                    return False, "Один из игроков уже состоит в браке.", None
+
+            async with db.execute(
+                """
+                SELECT id
+                FROM family_marriages
+                WHERE status = 'pending'
+                  AND user1_id = ?
+                  AND user2_id = ?
+                  AND created_date >= ?
+                LIMIT 1
+                """,
+                (user1, user2, pending_cutoff),
+            ) as cursor:
+                if await cursor.fetchone():
+                    await db.rollback()
+                    return False, "Для этой пары уже есть активное предложение о браке.", None
+
+            cursor = await db.execute(
+                """
+                INSERT INTO family_marriages
+                (proposer_id, target_id, user1_id, user2_id, status, source_chat_id, created_date)
+                VALUES (?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (
+                    safe_proposer,
+                    safe_target,
+                    user1,
+                    user2,
+                    int(source_chat_id) if source_chat_id else None,
+                    now,
+                ),
+            )
+            proposal_id = int(cursor.lastrowid or 0)
+            await db.commit()
+
+        return True, "Предложение о браке отправлено.", {
+            "proposal_id": proposal_id,
+            "proposer_id": safe_proposer,
+            "target_id": safe_target,
+            "source_chat_id": int(source_chat_id) if source_chat_id else None,
+            "created_date": now,
+        }
+
+    async def respond_marriage_proposal(
+        self,
+        target_user_id: int,
+        proposal_id: int,
+        accept: bool,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_target = int(target_user_id or 0)
+        safe_proposal = int(proposal_id or 0)
+        if safe_target <= 0 or safe_proposal <= 0:
+            return False, "Некорректные параметры.", None
+
+        now_dt = datetime.now()
+        now = now_dt.isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT * FROM family_marriages WHERE id = ? LIMIT 1",
+                (safe_proposal,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if not row:
+                await db.rollback()
+                return False, "Предложение не найдено.", None
+
+            proposal = dict(row)
+            if str(proposal.get("status") or "") != "pending":
+                await db.rollback()
+                if str(proposal.get("closure_note") or "") == "expired_timeout":
+                    return False, f"Срок предложения истек ({MARRIAGE_PROPOSAL_TTL_MINUTES} минут).", proposal
+                return False, "Это предложение уже неактивно.", proposal
+            created_dt = _parse_iso_datetime(proposal.get("created_date"))
+            if created_dt and (now_dt - created_dt) > timedelta(minutes=MARRIAGE_PROPOSAL_TTL_MINUTES):
+                await db.execute(
+                    """
+                    UPDATE family_marriages
+                    SET status = 'rejected',
+                        ended_date = ?,
+                        ended_by = NULL,
+                        closure_note = 'expired_timeout'
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    (now, safe_proposal),
+                )
+                await db.commit()
+                proposal["status"] = "rejected"
+                proposal["ended_date"] = now
+                proposal["ended_by"] = None
+                proposal["closure_note"] = "expired_timeout"
+                return False, f"Срок предложения истек ({MARRIAGE_PROPOSAL_TTL_MINUTES} минут).", proposal
+            if int(proposal.get("target_id") or 0) != safe_target:
+                await db.rollback()
+                return False, "Принять или отклонить может только получатель предложения.", None
+
+            proposer_id = int(proposal.get("proposer_id") or 0)
+            target_id = int(proposal.get("target_id") or 0)
+            if accept:
+                async with db.execute(
+                    """
+                    SELECT id
+                    FROM family_marriages
+                    WHERE status = 'active'
+                      AND id != ?
+                      AND (user1_id IN (?, ?) OR user2_id IN (?, ?))
+                    LIMIT 1
+                    """,
+                    (safe_proposal, proposer_id, target_id, proposer_id, target_id),
+                ) as cursor:
+                    if await cursor.fetchone():
+                        await db.rollback()
+                        return False, "Нельзя подтвердить: один из игроков уже в активном браке.", None
+
+                await db.execute(
+                    """
+                    UPDATE family_marriages
+                    SET status = 'active',
+                        approved_date = ?,
+                        closure_note = NULL,
+                        relationship_points = COALESCE(relationship_points, 0)
+                    WHERE id = ?
+                    """,
+                    (now, safe_proposal),
+                )
+                await db.commit()
+                proposal["status"] = "active"
+                proposal["approved_date"] = now
+                return True, "Брак зарегистрирован.", proposal
+
+            await db.execute(
+                """
+                UPDATE family_marriages
+                SET status = 'rejected',
+                    ended_date = ?,
+                    ended_by = ?,
+                    closure_note = 'declined'
+                WHERE id = ?
+                """,
+                (now, safe_target, safe_proposal),
+            )
+            await db.commit()
+            proposal["status"] = "rejected"
+            proposal["ended_date"] = now
+            proposal["ended_by"] = safe_target
+            return True, "Предложение отклонено.", proposal
+
+    async def divorce_marriage(
+        self,
+        actor_id: int,
+        mode: str = "public",
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_actor = int(actor_id or 0)
+        safe_mode = "silent" if str(mode or "").strip().lower() == "silent" else "public"
+        marriage = await self.get_active_marriage(safe_actor)
+        if not marriage:
+            return False, "У вас нет активного брака.", None
+
+        marriage_id = int(marriage.get("id") or 0)
+        spouse_id = int(marriage.get("spouse_id") or 0)
+        now = datetime.now().isoformat()
+        started_raw = str(marriage.get("approved_date") or marriage.get("created_date") or "")
+        started_dt = _parse_iso_datetime(started_raw)
+        days_together = 0
+        if started_dt:
+            days_together = max(0, int((datetime.now() - started_dt).total_seconds() // 86400))
+
+        async with self._connect() as db:
+            await db.execute(
+                """
+                UPDATE family_marriages
+                SET status = 'divorced',
+                    ended_date = ?,
+                    ended_by = ?,
+                    closure_note = ?
+                WHERE id = ? AND status = 'active'
+                """,
+                (now, safe_actor, safe_mode, marriage_id),
+            )
+            await db.commit()
+
+        return True, "Развод оформлен.", {
+            "marriage_id": marriage_id,
+            "actor_id": safe_actor,
+            "spouse_id": spouse_id,
+            "days_together": days_together,
+            "mode": safe_mode,
+            "ended_date": now,
+        }
+
+    async def list_marriage_top(self, limit: int = 10) -> List[Dict[str, Any]]:
+        safe_limit = max(1, min(int(limit or 10), 50))
+        query = """
+            SELECT fm.id,
+                   fm.user1_id,
+                   fm.user2_id,
+                   fm.created_date,
+                   fm.approved_date,
+                   COALESCE(fm.relationship_points, 0) AS relationship_points,
+                   CAST(MAX(0, julianday('now') - julianday(COALESCE(fm.approved_date, fm.created_date))) AS INTEGER) AS days_together,
+                   COALESCE(NULLIF(u1.nickname, ''), NULLIF(u1.full_name, ''), NULLIF(u1.username, ''), CAST(fm.user1_id AS TEXT)) AS user1_name,
+                   COALESCE(NULLIF(u2.nickname, ''), NULLIF(u2.full_name, ''), NULLIF(u2.username, ''), CAST(fm.user2_id AS TEXT)) AS user2_name
+            FROM family_marriages fm
+            LEFT JOIN users u1 ON u1.user_id = fm.user1_id
+            LEFT JOIN users u2 ON u2.user_id = fm.user2_id
+            WHERE fm.status = 'active'
+            ORDER BY days_together DESC, COALESCE(fm.approved_date, fm.created_date) ASC, fm.id ASC
+            LIMIT ?
+        """
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, (safe_limit,)) as cursor:
+                rows = await cursor.fetchall()
+                enriched: List[Dict[str, Any]] = []
+                for row in rows:
+                    item = dict(row)
+                    item.update(_relationship_snapshot(item.get("relationship_points")))
+                    enriched.append(item)
+                return enriched
+
+    async def pay_family_debt(
+        self,
+        user_id: int,
+        amount: Optional[float] = None,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_user_id = int(user_id or 0)
+        if safe_user_id <= 0:
+            return False, "Некорректный пользователь.", None
+
+        account = await self.get_family_account(safe_user_id)
+        debt = round(float(account.get("family_debt") or 0), 2)
+        if debt <= 0:
+            return False, "Семейного долга нет.", None
+
+        pay_request = debt if amount is None else round(max(0.0, float(amount or 0)), 2)
+        if pay_request <= 0:
+            return False, "Сумма платежа должна быть положительной.", None
+
+        now = datetime.now().isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT balance, bank FROM users WHERE user_id = ? LIMIT 1",
+                (safe_user_id,),
+            ) as cursor:
+                user = await cursor.fetchone()
+            if not user:
+                await db.rollback()
+                return False, "Профиль не найден.", None
+
+            balance = round(float(user["balance"] or 0), 2)
+            bank = round(float(user["bank"] or 0), 2)
+            target = round(min(pay_request, debt), 2)
+            paid_from_bank = round(min(bank, target), 2)
+            remainder = round(target - paid_from_bank, 2)
+            paid_from_balance = round(min(balance, remainder), 2)
+            paid_total = round(paid_from_bank + paid_from_balance, 2)
+            if paid_total <= 0:
+                await db.rollback()
+                return False, "Недостаточно средств для оплаты долга.", None
+
+            new_bank = round(bank - paid_from_bank, 2)
+            new_balance = round(balance - paid_from_balance, 2)
+            new_debt = round(max(0.0, debt - paid_total), 2)
+
+            await db.execute(
+                "UPDATE users SET balance = ?, bank = ? WHERE user_id = ?",
+                (new_balance, new_bank, safe_user_id),
+            )
+            await db.execute(
+                """
+                UPDATE family_accounts
+                SET family_debt = ?,
+                    total_family_paid = ROUND(COALESCE(total_family_paid, 0) + ?, 2),
+                    updated_date = ?
+                WHERE user_id = ?
+                """,
+                (new_debt, paid_total, now, safe_user_id),
+            )
+            await db.commit()
+
+        return True, "Семейный долг частично/полностью оплачен.", {
+            "paid_total": paid_total,
+            "paid_from_bank": paid_from_bank,
+            "paid_from_balance": paid_from_balance,
+            "debt_before": debt,
+            "debt_after": new_debt,
+            "new_balance": new_balance,
+            "new_bank": new_bank,
+        }
+
+    async def add_marriage_relationship_points(
+        self,
+        actor_id: int,
+        partner_id: int,
+        points: int,
+        reason: str = "interaction",
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_actor = int(actor_id or 0)
+        safe_partner = int(partner_id or 0)
+        gain = max(1, min(int(points or 0), 500))
+        if safe_actor <= 0 or safe_partner <= 0:
+            return False, "Некорректные участники.", None
+
+        marriage = await self.get_active_marriage(safe_actor)
+        if not marriage:
+            return False, "Активный брак не найден.", None
+        if int(marriage.get("spouse_id") or 0) != safe_partner:
+            return False, "Действие доступно только с вашим партнером по браку.", None
+
+        marriage_id = int(marriage.get("id") or 0)
+        if marriage_id <= 0:
+            return False, "Некорректный брак.", None
+
+        points_before = int(marriage.get("relationship_points") or 0)
+        level_before = int(marriage.get("relationship_level") or 1)
+        points_after = min(RELATIONSHIP_POINT_CAP, points_before + gain)
+        if points_after <= points_before:
+            snapshot = _relationship_snapshot(points_before)
+            return True, "Достигнут максимальный уровень отношений.", {
+                "marriage_id": marriage_id,
+                "points_added": 0,
+                "level_up": 0,
+                **snapshot,
+            }
+
+        now = datetime.now().isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT id FROM family_marriages WHERE id = ? AND status = 'active' LIMIT 1",
+                (marriage_id,),
+            ) as cursor:
+                active_row = await cursor.fetchone()
+            if not active_row:
+                await db.rollback()
+                return False, "Брак уже неактивен.", None
+            await db.execute(
+                "UPDATE family_marriages SET relationship_points = ? WHERE id = ?",
+                (points_after, marriage_id),
+            )
+            await db.commit()
+
+        snapshot = _relationship_snapshot(points_after)
+        level_after = int(snapshot.get("relationship_level") or 1)
+        level_up = max(0, level_after - level_before)
+
+        await self.log_player_activity(
+            user_id=safe_actor,
+            activity_type="family_relationship",
+            details=f"Улучшение отношений: {reason}",
+            value=float(gain),
+        )
+
+        return True, "Отношения улучшены.", {
+            "marriage_id": marriage_id,
+            "points_added": gain,
+            "level_up": level_up,
+            "updated_at": now,
+            **snapshot,
+        }
+
+    async def spend_on_partner(
+        self,
+        actor_id: int,
+        action_key: str,
+        target_partner_id: Optional[int] = None,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_actor = int(actor_id or 0)
+        safe_target = int(target_partner_id or 0)
+        safe_key = str(action_key or "").strip().lower()
+        cfg = RELATIONSHIP_ACTIONS.get(safe_key)
+        if safe_actor <= 0:
+            return False, "Некорректный пользователь.", None
+        if not cfg:
+            return False, "Неизвестный тип семейной траты.", None
+
+        marriage = await self.get_active_marriage(safe_actor)
+        if not marriage:
+            return False, "Вы не состоите в активном браке.", None
+        spouse_id = int(marriage.get("spouse_id") or 0)
+        if safe_target > 0 and spouse_id != safe_target:
+            return False, "Покупки по этой системе доступны только вашему супругу(е).", None
+
+        marriage_id = int(marriage.get("id") or 0)
+        if marriage_id <= 0:
+            return False, "Некорректный семейный профиль.", None
+
+        relation_level = int(marriage.get("relationship_level") or 1)
+        base_cost = round(max(1.0, float(cfg.get("cost") or 0.0)), 2)
+        base_points = max(1, int(cfg.get("points") or 0))
+        # Премиальные семейные активности становятся заметно дороже и значимее.
+        dynamic_cost_factor = 1.0
+        if safe_key in {"weekend_trip", "resort_vacation"}:
+            dynamic_cost_factor = 1.0 + min(0.45, relation_level * 0.01)
+        cost = round(base_cost * dynamic_cost_factor, 2)
+        points_gain = int(round(base_points * (1.0 + min(0.3, relation_level * 0.008))))
+        bonus_points = 0
+        if safe_key == "weekend_trip":
+            bonus_points = random.randint(25, 95)
+        elif safe_key == "resort_vacation":
+            bonus_points = random.randint(80, 220)
+        points_gain += bonus_points
+        action_title = str(cfg.get("title") or safe_key)
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT balance, bank FROM users WHERE user_id = ? LIMIT 1",
+                (safe_actor,),
+            ) as cursor:
+                actor_row = await cursor.fetchone()
+            if not actor_row:
+                await db.rollback()
+                return False, "Профиль не найден.", None
+
+            balance = round(float(actor_row["balance"] or 0), 2)
+            bank = round(float(actor_row["bank"] or 0), 2)
+            paid_from_bank = round(min(bank, cost), 2)
+            remainder = round(cost - paid_from_bank, 2)
+            paid_from_balance = round(min(balance, remainder), 2)
+            paid_total = round(paid_from_bank + paid_from_balance, 2)
+            if paid_total < cost:
+                await db.rollback()
+                return False, f"Недостаточно средств. Нужно {cost:,.2f} люмов.", None
+
+            new_balance = round(balance - paid_from_balance, 2)
+            new_bank = round(bank - paid_from_bank, 2)
+
+            async with db.execute(
+                "SELECT relationship_points FROM family_marriages WHERE id = ? AND status = 'active' LIMIT 1",
+                (marriage_id,),
+            ) as cursor:
+                marriage_row = await cursor.fetchone()
+            if not marriage_row:
+                await db.rollback()
+                return False, "Брак уже неактивен.", None
+
+            points_before = int(marriage_row["relationship_points"] or 0)
+            snapshot_before = _relationship_snapshot(points_before)
+            points_after = min(RELATIONSHIP_POINT_CAP, points_before + points_gain)
+            snapshot_after = _relationship_snapshot(points_after)
+            level_up = max(
+                0,
+                int(snapshot_after.get("relationship_level") or 1) - int(snapshot_before.get("relationship_level") or 1),
+            )
+            rep_bonus = 0.08
+            if safe_key == "date_night":
+                rep_bonus = 0.2
+            elif safe_key == "weekend_trip":
+                rep_bonus = 0.45
+            elif safe_key == "resort_vacation":
+                rep_bonus = 0.75
+
+            credited_turnover = round(cost * 0.12, 2)
+            budget_credit = await self._credit_public_budgets(
+                db,
+                credited_turnover,
+                tax_share=0.5,
+            )
+
+            await db.execute(
+                "UPDATE users SET balance = ?, bank = ? WHERE user_id = ?",
+                (new_balance, new_bank, safe_actor),
+            )
+            await db.execute(
+                """
+                UPDATE users
+                SET reputation = MIN(100, ROUND(COALESCE(reputation, 50) + ?, 2))
+                WHERE user_id IN (?, ?)
+                """,
+                (float(rep_bonus), safe_actor, spouse_id),
+            )
+            await db.execute(
+                "UPDATE family_marriages SET relationship_points = ? WHERE id = ?",
+                (points_after, marriage_id),
+            )
+            await db.commit()
+
+        await self.log_player_activity(
+            user_id=safe_actor,
+            activity_type="family_spend",
+            details=f"Семейная трата: {action_title}",
+            value=cost,
+        )
+
+        return True, "Семейная трата проведена.", {
+            "action_key": safe_key,
+            "action_title": action_title,
+            "cost": cost,
+            "points_added": points_gain,
+            "bonus_points": bonus_points,
+            "reputation_bonus": float(rep_bonus),
+            "new_balance": new_balance,
+            "new_bank": new_bank,
+            "partner_id": spouse_id,
+            "level_up": level_up,
+            "government_credit": float(budget_credit.get("government_credit") or 0.0),
+            "tax_service_credit": float(budget_credit.get("tax_service_credit") or 0.0),
+            "turnover_credit": credited_turnover,
+            **snapshot_after,
+        }
+
+    async def get_user_pet(self, owner_id: int) -> Optional[Dict[str, Any]]:
+        safe_owner = int(owner_id or 0)
+        query = """
+            SELECT *
+            FROM user_pets
+            WHERE owner_id = ? AND status = 'active'
+            ORDER BY id DESC
+            LIMIT 1
+        """
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, (safe_owner,)) as cursor:
+                row = await cursor.fetchone()
+                if not row:
+                    return None
+                pet = dict(row)
+                pet.setdefault("rarity", "обычный")
+                pet.setdefault("bonus_type", None)
+                pet.setdefault("bonus_value", 0.0)
+                return pet
+
+    async def adopt_pet(
+        self,
+        owner_id: int,
+        pet_type: str,
+        pet_name: str,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_owner = int(owner_id or 0)
+        if safe_owner <= 0:
+            return False, "Некорректный владелец.", None
+
+        pet_catalog = {
+            "cat": "Кот",
+            "dog": "Пес",
+            "rabbit": "Кролик",
+            "parrot": "Попугай",
+            "fox": "Лис",
+        }
+        safe_type = str(pet_type or "").strip().lower()
+        if safe_type not in pet_catalog:
+            return False, "Неизвестный тип питомца.", None
+        clean_name = _sanitize_display_name(pet_name, 24)
+        if len(clean_name) < 2:
+            clean_name = pet_catalog[safe_type]
+
+        now = datetime.now().isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+
+            async with db.execute(
+                "SELECT id, status FROM user_pets WHERE owner_id = ? ORDER BY id DESC LIMIT 1",
+                (safe_owner,),
+            ) as cursor:
+                existing_pet = await cursor.fetchone()
+                if existing_pet and str(existing_pet["status"] or "").strip().lower() == "active":
+                    await db.rollback()
+                    return False, "У вас уже есть активный питомец.", None
+
+            async with db.execute(
+                "SELECT balance FROM users WHERE user_id = ? LIMIT 1",
+                (safe_owner,),
+            ) as cursor:
+                user = await cursor.fetchone()
+            if not user:
+                await db.rollback()
+                return False, "Профиль не найден.", None
+
+            balance = round(float(user["balance"] or 0), 2)
+            if balance < PET_ADOPTION_FEE:
+                await db.rollback()
+                return False, f"Недостаточно средств. Нужно {PET_ADOPTION_FEE:,.2f} люмов.", None
+
+            new_balance = round(balance - PET_ADOPTION_FEE, 2)
+            await db.execute("UPDATE users SET balance = ? WHERE user_id = ?", (new_balance, safe_owner))
+            if existing_pet:
+                pet_id = int(existing_pet["id"] or 0)
+                await db.execute(
+                    """
+                    UPDATE user_pets
+                    SET pet_type = ?,
+                        pet_name = ?,
+                        level = 1,
+                        xp = 0,
+                        hunger = 85,
+                        mood = 82,
+                        energy = 80,
+                        health = 100,
+                        status = 'active',
+                        created_date = ?,
+                        last_feed_date = ?,
+                        last_play_date = ?,
+                        last_train_date = ?,
+                        rarity = 'обычный',
+                        bonus_type = NULL,
+                        bonus_value = 0
+                    WHERE id = ?
+                    """,
+                    (safe_type, clean_name, now, now, now, now, pet_id),
+                )
+            else:
+                cursor = await db.execute(
+                    """
+                    INSERT INTO user_pets
+                    (owner_id, pet_type, pet_name, level, xp, hunger, mood, energy, health, status, created_date, last_feed_date, last_play_date, last_train_date, rarity, bonus_type, bonus_value)
+                    VALUES (?, ?, ?, 1, 0, 85, 82, 80, 100, 'active', ?, ?, ?, ?, 'обычный', NULL, 0)
+                    """,
+                    (safe_owner, safe_type, clean_name, now, now, now, now),
+                )
+                pet_id = int(cursor.lastrowid or 0)
+            await db.commit()
+
+        await self.log_player_activity(
+            user_id=safe_owner,
+            activity_type="pet_adopted",
+            details=f"Питомец {pet_catalog[safe_type]}: {clean_name}",
+            value=PET_ADOPTION_FEE,
+        )
+        return True, "Питомец добавлен в семью.", {
+            "pet_id": pet_id,
+            "pet_type": safe_type,
+            "pet_title": pet_catalog[safe_type],
+            "pet_name": clean_name,
+            "adoption_fee": PET_ADOPTION_FEE,
+            "new_balance": new_balance,
+        }
+
+    async def rename_pet(self, owner_id: int, new_name: str) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_owner = int(owner_id or 0)
+        clean_name = _sanitize_display_name(new_name, 24)
+        if len(clean_name) < 2:
+            return False, "Имя питомца должно быть не короче 2 символов.", None
+        now = datetime.now().isoformat()
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT id, pet_name FROM user_pets WHERE owner_id = ? AND status = 'active' LIMIT 1",
+                (safe_owner,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if not row:
+                return False, "У вас нет активного питомца.", None
+            old_name = str(row[1] or "")
+            await db.execute(
+                "UPDATE user_pets SET pet_name = ?, last_train_date = COALESCE(last_train_date, ?) WHERE id = ?",
+                (clean_name, now, int(row[0])),
+            )
+            await db.commit()
+        return True, "Имя питомца обновлено.", {"old_name": old_name, "new_name": clean_name}
+
+    async def interact_with_pet(self, owner_id: int, action: str) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_owner = int(owner_id or 0)
+        safe_action = str(action or "").strip().lower()
+        action_cfg: Dict[str, Dict[str, Any]] = {
+            "feed": {"cost": 120.0, "cooldown": 40, "hunger": 24, "mood": 6, "energy": 3, "xp": 2},
+            "play": {"cost": 80.0, "cooldown": 55, "hunger": -4, "mood": 18, "energy": -10, "xp": 4},
+            "train": {"cost": 150.0, "cooldown": 80, "hunger": -8, "mood": 6, "energy": -14, "xp": 8},
+        }
+        cfg = action_cfg.get(safe_action)
+        if not cfg:
+            return False, "Неизвестное действие с питомцем.", None
+
+        ok_cd, remain = await self.check_and_set_user_cooldown(
+            user_id=safe_owner,
+            action_key=f"pet_action_{safe_action}",
+            cooldown_minutes=int(cfg["cooldown"]),
+        )
+        if not ok_cd:
+            return False, f"Подождите {remain} мин. до следующего действия.", {"cooldown_minutes": remain}
+
+        now = datetime.now().isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+
+            async with db.execute(
+                "SELECT balance FROM users WHERE user_id = ? LIMIT 1",
+                (safe_owner,),
+            ) as cursor:
+                user = await cursor.fetchone()
+            if not user:
+                await db.rollback()
+                return False, "Профиль не найден.", None
+
+            async with db.execute(
+                "SELECT * FROM user_pets WHERE owner_id = ? AND status = 'active' LIMIT 1",
+                (safe_owner,),
+            ) as cursor:
+                pet_row = await cursor.fetchone()
+            if not pet_row:
+                await db.rollback()
+                return False, "У вас нет активного питомца.", None
+            pet = dict(pet_row)
+
+            balance = round(float(user["balance"] or 0), 2)
+            cost = round(float(cfg["cost"] or 0), 2)
+            if balance < cost:
+                await db.rollback()
+                return False, "Недостаточно средств для этого действия.", None
+
+            hunger = int(pet.get("hunger") or 0)
+            mood = int(pet.get("mood") or 0)
+            energy = int(pet.get("energy") or 0)
+            health = int(pet.get("health") or 0)
+            level = int(pet.get("level") or 1)
+            xp = int(pet.get("xp") or 0)
+
+            hunger = max(0, min(100, hunger + int(cfg["hunger"])))
+            mood = max(0, min(100, mood + int(cfg["mood"])))
+            energy = max(0, min(100, energy + int(cfg["energy"])))
+            xp += int(cfg["xp"])
+            level_up = 0
+            while xp >= max(10, level * 20):
+                xp -= max(10, level * 20)
+                level += 1
+                level_up += 1
+                health = min(100, health + 3)
+            if hunger < 20 or mood < 20:
+                health = max(0, health - 2)
+
+            new_balance = round(balance - cost, 2)
+            feed_at = now if safe_action == "feed" else pet.get("last_feed_date")
+            play_at = now if safe_action == "play" else pet.get("last_play_date")
+            train_at = now if safe_action == "train" else pet.get("last_train_date")
+            await db.execute(
+                "UPDATE users SET balance = ? WHERE user_id = ?",
+                (new_balance, safe_owner),
+            )
+            await db.execute(
+                """
+                UPDATE user_pets
+                SET hunger = ?, mood = ?, energy = ?, health = ?, level = ?, xp = ?,
+                    last_feed_date = ?, last_play_date = ?, last_train_date = ?
+                WHERE id = ?
+                """,
+                (
+                    hunger,
+                    mood,
+                    energy,
+                    health,
+                    level,
+                    xp,
+                    feed_at,
+                    play_at,
+                    train_at,
+                    int(pet["id"]),
+                ),
+            )
+            await db.commit()
+
+        return True, "Действие с питомцем выполнено.", {
+            "action": safe_action,
+            "cost": cost,
+            "new_balance": new_balance,
+            "hunger": hunger,
+            "mood": mood,
+            "energy": energy,
+            "health": health,
+            "level": level,
+            "xp": xp,
+            "level_up": level_up,
+            "pet_name": pet.get("pet_name"),
+            "pet_type": pet.get("pet_type"),
+        }
+
+    async def release_pet(self, owner_id: int) -> tuple[bool, str]:
+        safe_owner = int(owner_id or 0)
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT id FROM user_pets WHERE owner_id = ? AND status = 'active' LIMIT 1",
+                (safe_owner,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if not row:
+                return False, "У вас нет активного питомца."
+            await db.execute(
+                "UPDATE user_pets SET status = 'released' WHERE id = ?",
+                (int(row[0]),),
+            )
+            await db.commit()
+        return True, "Питомец передан в приют."
+
+    async def open_pet_lootbox(
+        self,
+        owner_id: int,
+        box_type: str,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_owner = int(owner_id or 0)
+        if safe_owner <= 0:
+            return False, "Некорректный владелец.", None
+
+        box_key = str(box_type or "").strip().lower()
+        box_cfg = {
+            "common": {"price": 5_000.0, "weights": {"обычный": 70, "редкий": 20, "эпик": 7, "миф": 2, "легендарный": 1}},
+            "rare": {"price": 15_000.0, "weights": {"обычный": 40, "редкий": 35, "эпик": 15, "миф": 7, "легендарный": 3}},
+            "epic": {"price": 40_000.0, "weights": {"обычный": 20, "редкий": 30, "эпик": 25, "миф": 15, "легендарный": 10}},
+            "myth": {"price": 90_000.0, "weights": {"обычный": 10, "редкий": 20, "эпик": 25, "миф": 25, "легендарный": 20}},
+            "legend": {"price": 200_000.0, "weights": {"обычный": 0, "редкий": 10, "эпик": 20, "миф": 30, "легендарный": 40}},
+        }.get(box_key)
+        if not box_cfg:
+            return False, "Неизвестный ящик.", None
+
+        pet_catalog = {
+            "cat": "Кот",
+            "dog": "Пес",
+            "rabbit": "Кролик",
+            "parrot": "Попугай",
+            "fox": "Лис",
+        }
+        rarity_bonus = {
+            "обычный": 0.02,
+            "редкий": 0.04,
+            "эпик": 0.06,
+            "миф": 0.08,
+            "легендарный": 0.12,
+        }
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+
+            async with db.execute(
+                "SELECT id, status FROM user_pets WHERE owner_id = ? ORDER BY id DESC LIMIT 1",
+                (safe_owner,),
+            ) as cursor:
+                existing_pet = await cursor.fetchone()
+                if existing_pet and str(existing_pet["status"] or "").strip().lower() == "active":
+                    await db.rollback()
+                    return False, "Сначала отпустите текущего питомца.", None
+
+            async with db.execute(
+                "SELECT balance FROM users WHERE user_id = ? LIMIT 1",
+                (safe_owner,),
+            ) as cursor:
+                user = await cursor.fetchone()
+            if not user:
+                await db.rollback()
+                return False, "Профиль не найден.", None
+
+            price = float(box_cfg["price"])
+            balance = round(float(user["balance"] or 0), 2)
+            if balance < price:
+                await db.rollback()
+                return False, f"Недостаточно средств. Нужно {price:,.2f} люмов.", None
+
+            rarity = random.choices(
+                list(box_cfg["weights"].keys()),
+                weights=list(box_cfg["weights"].values()),
+                k=1,
+            )[0]
+            pet_type = random.choice(list(pet_catalog.keys()))
+            pet_title = pet_catalog[pet_type]
+            pet_name = pet_title
+            bonus_value = float(rarity_bonus.get(rarity, 0.0))
+
+            new_balance = round(balance - price, 2)
+            await db.execute("UPDATE users SET balance = ? WHERE user_id = ?", (new_balance, safe_owner))
+            now = datetime.now().isoformat()
+            if existing_pet:
+                pet_id = int(existing_pet["id"] or 0)
+                await db.execute(
+                    """
+                    UPDATE user_pets
+                    SET pet_type = ?,
+                        pet_name = ?,
+                        level = 1,
+                        xp = 0,
+                        hunger = 85,
+                        mood = 82,
+                        energy = 80,
+                        health = 100,
+                        status = 'active',
+                        created_date = ?,
+                        last_feed_date = ?,
+                        last_play_date = ?,
+                        last_train_date = ?,
+                        rarity = ?,
+                        bonus_type = 'family_discount_pct',
+                        bonus_value = ?
+                    WHERE id = ?
+                    """,
+                    (pet_type, pet_name, now, now, now, now, rarity, bonus_value, pet_id),
+                )
+            else:
+                cursor = await db.execute(
+                    """
+                    INSERT INTO user_pets
+                    (owner_id, pet_type, pet_name, level, xp, hunger, mood, energy, health, status, created_date, last_feed_date, last_play_date, last_train_date, rarity, bonus_type, bonus_value)
+                    VALUES (?, ?, ?, 1, 0, 85, 82, 80, 100, 'active', ?, ?, ?, ?, ?, 'family_discount_pct', ?)
+                    """,
+                    (safe_owner, pet_type, pet_name, now, now, now, now, rarity, bonus_value),
+                )
+                pet_id = int(cursor.lastrowid or 0)
+            await db.commit()
+
+        await self.log_player_activity(
+            user_id=safe_owner,
+            activity_type="pet_lootbox",
+            details=f"Открыт ящик {box_key}: {rarity} {pet_title}",
+            value=price,
+        )
+        return True, "Питомец получен.", {
+            "pet_id": pet_id,
+            "pet_type": pet_type,
+            "pet_title": pet_title,
+            "pet_name": pet_name,
+            "rarity": rarity,
+            "bonus_type": "family_discount_pct",
+            "bonus_value": bonus_value,
+            "price": price,
+            "new_balance": new_balance,
+        }
+
+    async def process_daily_family_expenses(self, cycle_date: Optional[str] = None) -> Dict[str, Any]:
+        safe_cycle = str(cycle_date or "").strip()
+        if not safe_cycle:
+            safe_cycle = datetime.now().date().isoformat()
+        now = datetime.now().isoformat()
+        checkpoint_key = "economy_family_expense_cycle_date"
+        charges: List[Dict[str, Any]] = []
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+
+            async with db.execute("SELECT value FROM system_state WHERE key = ? LIMIT 1", (checkpoint_key,)) as cursor:
+                row = await cursor.fetchone()
+            if row and str(row[0] or "") == safe_cycle:
+                await db.rollback()
+                return {
+                    "status": "already_processed",
+                    "cycle_date": safe_cycle,
+                    "processed_users": 0,
+                    "total_charged": 0.0,
+                    "total_paid": 0.0,
+                    "total_debt_added": 0.0,
+                    "charges": [],
+                }
+
+            async with db.execute(
+                """
+                SELECT user_id FROM (
+                    SELECT user1_id AS user_id FROM family_marriages WHERE status = 'active'
+                    UNION
+                    SELECT user2_id AS user_id FROM family_marriages WHERE status = 'active'
+                    UNION
+                    SELECT owner_id AS user_id FROM user_pets WHERE status = 'active'
+                )
+                ORDER BY user_id ASC
+                """
+            ) as cursor:
+                user_rows = await cursor.fetchall()
+
+            total_charged = 0.0
+            total_paid = 0.0
+            total_debt_added = 0.0
+
+            for user_row in user_rows:
+                uid = int(user_row["user_id"] or 0)
+                if uid <= 0:
+                    continue
+
+                async with db.execute(
+                    """
+                    SELECT CASE WHEN user1_id = ? THEN user2_id ELSE user1_id END AS partner_id,
+                           COALESCE(relationship_points, 0) AS relationship_points
+                    FROM family_marriages
+                    WHERE status = 'active'
+                      AND (? = user1_id OR ? = user2_id)
+                    ORDER BY COALESCE(approved_date, created_date) DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (uid, uid, uid),
+                ) as cursor:
+                    partner_row = await cursor.fetchone()
+                partner_id = int((partner_row["partner_id"] if partner_row else 0) or 0)
+                relationship_points = int((partner_row["relationship_points"] if partner_row else 0) or 0)
+                relationship_meta = _relationship_snapshot(relationship_points)
+                relationship_multiplier = (
+                    float(relationship_meta.get("relationship_upkeep_multiplier") or 1.0)
+                    if partner_id > 0
+                    else 1.0
+                )
+
+                async with db.execute(
+                    "SELECT COUNT(*) AS c FROM user_pets WHERE owner_id = ? AND status = 'active'",
+                    (uid,),
+                ) as cursor:
+                    pet_row = await cursor.fetchone()
+                pet_count = int((pet_row["c"] if pet_row else 0) or 0)
+
+                base_expense = (
+                    round(
+                        max(
+                            FAMILY_DAILY_MIN_TOTAL_EXPENSE,
+                            FAMILY_DAILY_MARRIAGE_EXPENSE * relationship_multiplier,
+                        ),
+                        2,
+                    )
+                    if partner_id > 0
+                    else 0.0
+                )
+                pet_expense = FAMILY_DAILY_PET_EXPENSE * pet_count
+                expense_total = round(base_expense + pet_expense, 2)
+                if pet_count > 0:
+                    async with db.execute(
+                        """
+                        SELECT bonus_type, bonus_value
+                        FROM user_pets
+                        WHERE owner_id = ? AND status = 'active'
+                        ORDER BY id DESC
+                        LIMIT 1
+                        """,
+                        (uid,),
+                    ) as cursor:
+                        pet_bonus_row = await cursor.fetchone()
+                    if pet_bonus_row:
+                        bonus_type = str(pet_bonus_row["bonus_type"] or "").strip().lower()
+                        bonus_value = float(pet_bonus_row["bonus_value"] or 0.0)
+                        if bonus_type == "family_discount_pct" and bonus_value > 0:
+                            discount = round(expense_total * min(0.3, bonus_value), 2)
+                            expense_total = round(max(0.0, expense_total - discount), 2)
+                if partner_id > 0:
+                    expense_total = round(max(FAMILY_DAILY_MIN_TOTAL_EXPENSE, expense_total), 2)
+                if expense_total <= 0:
+                    continue
+
+                async with db.execute(
+                    "SELECT balance, bank FROM users WHERE user_id = ? LIMIT 1",
+                    (uid,),
+                ) as cursor:
+                    user_balance_row = await cursor.fetchone()
+                if not user_balance_row:
+                    continue
+
+                balance = round(float(user_balance_row["balance"] or 0), 2)
+                bank = round(float(user_balance_row["bank"] or 0), 2)
+                paid_from_bank = round(min(bank, expense_total), 2)
+                remainder = round(expense_total - paid_from_bank, 2)
+                paid_from_balance = round(min(balance, remainder), 2)
+                paid_total = round(paid_from_bank + paid_from_balance, 2)
+                debt_added = round(max(0.0, expense_total - paid_total), 2)
+                new_bank = round(bank - paid_from_bank, 2)
+                new_balance = round(balance - paid_from_balance, 2)
+
+                await db.execute(
+                    "UPDATE users SET balance = ?, bank = ? WHERE user_id = ?",
+                    (new_balance, new_bank, uid),
+                )
+                await db.execute(
+                    """
+                    INSERT OR IGNORE INTO family_accounts
+                    (user_id, family_debt, total_family_charged, total_family_paid, updated_date)
+                    VALUES (?, 0, 0, 0, ?)
+                    """,
+                    (uid, now),
+                )
+                await db.execute(
+                    """
+                    UPDATE family_accounts
+                    SET family_debt = ROUND(COALESCE(family_debt, 0) + ?, 2),
+                        total_family_charged = ROUND(COALESCE(total_family_charged, 0) + ?, 2),
+                        total_family_paid = ROUND(COALESCE(total_family_paid, 0) + ?, 2),
+                        updated_date = ?
+                    WHERE user_id = ?
+                    """,
+                    (debt_added, expense_total, paid_total, now, uid),
+                )
+                await db.execute(
+                    """
+                    INSERT INTO family_expense_journal
+                    (user_id, partner_id, cycle_date, expense_total, base_expense, pet_expense, paid_from_bank, paid_from_balance, debt_added, created_date)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        uid,
+                        partner_id if partner_id > 0 else None,
+                        safe_cycle,
+                        expense_total,
+                        round(base_expense, 2),
+                        round(pet_expense, 2),
+                        paid_from_bank,
+                        paid_from_balance,
+                        debt_added,
+                        now,
+                    ),
+                )
+
+                if pet_count > 0:
+                    await db.execute(
+                        """
+                        UPDATE user_pets
+                        SET hunger = MAX(0, COALESCE(hunger, 0) - 10),
+                            mood = MAX(0, COALESCE(mood, 0) - 6),
+                            energy = MAX(0, COALESCE(energy, 0) - 5),
+                            health = MIN(
+                                100,
+                                MAX(
+                                    0,
+                                    COALESCE(health, 100) + CASE
+                                        WHEN COALESCE(hunger, 0) < 25 OR COALESCE(mood, 0) < 25 THEN -4
+                                        ELSE 1
+                                    END
+                                )
+                            )
+                        WHERE owner_id = ? AND status = 'active'
+                        """,
+                        (uid,),
+                    )
+
+                charges.append(
+                    {
+                        "user_id": uid,
+                        "partner_id": partner_id if partner_id > 0 else None,
+                        "relationship_level": int(relationship_meta.get("relationship_level") or 1) if partner_id > 0 else 0,
+                        "relationship_multiplier": relationship_multiplier if partner_id > 0 else 1.0,
+                        "relationship_points": relationship_points if partner_id > 0 else 0,
+                        "pet_count": pet_count,
+                        "expense_total": expense_total,
+                        "base_expense": round(base_expense, 2),
+                        "pet_expense": round(pet_expense, 2),
+                        "paid_total": paid_total,
+                        "paid_from_bank": paid_from_bank,
+                        "paid_from_balance": paid_from_balance,
+                        "debt_added": debt_added,
+                        "new_balance": new_balance,
+                        "new_bank": new_bank,
+                    }
+                )
+                total_charged = round(total_charged + expense_total, 2)
+                total_paid = round(total_paid + paid_total, 2)
+                total_debt_added = round(total_debt_added + debt_added, 2)
+
+            await db.execute(
+                """
+                INSERT INTO system_state (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (checkpoint_key, safe_cycle),
+            )
+            await db.commit()
+
+        return {
+            "status": "processed",
+            "cycle_date": safe_cycle,
+            "processed_users": len(charges),
+            "total_charged": total_charged,
+            "total_paid": total_paid,
+            "total_debt_added": total_debt_added,
+            "charges": charges,
         }
 
     async def run_side_hustle(
@@ -10246,7 +16261,7 @@ class AsyncDatabase:
         is_president = bool(int((gov or {}).get("current_leader_id") or 0) == int(user_id) or is_president_role)
 
         # Личный кулдаун (по каждому игроку отдельно), без глобальной блокировки.
-        cooldown_minutes = 12 if safe_type == "legal" else 18
+        cooldown_minutes = 20 if safe_type == "legal" else 30
         last_field = "last_side_hustle_at" if safe_type == "legal" else "last_illegal_hustle_at"
         last_raw = str(user.get(last_field) or "")
         if last_raw:
@@ -10275,28 +16290,28 @@ class AsyncDatabase:
         ban_until: Optional[str] = None
 
         if safe_type == "legal":
-            base = random.randint(1_400, 3_000)
+            base = random.randint(520, 1_260)
             if mini_success:
-                base = int(base * 1.22)
+                base = int(base * 1.14)
             if success:
                 payout_total = float(base)
                 visible_gain = payout_total
                 reputation = min(100.0, reputation + 0.25)
             else:
-                payout_total = float(max(400, int(base * 0.35)))
+                payout_total = float(max(220, int(base * 0.30)))
                 visible_gain = payout_total
                 reputation = max(0.0, reputation - 0.1)
         else:
-            base = random.randint(1_700, 3_300)
+            base = random.randint(650, 1_650)
             if mini_success:
-                base = int(base * 1.20)
+                base = int(base * 1.12)
             if success:
                 payout_total = float(base)
                 visible_gain = round(payout_total * 0.58, 2)
                 shadow_gain = round(payout_total - visible_gain, 2)
                 reputation = max(0.0, reputation - 0.35)
             else:
-                fine = random.randint(600, 2_400)
+                fine = random.randint(450, 1_500)
                 payout_total = -float(fine)
                 visible_gain = payout_total
                 reputation = max(0.0, reputation - 0.8)
@@ -10323,7 +16338,7 @@ class AsyncDatabase:
             updates["action_banned_until"] = ban_until
         await self.update_user(user_id, **updates)
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT INTO side_hustle_runs
@@ -10384,7 +16399,138 @@ class AsyncDatabase:
             ORDER BY g.reputation DESC, g.created_date DESC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, (safe_limit,)) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+    async def get_gang_roof_status(self, gang_id: int) -> Dict[str, Any]:
+        safe_gang = int(gang_id or 0)
+        if safe_gang <= 0:
+            return {
+                "gang_id": safe_gang,
+                "active_contracts": [],
+                "active_count": 0,
+                "due_count": 0,
+                "total_collected": 0.0,
+            }
+
+        now = datetime.now().isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute(
+                """
+                UPDATE gang_roof_contracts
+                SET status = 'expired',
+                    notes = COALESCE(notes, 'auto_expired')
+                WHERE gang_id = ?
+                  AND status = 'active'
+                  AND expires_at <= ?
+                """,
+                (safe_gang, now),
+            )
+            await db.commit()
+            async with db.execute(
+                """
+                SELECT *
+                FROM gang_roof_contracts
+                WHERE gang_id = ? AND status = 'active'
+                ORDER BY next_collection_at ASC, id ASC
+                """,
+                (safe_gang,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+        contracts = [dict(row) for row in rows]
+        due_count = 0
+        total_collected = 0.0
+        for item in contracts:
+            if str(item.get("next_collection_at") or "") <= now:
+                due_count += 1
+            total_collected = round(total_collected + float(item.get("total_collected") or 0.0), 2)
+        return {
+            "gang_id": safe_gang,
+            "active_contracts": contracts,
+            "active_count": len(contracts),
+            "due_count": due_count,
+            "total_collected": total_collected,
+        }
+
+    async def list_gang_roof_contracts(
+        self,
+        gang_id: int,
+        status: Optional[str] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        safe_gang = int(gang_id or 0)
+        safe_limit = max(1, min(int(limit or 20), 120))
+        status_filter = str(status or "").strip().lower()
+        where = "WHERE gang_id = ?"
+        params: list[Any] = [safe_gang]
+        if status_filter:
+            where += " AND status = ?"
+            params.append(status_filter)
+        query = f"""
+            SELECT *
+            FROM gang_roof_contracts
+            {where}
+            ORDER BY created_date DESC, id DESC
+            LIMIT ?
+        """
+        params.append(safe_limit)
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, tuple(params)) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+    async def get_gang_active_war(self, gang_id: int) -> Optional[Dict[str, Any]]:
+        safe_gang = int(gang_id or 0)
+        if safe_gang <= 0:
+            return None
+
+        now = datetime.now().isoformat()
+        query = """
+            SELECT gw.*,
+                   ga.name AS attacker_name,
+                   gd.name AS defender_name
+            FROM gang_wars gw
+            JOIN gangs ga ON ga.id = gw.attacker_gang_id
+            JOIN gangs gd ON gd.id = gw.defender_gang_id
+            WHERE gw.status = 'active'
+              AND (gw.attacker_gang_id = ? OR gw.defender_gang_id = ?)
+            ORDER BY gw.started_date DESC, gw.id DESC
+            LIMIT 1
+        """
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, (safe_gang, safe_gang)) as cursor:
+                row = await cursor.fetchone()
+        if not row:
+            return None
+
+        war = dict(row)
+        if str(war.get("ends_at") or "") <= now:
+            await self.finalize_gang_war(int(war.get("id") or 0))
+            return None
+        return war
+
+    async def list_recent_gang_wars(self, limit: int = 12) -> List[Dict[str, Any]]:
+        safe_limit = max(1, min(int(limit or 12), 80))
+        query = """
+            SELECT gw.*,
+                   ga.name AS attacker_name,
+                   gd.name AS defender_name,
+                   gwi.name AS winner_name
+            FROM gang_wars gw
+            JOIN gangs ga ON ga.id = gw.attacker_gang_id
+            JOIN gangs gd ON gd.id = gw.defender_gang_id
+            LEFT JOIN gangs gwi ON gwi.id = gw.winner_gang_id
+            ORDER BY COALESCE(gw.ended_date, gw.started_date) DESC, gw.id DESC
+            LIMIT ?
+        """
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (safe_limit,)) as cursor:
                 rows = await cursor.fetchall()
@@ -10401,11 +16547,789 @@ class AsyncDatabase:
             ORDER BY gm.join_date DESC
             LIMIT 1
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (int(user_id),)) as cursor:
                 row = await cursor.fetchone()
                 return dict(row) if row else None
+
+    async def start_gang_roof(self, actor_id: int) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_actor = int(actor_id or 0)
+        if safe_actor <= 0:
+            return False, "Некорректный игрок.", None
+
+        user_gang = await self.get_user_gang(safe_actor)
+        if not user_gang:
+            return False, "Вы не состоите в банде.", None
+        gang_id = int(user_gang.get("id") or 0)
+        if int(user_gang.get("leader_id") or 0) != safe_actor:
+            return False, "Открывать крышу может только лидер банды.", None
+
+        now_dt = datetime.now()
+        now = now_dt.isoformat()
+        max_contracts = max(1, min(6, 2 + int(int(user_gang.get("reputation") or 50) // 22)))
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+
+            await db.execute(
+                """
+                UPDATE gang_roof_contracts
+                SET status = 'expired',
+                    notes = COALESCE(notes, 'auto_expired')
+                WHERE gang_id = ?
+                  AND status = 'active'
+                  AND expires_at <= ?
+                """,
+                (gang_id, now),
+            )
+            async with db.execute(
+                "SELECT COUNT(*) AS c FROM gang_roof_contracts WHERE gang_id = ? AND status = 'active'",
+                (gang_id,),
+            ) as cursor:
+                active_row = await cursor.fetchone()
+            active_count = int((active_row["c"] if active_row else 0) or 0)
+            if active_count >= max_contracts:
+                await db.rollback()
+                return False, f"Лимит крыш достигнут: {active_count}/{max_contracts}.", None
+
+            async with db.execute(
+                "SELECT reputation FROM gangs WHERE id = ? LIMIT 1",
+                (gang_id,),
+            ) as cursor:
+                gang_row = await cursor.fetchone()
+            gang_rep = int((gang_row["reputation"] if gang_row else 50) or 50)
+
+            async with db.execute(
+                "SELECT user_id FROM gang_members WHERE gang_id = ?",
+                (gang_id,),
+            ) as cursor:
+                member_rows = await cursor.fetchall()
+            member_ids = [int(row["user_id"] or 0) for row in member_rows if int(row["user_id"] or 0) > 0]
+            if not member_ids:
+                member_ids = [safe_actor]
+            member_placeholders = ",".join(["?"] * len(member_ids))
+
+            biz_query = f"""
+                SELECT b.id, b.name, COALESCE(b.budget, 0) AS budget
+                FROM businesses b
+                WHERE COALESCE(b.status, 'active') = 'active'
+                  AND COALESCE(b.budget, 0) >= 20000
+                  AND b.owner_id NOT IN ({member_placeholders})
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM gang_roof_contracts gr
+                      WHERE gr.target_type = 'business'
+                        AND gr.target_id = b.id
+                        AND gr.status = 'active'
+                  )
+                ORDER BY COALESCE(b.budget, 0) DESC
+                LIMIT 40
+            """
+            priv_query = f"""
+                SELECT po.id, po.name, COALESCE(po.budget, 0) AS budget
+                FROM private_orgs po
+                WHERE COALESCE(po.status, 'active') = 'active'
+                  AND COALESCE(po.budget, 0) >= 25000
+                  AND po.leader_id NOT IN ({member_placeholders})
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM gang_roof_contracts gr
+                      WHERE gr.target_type = 'private_org'
+                        AND gr.target_id = po.id
+                        AND gr.status = 'active'
+                  )
+                ORDER BY COALESCE(po.budget, 0) DESC
+                LIMIT 40
+            """
+            async with db.execute(biz_query, tuple(member_ids)) as cursor:
+                business_rows = [dict(row) for row in await cursor.fetchall()]
+            async with db.execute(priv_query, tuple(member_ids)) as cursor:
+                private_rows = [dict(row) for row in await cursor.fetchall()]
+
+            candidates: List[Dict[str, Any]] = []
+            for item in business_rows:
+                candidates.append(
+                    {
+                        "target_type": "business",
+                        "target_id": int(item.get("id") or 0),
+                        "target_name": str(item.get("name") or f"Бизнес #{int(item.get('id') or 0)}"),
+                        "budget": round(float(item.get("budget") or 0.0), 2),
+                    }
+                )
+            for item in private_rows:
+                candidates.append(
+                    {
+                        "target_type": "private_org",
+                        "target_id": int(item.get("id") or 0),
+                        "target_name": str(item.get("name") or f"Организация #{int(item.get('id') or 0)}"),
+                        "budget": round(float(item.get("budget") or 0.0), 2),
+                    }
+                )
+            if not candidates:
+                await db.rollback()
+                return False, "Подходящих объектов для крыши сейчас нет.", None
+
+            if random.random() < 0.66:
+                candidates.sort(key=lambda item: float(item.get("budget") or 0), reverse=True)
+                target = random.choice(candidates[: max(1, min(8, len(candidates)))])
+            else:
+                target = random.choice(candidates)
+
+            success_chance = min(0.9, 0.48 + max(0.0, gang_rep) * 0.0032)
+            target_budget = round(float(target.get("budget") or 0.0), 2)
+            if random.random() > success_chance:
+                async with db.execute(
+                    "SELECT balance FROM users WHERE user_id = ? LIMIT 1",
+                    (safe_actor,),
+                ) as cursor:
+                    actor_row = await cursor.fetchone()
+                actor_balance = round(float((actor_row["balance"] if actor_row else 0) or 0), 2)
+                fine = round(min(actor_balance, float(random.randint(1_200, 4_800))), 2)
+                await db.execute(
+                    "UPDATE users SET balance = ? WHERE user_id = ?",
+                    (round(max(0.0, actor_balance - fine), 2), safe_actor),
+                )
+                await db.execute(
+                    "UPDATE gangs SET reputation = MAX(0, reputation - 1) WHERE id = ?",
+                    (gang_id,),
+                )
+                budget_credit = await self._credit_public_budgets(db, fine)
+                await db.commit()
+                return True, "Попытка крыши сорвалась, пришлось заплатить штраф.", {
+                    "result": "failed",
+                    "fine": fine,
+                    "government_credit": float(budget_credit.get("government_credit") or 0.0),
+                    "tax_service_credit": float(budget_credit.get("tax_service_credit") or 0.0),
+                }
+
+            fee_amount = round(min(95_000.0, max(3_000.0, target_budget * 0.038 + gang_rep * 28)), 2)
+            upfront = round(min(fee_amount * 0.45, target_budget * 0.10), 2)
+            upfront = max(500.0, upfront)
+            if str(target.get("target_type")) == "business":
+                await db.execute(
+                    "UPDATE businesses SET budget = ? WHERE id = ?",
+                    (round(max(0.0, target_budget - upfront), 2), int(target["target_id"])),
+                )
+            else:
+                await db.execute(
+                    "UPDATE private_orgs SET budget = ? WHERE id = ?",
+                    (round(max(0.0, target_budget - upfront), 2), int(target["target_id"])),
+                )
+
+            visible_gain = round(upfront * 0.58, 2)
+            shadow_gain = round(upfront - visible_gain, 2)
+            circulation_tax = round(upfront * 0.12, 2)
+            if circulation_tax > 0:
+                take_shadow = round(min(shadow_gain, circulation_tax), 2)
+                shadow_gain = round(max(0.0, shadow_gain - take_shadow), 2)
+                remain_tax = round(max(0.0, circulation_tax - take_shadow), 2)
+                if remain_tax > 0:
+                    visible_gain = round(max(0.0, visible_gain - remain_tax), 2)
+
+            async with db.execute(
+                "SELECT balance, shadow_balance FROM users WHERE user_id = ? LIMIT 1",
+                (safe_actor,),
+            ) as cursor:
+                actor_wallet = await cursor.fetchone()
+            actor_balance = round(float((actor_wallet["balance"] if actor_wallet else 0) or 0), 2)
+            actor_shadow = round(float((actor_wallet["shadow_balance"] if actor_wallet else 0) or 0), 2)
+            balance_after = round(actor_balance + visible_gain, 2)
+            shadow_after = round(actor_shadow + shadow_gain, 2)
+            await db.execute(
+                "UPDATE users SET balance = ?, shadow_balance = ? WHERE user_id = ?",
+                (balance_after, shadow_after, safe_actor),
+            )
+            await db.execute(
+                "UPDATE gangs SET reputation = MIN(100, reputation + 2) WHERE id = ?",
+                (gang_id,),
+            )
+
+            next_collect = (now_dt + timedelta(minutes=120)).isoformat()
+            expires_at = (now_dt + timedelta(hours=18)).isoformat()
+            cursor = await db.execute(
+                """
+                INSERT INTO gang_roof_contracts
+                (gang_id, target_type, target_id, target_name, fee_amount, status, created_by, created_date, next_collection_at, last_collection_at, expires_at, total_collected, notes)
+                VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    gang_id,
+                    str(target.get("target_type")),
+                    int(target.get("target_id") or 0),
+                    str(target.get("target_name") or ""),
+                    fee_amount,
+                    safe_actor,
+                    now,
+                    next_collect,
+                    now,
+                    expires_at,
+                    upfront,
+                    "signed",
+                ),
+            )
+            contract_id = int(cursor.lastrowid or 0)
+            budget_credit = await self._credit_public_budgets(db, circulation_tax)
+            await db.commit()
+
+        await self.log_player_activity(
+            user_id=safe_actor,
+            activity_type="gang_roof_start",
+            details=f"Открыта крыша: {target.get('target_name')}",
+            value=upfront,
+        )
+        return True, "Крыша оформлена: объект начал платить дань.", {
+            "result": "success",
+            "contract_id": contract_id,
+            "target_type": str(target.get("target_type")),
+            "target_id": int(target.get("target_id") or 0),
+            "target_name": str(target.get("target_name") or ""),
+            "fee_amount": fee_amount,
+            "upfront_collected": upfront,
+            "next_collection_at": next_collect,
+            "expires_at": expires_at,
+            "balance_after": balance_after,
+            "shadow_after": shadow_after,
+            "government_credit": float(budget_credit.get("government_credit") or 0.0),
+            "tax_service_credit": float(budget_credit.get("tax_service_credit") or 0.0),
+        }
+
+    async def collect_gang_roof_income(self, actor_id: int) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_actor = int(actor_id or 0)
+        if safe_actor <= 0:
+            return False, "Некорректный игрок.", None
+
+        user_gang = await self.get_user_gang(safe_actor)
+        if not user_gang:
+            return False, "Вы не состоите в банде.", None
+        gang_id = int(user_gang.get("id") or 0)
+        if gang_id <= 0:
+            return False, "Банда не найдена.", None
+
+        now_dt = datetime.now()
+        now = now_dt.isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute(
+                """
+                UPDATE gang_roof_contracts
+                SET status = 'expired',
+                    notes = COALESCE(notes, 'auto_expired')
+                WHERE gang_id = ?
+                  AND status = 'active'
+                  AND expires_at <= ?
+                """,
+                (gang_id, now),
+            )
+            async with db.execute(
+                """
+                SELECT *
+                FROM gang_roof_contracts
+                WHERE gang_id = ?
+                  AND status = 'active'
+                  AND next_collection_at <= ?
+                ORDER BY next_collection_at ASC
+                LIMIT 20
+                """,
+                (gang_id, now),
+            ) as cursor:
+                contracts = [dict(row) for row in await cursor.fetchall()]
+            if not contracts:
+                await db.rollback()
+                return False, "Пока нет объектов крыши с готовым сбором.", None
+
+            gross_collected = 0.0
+            collected_count = 0
+            closed_count = 0
+            for contract in contracts:
+                target_type = str(contract.get("target_type") or "")
+                target_id = int(contract.get("target_id") or 0)
+                fee_amount = round(float(contract.get("fee_amount") or 0), 2)
+                if target_id <= 0 or fee_amount <= 0:
+                    await db.execute(
+                        "UPDATE gang_roof_contracts SET status = 'cancelled', notes = 'invalid_target' WHERE id = ?",
+                        (int(contract.get("id") or 0),),
+                    )
+                    closed_count += 1
+                    continue
+
+                if target_type == "business":
+                    async with db.execute(
+                        "SELECT budget FROM businesses WHERE id = ? AND COALESCE(status, 'active') = 'active' LIMIT 1",
+                        (target_id,),
+                    ) as cursor:
+                        target_row = await cursor.fetchone()
+                elif target_type == "private_org":
+                    async with db.execute(
+                        "SELECT budget FROM private_orgs WHERE id = ? AND COALESCE(status, 'active') = 'active' LIMIT 1",
+                        (target_id,),
+                    ) as cursor:
+                        target_row = await cursor.fetchone()
+                else:
+                    target_row = None
+
+                if not target_row:
+                    await db.execute(
+                        "UPDATE gang_roof_contracts SET status = 'cancelled', notes = 'target_missing' WHERE id = ?",
+                        (int(contract.get("id") or 0),),
+                    )
+                    closed_count += 1
+                    continue
+
+                target_budget = round(float(target_row["budget"] or 0), 2)
+                can_collect = round(min(fee_amount, target_budget * 0.12), 2)
+                if can_collect < 250:
+                    await db.execute(
+                        "UPDATE gang_roof_contracts SET status = 'completed', notes = 'target_exhausted' WHERE id = ?",
+                        (int(contract.get("id") or 0),),
+                    )
+                    closed_count += 1
+                    continue
+
+                new_target_budget = round(max(0.0, target_budget - can_collect), 2)
+                if target_type == "business":
+                    await db.execute("UPDATE businesses SET budget = ? WHERE id = ?", (new_target_budget, target_id))
+                else:
+                    await db.execute("UPDATE private_orgs SET budget = ? WHERE id = ?", (new_target_budget, target_id))
+                await db.execute(
+                    """
+                    UPDATE gang_roof_contracts
+                    SET total_collected = ROUND(COALESCE(total_collected, 0) + ?, 2),
+                        last_collection_at = ?,
+                        next_collection_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        can_collect,
+                        now,
+                        (now_dt + timedelta(minutes=120)).isoformat(),
+                        int(contract.get("id") or 0),
+                    ),
+                )
+                gross_collected = round(gross_collected + can_collect, 2)
+                collected_count += 1
+
+            if gross_collected <= 0:
+                await db.commit()
+                return False, "Сбор выполнен, но платить оказалось нечем.", {
+                    "collected_count": collected_count,
+                    "closed_count": closed_count,
+                    "gross_collected": gross_collected,
+                }
+
+            visible_gain = round(gross_collected * 0.54, 2)
+            shadow_gain = round(gross_collected - visible_gain, 2)
+            circulation_tax = round(gross_collected * 0.12, 2)
+            if circulation_tax > 0:
+                take_shadow = round(min(shadow_gain, circulation_tax), 2)
+                shadow_gain = round(max(0.0, shadow_gain - take_shadow), 2)
+                remain_tax = round(max(0.0, circulation_tax - take_shadow), 2)
+                if remain_tax > 0:
+                    visible_gain = round(max(0.0, visible_gain - remain_tax), 2)
+
+            async with db.execute(
+                "SELECT balance, shadow_balance FROM users WHERE user_id = ? LIMIT 1",
+                (safe_actor,),
+            ) as cursor:
+                actor_row = await cursor.fetchone()
+            if not actor_row:
+                await db.rollback()
+                return False, "Игрок не найден.", None
+            balance_after = round(float(actor_row["balance"] or 0) + visible_gain, 2)
+            shadow_after = round(float(actor_row["shadow_balance"] or 0) + shadow_gain, 2)
+            await db.execute(
+                "UPDATE users SET balance = ?, shadow_balance = ? WHERE user_id = ?",
+                (balance_after, shadow_after, safe_actor),
+            )
+            rep_gain = max(1, min(5, int(round(collected_count / 2))))
+            await db.execute(
+                "UPDATE gangs SET reputation = MIN(100, reputation + ?) WHERE id = ?",
+                (rep_gain, gang_id),
+            )
+            budget_credit = await self._credit_public_budgets(db, circulation_tax)
+            await db.commit()
+
+        await self.log_player_activity(
+            user_id=safe_actor,
+            activity_type="gang_roof_collect",
+            details=f"Сбор дани по крыше: объектов {collected_count}",
+            value=gross_collected,
+        )
+        return True, "Сбор дани по крыше выполнен.", {
+            "collected_count": collected_count,
+            "closed_count": closed_count,
+            "gross_collected": gross_collected,
+            "visible_gain": visible_gain,
+            "shadow_gain": shadow_gain,
+            "circulation_tax": circulation_tax,
+            "balance_after": balance_after,
+            "shadow_after": shadow_after,
+            "government_credit": float(budget_credit.get("government_credit") or 0.0),
+            "tax_service_credit": float(budget_credit.get("tax_service_credit") or 0.0),
+        }
+
+    async def declare_gang_war(
+        self,
+        actor_id: int,
+        target_gang_id: int,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_actor = int(actor_id or 0)
+        safe_target = int(target_gang_id or 0)
+        if safe_actor <= 0 or safe_target <= 0:
+            return False, "Некорректные параметры.", None
+
+        user_gang = await self.get_user_gang(safe_actor)
+        if not user_gang:
+            return False, "Вы не состоите в банде.", None
+        actor_gang_id = int(user_gang.get("id") or 0)
+        if actor_gang_id <= 0:
+            return False, "Банда не найдена.", None
+        if actor_gang_id == safe_target:
+            return False, "Нельзя объявить войну своей банде.", None
+        if int(user_gang.get("leader_id") or 0) != safe_actor:
+            return False, "Объявлять войну может только лидер банды.", None
+
+        now_dt = datetime.now()
+        now = now_dt.isoformat()
+        war_fee = 120_000.0
+        ends_at = (now_dt + timedelta(hours=18)).isoformat()
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT id, status FROM gangs WHERE id = ? LIMIT 1",
+                (safe_target,),
+            ) as cursor:
+                target_gang = await cursor.fetchone()
+            if not target_gang or str(target_gang["status"] or "").lower() != "active":
+                await db.rollback()
+                return False, "Целевая банда недоступна.", None
+
+            async with db.execute(
+                """
+                SELECT id
+                FROM gang_wars
+                WHERE status = 'active'
+                  AND (
+                      attacker_gang_id IN (?, ?)
+                      OR defender_gang_id IN (?, ?)
+                  )
+                LIMIT 1
+                """,
+                (actor_gang_id, safe_target, actor_gang_id, safe_target),
+            ) as cursor:
+                active_war = await cursor.fetchone()
+            if active_war:
+                await db.rollback()
+                return False, "Одна из банд уже участвует в активной войне.", None
+
+            async with db.execute(
+                "SELECT balance FROM users WHERE user_id = ? LIMIT 1",
+                (safe_actor,),
+            ) as cursor:
+                actor_row = await cursor.fetchone()
+            if not actor_row:
+                await db.rollback()
+                return False, "Лидер не найден.", None
+            actor_balance = round(float(actor_row["balance"] or 0), 2)
+            if actor_balance < war_fee:
+                await db.rollback()
+                return False, f"Нужно {war_fee:,.2f} люмов для объявления войны.", None
+
+            new_balance = round(actor_balance - war_fee, 2)
+            await db.execute(
+                "UPDATE users SET balance = ? WHERE user_id = ?",
+                (new_balance, safe_actor),
+            )
+            cursor = await db.execute(
+                """
+                INSERT INTO gang_wars
+                (attacker_gang_id, defender_gang_id, created_by, status, started_date, ends_at, attacker_score, defender_score, battle_count, prize_pool)
+                VALUES (?, ?, ?, 'active', ?, ?, 0, 0, 0, ?)
+                """,
+                (
+                    actor_gang_id,
+                    safe_target,
+                    safe_actor,
+                    now,
+                    ends_at,
+                    war_fee,
+                ),
+            )
+            war_id = int(cursor.lastrowid or 0)
+            await db.commit()
+
+        await self.log_player_activity(
+            user_id=safe_actor,
+            activity_type="gang_war_declare",
+            details=f"Объявлена война банде #{safe_target}",
+            value=war_fee,
+        )
+        return True, "Война объявлена.", {
+            "war_id": war_id,
+            "attacker_gang_id": actor_gang_id,
+            "defender_gang_id": safe_target,
+            "war_fee": war_fee,
+            "balance_after": new_balance,
+            "ends_at": ends_at,
+        }
+
+    async def finalize_gang_war(
+        self,
+        war_id: int,
+        surrender_gang_id: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        safe_war = int(war_id or 0)
+        if safe_war <= 0:
+            return None
+
+        now = datetime.now().isoformat()
+        safe_surrender = int(surrender_gang_id or 0)
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT * FROM gang_wars WHERE id = ? LIMIT 1",
+                (safe_war,),
+            ) as cursor:
+                war_row = await cursor.fetchone()
+            if not war_row:
+                await db.rollback()
+                return None
+            war = dict(war_row)
+            if str(war.get("status") or "") != "active":
+                await db.rollback()
+                return war
+            if safe_surrender <= 0 and str(war.get("ends_at") or "") > now:
+                await db.rollback()
+                return None
+
+            attacker_id = int(war.get("attacker_gang_id") or 0)
+            defender_id = int(war.get("defender_gang_id") or 0)
+            attacker_score = int(war.get("attacker_score") or 0)
+            defender_score = int(war.get("defender_score") or 0)
+
+            if safe_surrender == attacker_id:
+                winner_id = defender_id
+                summary_note = "attacker_surrendered"
+            elif safe_surrender == defender_id:
+                winner_id = attacker_id
+                summary_note = "defender_surrendered"
+            else:
+                if attacker_score > defender_score:
+                    winner_id = attacker_id
+                elif defender_score > attacker_score:
+                    winner_id = defender_id
+                else:
+                    winner_id = random.choice([attacker_id, defender_id])
+                summary_note = "score_resolved"
+            loser_id = defender_id if winner_id == attacker_id else attacker_id
+
+            prize_pool = round(float(war.get("prize_pool") or 0), 2)
+            winner_prize = round(prize_pool * 0.7, 2)
+            public_share = round(max(0.0, prize_pool - winner_prize), 2)
+
+            async with db.execute(
+                "SELECT leader_id FROM gangs WHERE id = ? LIMIT 1",
+                (winner_id,),
+            ) as cursor:
+                winner_gang = await cursor.fetchone()
+            winner_leader_id = int((winner_gang["leader_id"] if winner_gang else 0) or 0)
+            if winner_leader_id > 0 and winner_prize > 0:
+                async with db.execute(
+                    "SELECT balance FROM users WHERE user_id = ? LIMIT 1",
+                    (winner_leader_id,),
+                ) as cursor:
+                    leader_row = await cursor.fetchone()
+                if leader_row:
+                    new_balance = round(float(leader_row["balance"] or 0) + winner_prize, 2)
+                    await db.execute(
+                        "UPDATE users SET balance = ? WHERE user_id = ?",
+                        (new_balance, winner_leader_id),
+                    )
+
+            await db.execute("UPDATE gangs SET reputation = MIN(100, reputation + 8) WHERE id = ?", (winner_id,))
+            await db.execute("UPDATE gangs SET reputation = MAX(0, reputation - 5) WHERE id = ?", (loser_id,))
+            budget_credit = await self._credit_public_budgets(db, public_share)
+            await db.execute(
+                """
+                UPDATE gang_wars
+                SET status = 'finished',
+                    ended_date = ?,
+                    winner_gang_id = ?,
+                    summary_note = ?
+                WHERE id = ?
+                """,
+                (now, winner_id, summary_note, safe_war),
+            )
+            await db.commit()
+
+        return {
+            "war_id": safe_war,
+            "winner_gang_id": winner_id,
+            "loser_gang_id": loser_id,
+            "winner_prize": winner_prize,
+            "public_share": public_share,
+            "government_credit": float(budget_credit.get("government_credit") or 0.0),
+            "tax_service_credit": float(budget_credit.get("tax_service_credit") or 0.0),
+            "summary_note": summary_note,
+        }
+
+    async def attack_gang_war(self, actor_id: int) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_actor = int(actor_id or 0)
+        if safe_actor <= 0:
+            return False, "Некорректный участник.", None
+
+        user_gang = await self.get_user_gang(safe_actor)
+        if not user_gang:
+            return False, "Вы не состоите в банде.", None
+        gang_id = int(user_gang.get("id") or 0)
+        if gang_id <= 0:
+            return False, "Банда не найдена.", None
+
+        active_war = await self.get_gang_active_war(gang_id)
+        if not active_war:
+            return False, "Активной войны для вашей банды нет.", None
+        war_id = int(active_war.get("id") or 0)
+        if war_id <= 0:
+            return False, "Война не найдена.", None
+
+        cooldown_ok, remain = await self.check_and_set_user_cooldown(
+            user_id=safe_actor,
+            action_key=f"gang_war_attack_{war_id}",
+            cooldown_minutes=40,
+        )
+        if not cooldown_ok:
+            return False, f"До следующей атаки по войне: {remain} мин.", {"cooldown_minutes": remain}
+
+        now = datetime.now().isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT * FROM gang_wars WHERE id = ? AND status = 'active' LIMIT 1",
+                (war_id,),
+            ) as cursor:
+                war_row = await cursor.fetchone()
+            if not war_row:
+                await db.rollback()
+                return False, "Война уже завершена.", None
+            war = dict(war_row)
+
+            attacker_id = int(war.get("attacker_gang_id") or 0)
+            defender_id = int(war.get("defender_gang_id") or 0)
+            if gang_id not in {attacker_id, defender_id}:
+                await db.rollback()
+                return False, "Вы не участник этой войны.", None
+
+            own_score_col = "attacker_score" if gang_id == attacker_id else "defender_score"
+            enemy_gang_id = defender_id if gang_id == attacker_id else attacker_id
+            own_rep = int(user_gang.get("reputation") or 0)
+            async with db.execute("SELECT reputation FROM gangs WHERE id = ? LIMIT 1", (enemy_gang_id,)) as cursor:
+                enemy_row = await cursor.fetchone()
+            enemy_rep = int((enemy_row["reputation"] if enemy_row else 50) or 50)
+
+            attack_roll = random.randint(6, 22) + int(own_rep * 0.08)
+            defense_roll = random.randint(4, 20) + int(enemy_rep * 0.07)
+            points = max(1, int(round((attack_roll - defense_roll * 0.45))))
+            critical = random.random() < 0.16
+            if critical:
+                points += random.randint(6, 18)
+
+            actor_reward = round(900.0 + points * random.randint(95, 145), 2)
+            visible_gain = round(actor_reward * 0.7, 2)
+            shadow_gain = round(actor_reward - visible_gain, 2)
+            circulation_tax = round(actor_reward * 0.12, 2)
+            if circulation_tax > 0:
+                take_shadow = round(min(shadow_gain, circulation_tax), 2)
+                shadow_gain = round(max(0.0, shadow_gain - take_shadow), 2)
+                remain_tax = round(max(0.0, circulation_tax - take_shadow), 2)
+                if remain_tax > 0:
+                    visible_gain = round(max(0.0, visible_gain - remain_tax), 2)
+
+            async with db.execute(
+                "SELECT balance, shadow_balance FROM users WHERE user_id = ? LIMIT 1",
+                (safe_actor,),
+            ) as cursor:
+                actor_row = await cursor.fetchone()
+            if not actor_row:
+                await db.rollback()
+                return False, "Игрок не найден.", None
+
+            balance_after = round(float(actor_row["balance"] or 0) + visible_gain, 2)
+            shadow_after = round(float(actor_row["shadow_balance"] or 0) + shadow_gain, 2)
+            await db.execute(
+                "UPDATE users SET balance = ?, shadow_balance = ? WHERE user_id = ?",
+                (balance_after, shadow_after, safe_actor),
+            )
+            await db.execute(
+                f"""
+                UPDATE gang_wars
+                SET {own_score_col} = COALESCE({own_score_col}, 0) + ?,
+                    battle_count = COALESCE(battle_count, 0) + 1,
+                    last_battle_at = ?
+                WHERE id = ?
+                """,
+                (points, now, war_id),
+            )
+            await db.execute("UPDATE gangs SET reputation = MIN(100, reputation + 1) WHERE id = ?", (gang_id,))
+            await db.execute("UPDATE gangs SET reputation = MAX(0, reputation - 1) WHERE id = ?", (enemy_gang_id,))
+            budget_credit = await self._credit_public_budgets(db, circulation_tax)
+            async with db.execute(
+                "SELECT attacker_score, defender_score, battle_count, ends_at FROM gang_wars WHERE id = ? LIMIT 1",
+                (war_id,),
+            ) as cursor:
+                score_row = await cursor.fetchone()
+            await db.commit()
+
+        final_payload = None
+        if score_row and str(score_row["ends_at"] or "") <= datetime.now().isoformat():
+            final_payload = await self.finalize_gang_war(war_id)
+
+        await self.log_player_activity(
+            user_id=safe_actor,
+            activity_type="gang_war_attack",
+            details=f"Атака в войне банд #{war_id}",
+            value=actor_reward,
+        )
+        return True, "Атака в войне проведена.", {
+            "war_id": war_id,
+            "points": points,
+            "critical": critical,
+            "reward": actor_reward,
+            "balance_after": balance_after,
+            "shadow_after": shadow_after,
+            "attacker_score": int((score_row["attacker_score"] if score_row else 0) or 0),
+            "defender_score": int((score_row["defender_score"] if score_row else 0) or 0),
+            "battle_count": int((score_row["battle_count"] if score_row else 0) or 0),
+            "government_credit": float(budget_credit.get("government_credit") or 0.0),
+            "tax_service_credit": float(budget_credit.get("tax_service_credit") or 0.0),
+            "finalized": bool(final_payload),
+            "final_payload": final_payload,
+        }
+
+    async def surrender_gang_war(self, actor_id: int) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_actor = int(actor_id or 0)
+        if safe_actor <= 0:
+            return False, "Некорректный игрок.", None
+
+        user_gang = await self.get_user_gang(safe_actor)
+        if not user_gang:
+            return False, "Вы не состоите в банде.", None
+        gang_id = int(user_gang.get("id") or 0)
+        if int(user_gang.get("leader_id") or 0) != safe_actor:
+            return False, "Сдаться может только лидер банды.", None
+
+        active_war = await self.get_gang_active_war(gang_id)
+        if not active_war:
+            return False, "Активной войны нет.", None
+        payload = await self.finalize_gang_war(int(active_war.get("id") or 0), surrender_gang_id=gang_id)
+        if not payload:
+            return False, "Не удалось завершить войну.", None
+        return True, "Война завершена капитуляцией.", payload
 
     async def create_gang(
         self,
@@ -10430,7 +17354,7 @@ class AsyncDatabase:
             return False, f"Недостаточно средств. Нужно ${fee:,.0f}.", None
 
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute("SELECT id FROM gangs WHERE lower(name) = lower(?) LIMIT 1", (clean_name,)) as cursor:
@@ -10450,6 +17374,7 @@ class AsyncDatabase:
                 "INSERT INTO gang_members (gang_id, user_id, role, join_date) VALUES (?, ?, 'Лидер', ?)",
                 (gang_id, int(leader_id), now),
             )
+            await self._credit_public_budgets(db, fee)
             await db.commit()
 
         await self.log_player_activity(
@@ -10464,7 +17389,7 @@ class AsyncDatabase:
         if await self.get_user_gang(user_id):
             return False, "Вы уже состоите в банде."
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute("SELECT id FROM gangs WHERE id = ? AND status = 'active'", (int(gang_id),)) as cursor:
@@ -10487,8 +17412,115 @@ class AsyncDatabase:
         )
         return True, "Вы вступили в банду."
 
+    async def leave_gang(self, user_id: int) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_user_id = int(user_id or 0)
+        if safe_user_id <= 0:
+            return False, "Некорректный игрок.", None
+
+        gang = await self.get_user_gang(safe_user_id)
+        if not gang:
+            return False, "Вы не состоите в банде.", None
+
+        gang_id = int(gang.get("id") or 0)
+        if gang_id <= 0:
+            return False, "Банда не найдена.", None
+
+        is_leader = int(gang.get("leader_id") or 0) == safe_user_id
+        now = datetime.now().isoformat()
+        payload: Dict[str, Any] = {"gang_id": gang_id, "was_leader": is_leader}
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+
+            async with db.execute(
+                "SELECT id FROM gang_members WHERE gang_id = ? AND user_id = ? LIMIT 1",
+                (gang_id, safe_user_id),
+            ) as cursor:
+                membership = await cursor.fetchone()
+            if not membership:
+                await db.rollback()
+                return False, "Вы не найдены в составе банды.", None
+
+            transfer_to: Optional[int] = None
+            dissolved = False
+            if is_leader:
+                async with db.execute(
+                    """
+                    SELECT user_id
+                    FROM gang_members
+                    WHERE gang_id = ? AND user_id != ?
+                    ORDER BY join_date ASC, id ASC
+                    LIMIT 1
+                    """,
+                    (gang_id, safe_user_id),
+                ) as cursor:
+                    next_leader = await cursor.fetchone()
+                if next_leader:
+                    transfer_to = int(next_leader["user_id"] or 0)
+                    if transfer_to > 0:
+                        await db.execute(
+                            "UPDATE gangs SET leader_id = ? WHERE id = ?",
+                            (transfer_to, gang_id),
+                        )
+                        await db.execute(
+                            "UPDATE gang_members SET role = 'Лидер' WHERE gang_id = ? AND user_id = ?",
+                            (gang_id, transfer_to),
+                        )
+                else:
+                    dissolved = True
+                    await db.execute("UPDATE gangs SET status = 'inactive' WHERE id = ?", (gang_id,))
+                    await db.execute(
+                        "UPDATE drug_cartels SET status = 'closed' WHERE gang_id = ? AND status = 'active'",
+                        (gang_id,),
+                    )
+                    await db.execute(
+                        "UPDATE gang_applications SET status = 'cancelled', reviewed_date = ? WHERE gang_id = ? AND status = 'pending'",
+                        (now, gang_id),
+                    )
+
+            await db.execute(
+                "DELETE FROM gang_members WHERE gang_id = ? AND user_id = ?",
+                (gang_id, safe_user_id),
+            )
+
+            async with db.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM gang_members gm
+                JOIN gangs g ON g.id = gm.gang_id
+                WHERE gm.user_id = ? AND g.status = 'active'
+                """,
+                (safe_user_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            still_member = int((row["c"] if row else 0) or 0) > 0
+            await db.execute(
+                "UPDATE users SET gang_member = ? WHERE user_id = ?",
+                (1 if still_member else 0, safe_user_id),
+            )
+            await db.commit()
+
+        payload["transferred_to"] = transfer_to
+        payload["dissolved"] = dissolved
+        try:
+            await self.log_player_activity(
+                user_id=safe_user_id,
+                activity_type="gang_leave",
+                details=f"Выход из банды #{gang_id}",
+                value=0,
+            )
+        except Exception:
+            pass
+
+        if dissolved:
+            return True, "Вы покинули банду. Банда расформирована (вы были последним участником).", payload
+        if transfer_to and transfer_to > 0:
+            return True, f"Вы покинули банду. Лидерство передано игроку #{transfer_to}.", payload
+        return True, "Вы покинули банду.", payload
+
     async def get_gang_cartel(self, gang_id: int) -> Optional[Dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute("SELECT * FROM drug_cartels WHERE gang_id = ?", (int(gang_id),)) as cursor:
                 row = await cursor.fetchone()
@@ -10512,7 +17544,7 @@ class AsyncDatabase:
         if len(clean_name) < 3:
             clean_name = f"Картель банды {gang.get('name', gang_id)}"
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 INSERT INTO drug_cartels
@@ -10608,7 +17640,7 @@ class AsyncDatabase:
         new_balance = round(max(0.0, balance + delta_balance), 2)
         new_shadow = round(max(0.0, shadow + delta_shadow), 2)
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             await db.execute(
                 "UPDATE drug_cartels SET stock = ?, purity = ?, laundering_level = ? WHERE gang_id = ?",
@@ -10653,8 +17685,592 @@ class AsyncDatabase:
             "new_shadow_balance": new_shadow,
         }
 
+    async def run_gang_operation(
+        self,
+        actor_id: int,
+        operation: str,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_actor = int(actor_id or 0)
+        if safe_actor <= 0:
+            return False, "Некорректный участник.", None
+
+        user_gang = await self.get_user_gang(safe_actor)
+        if not user_gang:
+            return False, "Вы не состоите в банде.", None
+
+        gang_id = int(user_gang.get("id") or 0)
+        if gang_id <= 0:
+            return False, "Банда не найдена.", None
+
+        op = str(operation or "").strip().lower()
+        cfg = {
+            "patrol": {"cooldown": 35},
+            "racket": {"cooldown": 55},
+            "raid": {"cooldown": 120},
+            "kidnap": {"cooldown": 90},
+            "ransom": {"cooldown": 30},
+            "mug": {"cooldown": 45},
+            "heist_org": {"cooldown": 130},
+            "heist_bank": {"cooldown": 210},
+        }.get(op)
+        if not cfg:
+            return False, "Неизвестная операция.", None
+
+        precheck_now = datetime.now().isoformat()
+        if op == "ransom":
+            async with self._connect() as pre_db:
+                async with pre_db.execute(
+                    """
+                    SELECT id
+                    FROM gang_hostage_cases
+                    WHERE gang_id = ?
+                      AND status = 'active'
+                      AND expires_at > ?
+                    ORDER BY created_date DESC
+                    LIMIT 1
+                    """,
+                    (gang_id, precheck_now),
+                ) as cursor:
+                    if not await cursor.fetchone():
+                        return False, "Нет активного заложника для выкупа.", None
+        if op == "kidnap":
+            async with self._connect() as pre_db:
+                async with pre_db.execute(
+                    """
+                    SELECT id
+                    FROM gang_hostage_cases
+                    WHERE gang_id = ?
+                      AND status = 'active'
+                      AND expires_at > ?
+                    ORDER BY created_date DESC
+                    LIMIT 1
+                    """,
+                    (gang_id, precheck_now),
+                ) as cursor:
+                    if await cursor.fetchone():
+                        return False, "У банды уже есть активный заложник. Сначала завершите выкуп.", None
+
+        ok_cd, remain = await self.check_and_set_user_cooldown(
+            user_id=safe_actor,
+            action_key=f"gang_op_{op}",
+            cooldown_minutes=int(cfg["cooldown"]),
+        )
+        if not ok_cd:
+            return False, f"Кулдаун операции: {remain} мин.", {"cooldown_minutes": remain}
+
+        now_dt = datetime.now()
+        now = now_dt.isoformat()
+        cartel = await self.get_gang_cartel(gang_id)
+
+        payout_visible = 0.0
+        payout_shadow = 0.0
+        gross_payout = 0.0
+        circulation_tax = 0.0
+        fine = 0.0
+        rep_gain = 0
+        operation_result = "success"
+        cartel_delta: Dict[str, Any] = {}
+        operation_meta: Dict[str, Any] = {}
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT balance, shadow_balance FROM users WHERE user_id = ? LIMIT 1",
+                (safe_actor,),
+            ) as cursor:
+                user_row = await cursor.fetchone()
+            if not user_row:
+                await db.rollback()
+                return False, "Игрок не найден.", None
+
+            async with db.execute(
+                "SELECT reputation FROM gangs WHERE id = ? LIMIT 1",
+                (gang_id,),
+            ) as cursor:
+                gang_row = await cursor.fetchone()
+            if not gang_row:
+                await db.rollback()
+                return False, "Банда не найдена.", None
+
+            balance = round(float(user_row["balance"] or 0), 2)
+            shadow = round(float(user_row["shadow_balance"] or 0), 2)
+            rep_before = int(gang_row["reputation"] or 0)
+
+            if op in {"patrol", "racket", "raid"}:
+                op_cfg = {
+                    "patrol": {"payout_min": 800, "payout_max": 1600, "rep_min": 1, "rep_max": 3, "fine_chance": 0.05},
+                    "racket": {"payout_min": 1500, "payout_max": 3200, "rep_min": 2, "rep_max": 5, "fine_chance": 0.12},
+                    "raid": {"payout_min": 2500, "payout_max": 5200, "rep_min": 4, "rep_max": 8, "fine_chance": 0.20},
+                }[op]
+                gross_payout = round(float(random.randint(op_cfg["payout_min"], op_cfg["payout_max"])), 2)
+                payout_visible = round(gross_payout * (0.65 if op == "racket" else 0.85), 2)
+                payout_shadow = round(gross_payout - payout_visible, 2)
+                circulation_tax = round(gross_payout * MONEY_CIRCULATION_GOV_SHARE, 2)
+                rep_gain = int(random.randint(op_cfg["rep_min"], op_cfg["rep_max"]))
+                if random.random() < float(op_cfg["fine_chance"]):
+                    fine = round(float(random.randint(350, 1400)), 2)
+                    operation_result = "fined"
+                if cartel and op in {"racket", "raid"}:
+                    stock_delta = float(random.randint(3, 10))
+                    purity_delta = float(random.randint(1, 3))
+                    laundering_delta = 1 if op == "raid" and random.random() < 0.35 else 0
+                    cartel_delta = {
+                        "stock_delta": stock_delta,
+                        "purity_delta": purity_delta,
+                        "laundering_delta": laundering_delta,
+                    }
+
+            elif op == "kidnap":
+                await db.execute(
+                    """
+                    UPDATE gang_hostage_cases
+                    SET status = 'expired',
+                        resolved_date = ?,
+                        resolved_note = 'auto_expired'
+                    WHERE gang_id = ?
+                      AND status = 'active'
+                      AND expires_at <= ?
+                    """,
+                    (now, gang_id, now),
+                )
+                async with db.execute(
+                    """
+                    SELECT id
+                    FROM gang_hostage_cases
+                    WHERE gang_id = ?
+                      AND status = 'active'
+                    ORDER BY created_date DESC
+                    LIMIT 1
+                    """,
+                    (gang_id,),
+                ) as cursor:
+                    active_hostage = await cursor.fetchone()
+                if active_hostage:
+                    await db.rollback()
+                    return False, "У банды уже есть активный заложник. Сначала завершите выкуп.", None
+
+                async with db.execute(
+                    """
+                    SELECT u.user_id, u.balance, u.bank, u.nickname, u.full_name, u.username
+                    FROM users u
+                    LEFT JOIN gang_members gm
+                      ON gm.user_id = u.user_id
+                     AND gm.gang_id = ?
+                    WHERE u.user_id != ?
+                      AND gm.id IS NULL
+                      AND (COALESCE(u.balance, 0) + COALESCE(u.bank, 0)) >= 1200
+                    ORDER BY RANDOM()
+                    LIMIT 1
+                    """,
+                    (gang_id, safe_actor),
+                ) as cursor:
+                    victim = await cursor.fetchone()
+                if not victim:
+                    await db.rollback()
+                    return False, "Не удалось найти цель для захвата. Попробуйте позже.", None
+
+                victim_name = _compose_public_name(dict(victim), fallback_id=int(victim["user_id"] or 0))
+                demand_text = random.choice(
+                    [
+                        "крупный выкуп наличными",
+                        "деньги и безопасный коридор",
+                        "доступ к складу ресурсов",
+                        "выплата и отказ от преследования",
+                    ]
+                )
+                demand_amount = round(float(random.randint(4_000, 28_000) + rep_before * 25), 2)
+                expires_at = (now_dt + timedelta(minutes=45)).isoformat()
+                await db.execute(
+                    """
+                    INSERT INTO gang_hostage_cases
+                    (gang_id, actor_id, victim_id, demand_amount, demand_text, status, created_date, expires_at)
+                    VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+                    """,
+                    (gang_id, safe_actor, int(victim["user_id"] or 0), demand_amount, demand_text, now, expires_at),
+                )
+
+                gross_payout = round(float(random.randint(450, 1350)), 2)
+                payout_visible = round(gross_payout * 0.4, 2)
+                payout_shadow = round(gross_payout - payout_visible, 2)
+                circulation_tax = round(gross_payout * 0.08, 2)
+                rep_gain = int(random.randint(3, 6))
+                operation_result = "captured"
+                operation_meta.update(
+                    {
+                        "victim_id": int(victim["user_id"] or 0),
+                        "victim_name": victim_name,
+                        "demand_amount": demand_amount,
+                        "demand_text": demand_text,
+                        "expires_at": expires_at,
+                    }
+                )
+
+            elif op == "ransom":
+                await db.execute(
+                    """
+                    UPDATE gang_hostage_cases
+                    SET status = 'expired',
+                        resolved_date = ?,
+                        resolved_note = 'auto_expired'
+                    WHERE gang_id = ?
+                      AND status = 'active'
+                      AND expires_at <= ?
+                    """,
+                    (now, gang_id, now),
+                )
+                async with db.execute(
+                    """
+                    SELECT *
+                    FROM gang_hostage_cases
+                    WHERE gang_id = ?
+                      AND status = 'active'
+                    ORDER BY created_date DESC
+                    LIMIT 1
+                    """,
+                    (gang_id,),
+                ) as cursor:
+                    hostage_row = await cursor.fetchone()
+                if not hostage_row:
+                    await db.rollback()
+                    return False, "Нет активного заложника для выкупа.", None
+
+                hostage = dict(hostage_row)
+                victim_id = int(hostage.get("victim_id") or 0)
+                demand_amount = round(float(hostage.get("demand_amount") or 0), 2)
+                async with db.execute(
+                    "SELECT user_id, balance, bank, nickname, full_name, username FROM users WHERE user_id = ? LIMIT 1",
+                    (victim_id,),
+                ) as cursor:
+                    victim_row = await cursor.fetchone()
+                if not victim_row:
+                    await db.execute(
+                        "UPDATE gang_hostage_cases SET status = 'failed', resolved_date = ?, resolved_note = ? WHERE id = ?",
+                        (now, "victim_missing", int(hostage.get("id") or 0)),
+                    )
+                    operation_result = "failed"
+                    rep_gain = -2
+                    demand_amount = round(max(0.0, demand_amount), 2)
+                    operation_meta.update({"victim_id": victim_id, "demand_amount": demand_amount})
+                else:
+                    victim = dict(victim_row)
+                    victim_name = _compose_public_name(victim, fallback_id=victim_id)
+                    victim_balance = round(float(victim.get("balance") or 0), 2)
+                    victim_bank = round(float(victim.get("bank") or 0), 2)
+                    available = round(max(0.0, victim_balance + victim_bank), 2)
+                    if available <= 0:
+                        await db.execute(
+                            "UPDATE gang_hostage_cases SET status = 'failed', resolved_date = ?, resolved_note = ? WHERE id = ?",
+                            (now, "victim_broke", int(hostage.get("id") or 0)),
+                        )
+                        operation_result = "failed"
+                        rep_gain = -3
+                        operation_meta.update(
+                            {
+                                "victim_id": victim_id,
+                                "victim_name": victim_name,
+                                "demand_amount": demand_amount,
+                                "collected_amount": 0.0,
+                            }
+                        )
+                    else:
+                        base_collect = available * random.uniform(0.55, 0.9)
+                        collected = round(min(demand_amount, max(350.0, base_collect)), 2)
+                        take_from_balance = round(min(victim_balance, collected), 2)
+                        take_rest = round(collected - take_from_balance, 2)
+                        take_from_bank = round(min(victim_bank, take_rest), 2)
+                        victim_balance_after = round(max(0.0, victim_balance - take_from_balance), 2)
+                        victim_bank_after = round(max(0.0, victim_bank - take_from_bank), 2)
+                        await db.execute(
+                            "UPDATE users SET balance = ?, bank = ? WHERE user_id = ?",
+                            (victim_balance_after, victim_bank_after, victim_id),
+                        )
+                        note = "paid_full" if collected >= demand_amount else "paid_partial"
+                        await db.execute(
+                            "UPDATE gang_hostage_cases SET status = 'resolved', resolved_date = ?, resolved_note = ? WHERE id = ?",
+                            (now, note, int(hostage.get("id") or 0)),
+                        )
+
+                        gross_payout = round(collected, 2)
+                        payout_visible = round(gross_payout * 0.42, 2)
+                        payout_shadow = round(gross_payout - payout_visible, 2)
+                        circulation_tax = round(gross_payout * 0.14, 2)
+                        rep_gain = int(random.randint(2, 5))
+                        operation_result = note
+                        operation_meta.update(
+                            {
+                                "victim_id": victim_id,
+                                "victim_name": victim_name,
+                                "demand_amount": demand_amount,
+                                "collected_amount": collected,
+                            }
+                        )
+
+            elif op == "mug":
+                async with db.execute(
+                    """
+                    SELECT u.user_id, u.balance, u.nickname, u.full_name, u.username
+                    FROM users u
+                    LEFT JOIN gang_members gm
+                      ON gm.user_id = u.user_id
+                     AND gm.gang_id = ?
+                    WHERE u.user_id != ?
+                      AND gm.id IS NULL
+                      AND COALESCE(u.balance, 0) >= 500
+                    ORDER BY RANDOM()
+                    LIMIT 1
+                    """,
+                    (gang_id, safe_actor),
+                ) as cursor:
+                    victim_row = await cursor.fetchone()
+                if not victim_row:
+                    await db.rollback()
+                    return False, "Не найден подходящий игрок для ограбления.", None
+                victim = dict(victim_row)
+                victim_id = int(victim.get("user_id") or 0)
+                victim_name = _compose_public_name(victim, fallback_id=victim_id)
+                victim_balance = round(float(victim.get("balance") or 0), 2)
+
+                if random.random() >= 0.72:
+                    fine = round(float(random.randint(900, 3200)), 2)
+                    rep_gain = -2
+                    operation_result = "failed"
+                    operation_meta.update({"victim_id": victim_id, "victim_name": victim_name, "stolen_amount": 0.0})
+                else:
+                    steal_limit = max(0.0, victim_balance - 150.0)
+                    stolen = round(
+                        min(
+                            steal_limit,
+                            victim_balance * random.uniform(0.22, 0.46),
+                            float(random.randint(800, 5500)),
+                        ),
+                        2,
+                    )
+                    if stolen <= 120:
+                        fine = round(float(random.randint(700, 2200)), 2)
+                        rep_gain = -1
+                        operation_result = "failed"
+                        operation_meta.update({"victim_id": victim_id, "victim_name": victim_name, "stolen_amount": 0.0})
+                    else:
+                        victim_balance_after = round(max(0.0, victim_balance - stolen), 2)
+                        await db.execute(
+                            "UPDATE users SET balance = ? WHERE user_id = ?",
+                            (victim_balance_after, victim_id),
+                        )
+                        gross_payout = round(stolen, 2)
+                        payout_visible = round(gross_payout * 0.57, 2)
+                        payout_shadow = round(gross_payout - payout_visible, 2)
+                        circulation_tax = round(gross_payout * 0.10, 2)
+                        rep_gain = int(random.randint(1, 4))
+                        operation_result = "success"
+                        operation_meta.update(
+                            {
+                                "victim_id": victim_id,
+                                "victim_name": victim_name,
+                                "stolen_amount": stolen,
+                            }
+                        )
+
+            elif op == "heist_org":
+                async with db.execute(
+                    """
+                    SELECT id, name, budget, type
+                    FROM organizations
+                    WHERE COALESCE(budget, 0) >= 8000
+                      AND lower(COALESCE(type, '')) != 'government'
+                    ORDER BY RANDOM()
+                    LIMIT 1
+                    """
+                ) as cursor:
+                    org_row = await cursor.fetchone()
+                if not org_row:
+                    await db.rollback()
+                    return False, "Нет подходящей организации для налета.", None
+                org = dict(org_row)
+                org_id = int(org.get("id") or 0)
+                org_budget = round(float(org.get("budget") or 0), 2)
+
+                if random.random() >= 0.58:
+                    fine = round(float(random.randint(2_200, 6_800)), 2)
+                    rep_gain = -3
+                    operation_result = "failed"
+                    operation_meta.update({"org_id": org_id, "org_name": str(org.get("name") or "Организация"), "stolen_amount": 0.0})
+                else:
+                    stolen = round(
+                        min(
+                            org_budget * random.uniform(0.04, 0.15),
+                            float(random.randint(5_000, 28_000)),
+                        ),
+                        2,
+                    )
+                    if stolen <= 400:
+                        fine = round(float(random.randint(1_800, 4_500)), 2)
+                        rep_gain = -2
+                        operation_result = "failed"
+                        operation_meta.update({"org_id": org_id, "org_name": str(org.get("name") or "Организация"), "stolen_amount": 0.0})
+                    else:
+                        await db.execute(
+                            "UPDATE organizations SET budget = ? WHERE id = ?",
+                            (round(max(0.0, org_budget - stolen), 2), org_id),
+                        )
+                        gross_payout = round(stolen, 2)
+                        payout_visible = round(gross_payout * 0.35, 2)
+                        payout_shadow = round(gross_payout - payout_visible, 2)
+                        circulation_tax = round(gross_payout * 0.12, 2)
+                        rep_gain = int(random.randint(3, 7))
+                        operation_result = "success"
+                        operation_meta.update(
+                            {
+                                "org_id": org_id,
+                                "org_name": str(org.get("name") or "Организация"),
+                                "stolen_amount": stolen,
+                            }
+                        )
+
+            elif op == "heist_bank":
+                async with db.execute(
+                    """
+                    SELECT id, name, budget, type
+                    FROM organizations
+                    WHERE COALESCE(budget, 0) >= 15_000
+                      AND (
+                          lower(COALESCE(name, '')) LIKE '%банк%'
+                          OR lower(COALESCE(type, '')) IN ('bank', 'finance', 'financial')
+                      )
+                    ORDER BY COALESCE(budget, 0) DESC, id ASC
+                    LIMIT 1
+                    """
+                ) as cursor:
+                    bank_row = await cursor.fetchone()
+                if not bank_row:
+                    async with db.execute(
+                        """
+                        SELECT id, name, budget, type
+                        FROM organizations
+                        WHERE lower(COALESCE(type, '')) = 'government'
+                        ORDER BY COALESCE(budget, 0) DESC, id ASC
+                        LIMIT 1
+                        """
+                    ) as cursor:
+                        bank_row = await cursor.fetchone()
+                if not bank_row:
+                    await db.rollback()
+                    return False, "Банк для ограбления не найден.", None
+
+                bank = dict(bank_row)
+                bank_id = int(bank.get("id") or 0)
+                bank_budget = round(float(bank.get("budget") or 0), 2)
+                bank_name = str(bank.get("name") or "Банк")
+
+                if random.random() >= 0.36:
+                    fine = round(float(random.randint(7_000, 18_000)), 2)
+                    rep_gain = -5
+                    operation_result = "failed"
+                    operation_meta.update({"org_id": bank_id, "org_name": bank_name, "stolen_amount": 0.0})
+                else:
+                    stolen = round(
+                        min(
+                            bank_budget * random.uniform(0.03, 0.09),
+                            float(random.randint(12_000, 70_000)),
+                        ),
+                        2,
+                    )
+                    if stolen <= 1_200:
+                        fine = round(float(random.randint(4_500, 11_500)), 2)
+                        rep_gain = -3
+                        operation_result = "failed"
+                        operation_meta.update({"org_id": bank_id, "org_name": bank_name, "stolen_amount": 0.0})
+                    else:
+                        await db.execute(
+                            "UPDATE organizations SET budget = ? WHERE id = ?",
+                            (round(max(0.0, bank_budget - stolen), 2), bank_id),
+                        )
+                        gross_payout = round(stolen, 2)
+                        payout_visible = round(gross_payout * 0.30, 2)
+                        payout_shadow = round(gross_payout - payout_visible, 2)
+                        circulation_tax = round(gross_payout * 0.18, 2)
+                        rep_gain = int(random.randint(5, 10))
+                        operation_result = "success"
+                        operation_meta.update({"org_id": bank_id, "org_name": bank_name, "stolen_amount": stolen})
+
+            circulation_tax = round(max(0.0, circulation_tax), 2)
+            gross_payout = round(max(0.0, gross_payout), 2)
+            payout_visible = round(max(0.0, payout_visible), 2)
+            payout_shadow = round(max(0.0, payout_shadow), 2)
+            if circulation_tax > 0:
+                take_shadow = round(min(payout_shadow, circulation_tax), 2)
+                payout_shadow = round(max(0.0, payout_shadow - take_shadow), 2)
+                remain_tax = round(max(0.0, circulation_tax - take_shadow), 2)
+                if remain_tax > 0:
+                    payout_visible = round(max(0.0, payout_visible - remain_tax), 2)
+
+            fine = round(max(0.0, fine), 2)
+            fine_applied = round(min(fine, max(0.0, balance + payout_visible)), 2)
+            balance_after = round(max(0.0, balance + payout_visible - fine_applied), 2)
+            shadow_after = round(max(0.0, shadow + payout_shadow), 2)
+            rep_after = max(0, min(100, rep_before + int(rep_gain)))
+
+            await db.execute(
+                "UPDATE users SET balance = ?, shadow_balance = ? WHERE user_id = ?",
+                (balance_after, shadow_after, safe_actor),
+            )
+            await db.execute(
+                "UPDATE gangs SET reputation = ? WHERE id = ?",
+                (rep_after, gang_id),
+            )
+            if cartel and cartel_delta:
+                await db.execute(
+                    """
+                    UPDATE drug_cartels
+                    SET stock = MAX(0, COALESCE(stock, 0) + ?),
+                        purity = MIN(99, MAX(35, COALESCE(purity, 50) + ?)),
+                        laundering_level = MAX(1, COALESCE(laundering_level, 1) + ?)
+                    WHERE gang_id = ?
+                    """,
+                    (
+                        float(cartel_delta["stock_delta"]),
+                        float(cartel_delta["purity_delta"]),
+                        int(cartel_delta["laundering_delta"]),
+                        gang_id,
+                    ),
+                )
+
+            budget_credit = await self._credit_public_budgets(
+                db,
+                round(circulation_tax + fine_applied, 2),
+            )
+            await db.commit()
+
+        payout_net = round(max(0.0, payout_visible + payout_shadow), 2)
+        await self.log_player_activity(
+            user_id=safe_actor,
+            activity_type="gang_operation",
+            details=f"Операция банды: {op} ({operation_result})",
+            value=max(0.0, payout_net),
+        )
+
+        return True, "Операция выполнена.", {
+            "operation": op,
+            "result": operation_result,
+            "payout": payout_net,
+            "payout_gross": gross_payout,
+            "payout_visible": payout_visible,
+            "payout_shadow": payout_shadow,
+            "circulation_tax": circulation_tax,
+            "fine": fine_applied,
+            "balance_after": balance_after,
+            "shadow_after": shadow_after,
+            "rep_before": rep_before,
+            "rep_after": rep_after,
+            "rep_gain": rep_gain,
+            "cartel_delta": cartel_delta,
+            "government_credit": float(budget_credit.get("government_credit") or 0.0),
+            "tax_service_credit": float(budget_credit.get("tax_service_credit") or 0.0),
+            **operation_meta,
+        }
+
     async def _ensure_market_contracts_table(self) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS market_contracts (
@@ -10712,7 +18328,7 @@ class AsyncDatabase:
         now_iso = now.isoformat()
         deadline_iso = (now + timedelta(hours=hours)).isoformat()
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -10798,7 +18414,7 @@ class AsyncDatabase:
             LIMIT ?
         """
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, tuple(params)) as cursor:
                 rows = await cursor.fetchall()
@@ -10807,7 +18423,7 @@ class AsyncDatabase:
     async def claim_market_contract(self, actor_id: int, contract_id: int) -> tuple[bool, str]:
         await self._ensure_market_contracts_table()
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -10850,7 +18466,7 @@ class AsyncDatabase:
     ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
         await self._ensure_market_contracts_table()
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -10926,7 +18542,7 @@ class AsyncDatabase:
     ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
         await self._ensure_market_contracts_table()
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -10974,7 +18590,7 @@ class AsyncDatabase:
         }
 
     async def _ensure_bank_transactions_table(self) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS bank_transactions (
@@ -10996,6 +18612,22 @@ class AsyncDatabase:
             )
             await db.commit()
 
+    async def _ensure_bank_interest_carry_table(self) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bank_interest_carry (
+                    user_id INTEGER PRIMARY KEY,
+                    carry REAL NOT NULL DEFAULT 0,
+                    updated_date TEXT NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_bank_interest_carry_updated ON bank_interest_carry(updated_date DESC)"
+            )
+            await db.commit()
+
     async def deposit_to_bank(
         self,
         user_id: int,
@@ -11011,7 +18643,7 @@ class AsyncDatabase:
 
         now = datetime.now().isoformat()
         note_clean = " ".join((note or "").strip().split())[:220]
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -11082,7 +18714,7 @@ class AsyncDatabase:
 
         now = datetime.now().isoformat()
         note_clean = " ".join((note or "").strip().split())[:220]
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -11171,7 +18803,7 @@ class AsyncDatabase:
         if not note_clean:
             note_clean = "Перевод между игроками"
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
 
@@ -11293,10 +18925,212 @@ class AsyncDatabase:
             "recipient_name": recipient_name,
         }
 
+    async def list_pending_loan_applications(self, limit: int = 20) -> List[Dict[str, Any]]:
+        safe_limit = max(1, min(int(limit or 20), 80))
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT l.*,
+                       COALESCE(NULLIF(u.nickname, ''), NULLIF(u.full_name, ''), NULLIF(u.username, ''), CAST(l.applicant_id AS TEXT)) AS applicant_name,
+                       COALESCE(u.reputation, 50) AS applicant_reputation,
+                       COALESCE(u.education, 1) AS applicant_education,
+                       COALESCE(u.tax_debt, 0) AS applicant_tax_debt,
+                       COALESCE(u.balance, 0) AS applicant_balance
+                FROM loans l
+                LEFT JOIN users u ON u.user_id = l.applicant_id
+                WHERE l.status = 'pending'
+                ORDER BY l.application_date ASC, l.id ASC
+                LIMIT ?
+                """,
+                (safe_limit,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+    async def review_loan_application(
+        self,
+        loan_id: int,
+        officer_id: int,
+        approve: bool,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_loan_id = int(loan_id or 0)
+        safe_officer_id = int(officer_id or 0)
+        if safe_loan_id <= 0 or safe_officer_id <= 0:
+            return False, "Некорректная заявка.", None
+
+        now = datetime.now().isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute("SELECT * FROM loans WHERE id = ? LIMIT 1", (safe_loan_id,)) as cursor:
+                loan = await cursor.fetchone()
+            if not loan:
+                await db.rollback()
+                return False, "Кредитная заявка не найдена.", None
+            if str(loan["status"] or "") != "pending":
+                await db.rollback()
+                return False, "Заявка уже обработана.", None
+
+            applicant_id = int(loan["applicant_id"] or 0)
+            amount = round(float(loan["amount"] or 0.0), 2)
+            async with db.execute("SELECT balance FROM users WHERE user_id = ? LIMIT 1", (applicant_id,)) as cursor:
+                applicant = await cursor.fetchone()
+            if not applicant:
+                await db.rollback()
+                return False, "Заявитель не найден.", None
+
+            async with db.execute(
+                "SELECT id, budget FROM organizations WHERE lower(COALESCE(type, '')) = 'bank' ORDER BY id ASC LIMIT 1"
+            ) as cursor:
+                bank_org = await cursor.fetchone()
+            bank_budget_before = round(float(bank_org["budget"] or 0.0), 2) if bank_org else 0.0
+            bank_org_id = int(bank_org["id"] or 0) if bank_org else 0
+
+            if approve:
+                if bank_org_id > 0 and bank_budget_before < amount:
+                    await db.rollback()
+                    return False, f"В бюджете банка не хватает средств. Нужно ${amount:,.2f}.", None
+                new_balance = round(float(applicant["balance"] or 0.0) + amount, 2)
+                await db.execute("UPDATE users SET balance = ? WHERE user_id = ?", (new_balance, applicant_id))
+                if bank_org_id > 0:
+                    await db.execute(
+                        "UPDATE organizations SET budget = ? WHERE id = ?",
+                        (round(bank_budget_before - amount, 2), bank_org_id),
+                    )
+                await db.execute(
+                    """
+                    UPDATE loans
+                    SET status = 'approved', bank_officer_id = ?, approval_date = ?
+                    WHERE id = ?
+                    """,
+                    (safe_officer_id, now, safe_loan_id),
+                )
+                status_label = "approved"
+            else:
+                new_balance = round(float(applicant["balance"] or 0.0), 2)
+                await db.execute(
+                    """
+                    UPDATE loans
+                    SET status = 'rejected', bank_officer_id = ?, approval_date = ?
+                    WHERE id = ?
+                    """,
+                    (safe_officer_id, now, safe_loan_id),
+                )
+                status_label = "rejected"
+
+            await db.commit()
+
+        await self.log_player_activity(
+            user_id=applicant_id,
+            activity_type="loan_review",
+            details=f"Кредит #{safe_loan_id}: {status_label}",
+            value=amount if approve else 0.0,
+        )
+        return True, "Кредит одобрен." if approve else "Кредит отклонен.", {
+            "loan_id": safe_loan_id,
+            "applicant_id": applicant_id,
+            "amount": amount,
+            "approved": bool(approve),
+            "applicant_balance": new_balance,
+            "bank_budget_before": bank_budget_before,
+            "reviewed_at": now,
+        }
+
+    async def repay_loan(
+        self,
+        user_id: int,
+        loan_id: int,
+        mode: str = "scheduled",
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        safe_user_id = int(user_id or 0)
+        safe_loan_id = int(loan_id or 0)
+        safe_mode = str(mode or "scheduled").strip().lower()
+        if safe_user_id <= 0 or safe_loan_id <= 0:
+            return False, "Некорректный кредит.", None
+
+        now = datetime.now().isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                """
+                SELECT *
+                FROM loans
+                WHERE id = ? AND applicant_id = ? AND status IN ('approved', 'active')
+                LIMIT 1
+                """,
+                (safe_loan_id, safe_user_id),
+            ) as cursor:
+                loan = await cursor.fetchone()
+            if not loan:
+                await db.rollback()
+                return False, "Активный кредит не найден.", None
+
+            remaining = round(float(loan["remaining_balance"] or 0.0), 2)
+            if remaining <= 0:
+                await db.execute("UPDATE loans SET status = 'paid' WHERE id = ?", (safe_loan_id,))
+                await db.commit()
+                return True, "Кредит уже закрыт.", {"loan_id": safe_loan_id, "remaining_balance": 0.0}
+
+            scheduled = round(float(loan["monthly_payment"] or 0.0), 2)
+            if scheduled <= 0:
+                scheduled = round(float(loan["daily_payment"] or 0.0) * 30, 2)
+            if scheduled <= 0:
+                scheduled = round(max(100.0, remaining * 0.12), 2)
+            payment = remaining if safe_mode == "full" else min(remaining, scheduled)
+
+            async with db.execute("SELECT balance FROM users WHERE user_id = ? LIMIT 1", (safe_user_id,)) as cursor:
+                user = await cursor.fetchone()
+            if not user:
+                await db.rollback()
+                return False, "Игрок не найден.", None
+            balance = round(float(user["balance"] or 0.0), 2)
+            if balance < payment:
+                await db.rollback()
+                return False, f"Не хватает средств. Нужно ${payment:,.2f}.", None
+
+            new_balance = round(balance - payment, 2)
+            new_remaining = round(max(0.0, remaining - payment), 2)
+            new_status = "paid" if new_remaining <= 0 else "active"
+            await db.execute("UPDATE users SET balance = ? WHERE user_id = ?", (new_balance, safe_user_id))
+            await db.execute(
+                """
+                UPDATE loans
+                SET remaining_balance = ?, status = ?, last_payment_date = ?
+                WHERE id = ?
+                """,
+                (new_remaining, new_status, now, safe_loan_id),
+            )
+            async with db.execute(
+                "SELECT id, budget FROM organizations WHERE lower(COALESCE(type, '')) = 'bank' ORDER BY id ASC LIMIT 1"
+            ) as cursor:
+                bank_org = await cursor.fetchone()
+            if bank_org:
+                await db.execute(
+                    "UPDATE organizations SET budget = ? WHERE id = ?",
+                    (round(float(bank_org["budget"] or 0.0) + payment, 2), int(bank_org["id"] or 0)),
+                )
+            await db.commit()
+
+        await self.log_player_activity(
+            user_id=safe_user_id,
+            activity_type="loan_payment",
+            details=f"Платеж по кредиту #{safe_loan_id}",
+            value=payment,
+        )
+        return True, "Платеж принят." if new_remaining > 0 else "Кредит полностью закрыт.", {
+            "loan_id": safe_loan_id,
+            "payment": payment,
+            "remaining_balance": new_remaining,
+            "status": new_status,
+            "balance": new_balance,
+        }
+
     async def get_user_bank_transactions(self, user_id: int, limit: int = 20) -> List[Dict[str, Any]]:
         await self._ensure_bank_transactions_table()
         safe_limit = max(1, min(int(limit or 20), 100))
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 """
@@ -11311,8 +19145,1000 @@ class AsyncDatabase:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
 
+    async def _ensure_enterprise_task_tables(self) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS business_daily_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    business_id INTEGER NOT NULL,
+                    cycle_date TEXT NOT NULL,
+                    required_actions INTEGER DEFAULT 2,
+                    completed_actions INTEGER DEFAULT 0,
+                    status TEXT DEFAULT 'active',
+                    last_action_at TEXT,
+                    updated_date TEXT NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_business_daily_tasks_business_cycle ON business_daily_tasks(business_id, cycle_date)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_business_daily_tasks_cycle ON business_daily_tasks(cycle_date, status)"
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS private_org_daily_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    org_id INTEGER NOT NULL,
+                    cycle_date TEXT NOT NULL,
+                    required_actions INTEGER DEFAULT 2,
+                    completed_actions INTEGER DEFAULT 0,
+                    status TEXT DEFAULT 'active',
+                    last_action_at TEXT,
+                    updated_date TEXT NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_private_org_daily_tasks_org_cycle ON private_org_daily_tasks(org_id, cycle_date)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_private_org_daily_tasks_cycle ON private_org_daily_tasks(cycle_date, status)"
+            )
+            await db.commit()
+
+    def _business_required_actions(self, equipment_level: int) -> int:
+        safe_level = max(1, int(equipment_level or 1))
+        return max(2, min(5, 2 + safe_level // 3))
+
+    def _private_org_required_actions(self, equipment_level: int, members_count: int) -> int:
+        safe_level = max(1, int(equipment_level or 1))
+        safe_members = max(0, int(members_count or 0))
+        required = 2 + safe_level // 4 + safe_members // 5
+        return max(2, min(6, required))
+
+    async def increment_business_daily_task_progress(
+        self,
+        business_id: int,
+        increment: int = 1,
+        cycle_date: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        await self._ensure_enterprise_task_tables()
+        safe_business_id = int(business_id or 0)
+        safe_increment = max(1, min(int(increment or 1), 10))
+        if safe_business_id <= 0:
+            return {"ok": False, "reason": "invalid_business"}
+
+        cycle = (cycle_date or datetime.now().date().isoformat()).strip()
+        now = datetime.now().isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT equipment_level FROM businesses WHERE id = ? LIMIT 1",
+                (safe_business_id,),
+            ) as cursor:
+                biz = await cursor.fetchone()
+            if not biz:
+                await db.rollback()
+                return {"ok": False, "reason": "not_found"}
+
+            required = self._business_required_actions(int(biz["equipment_level"] or 1))
+            await db.execute(
+                """
+                INSERT INTO business_daily_tasks
+                (business_id, cycle_date, required_actions, completed_actions, status, last_action_at, updated_date)
+                VALUES (?, ?, ?, 0, 'active', NULL, ?)
+                ON CONFLICT(business_id, cycle_date) DO UPDATE SET
+                    required_actions = MAX(COALESCE(business_daily_tasks.required_actions, 0), excluded.required_actions),
+                    updated_date = excluded.updated_date
+                """,
+                (safe_business_id, cycle, required, now),
+            )
+            await db.execute(
+                """
+                UPDATE business_daily_tasks
+                SET completed_actions = MIN(required_actions, COALESCE(completed_actions, 0) + ?),
+                    status = CASE
+                        WHEN MIN(required_actions, COALESCE(completed_actions, 0) + ?) >= required_actions THEN 'done'
+                        ELSE 'active'
+                    END,
+                    last_action_at = ?,
+                    updated_date = ?
+                WHERE business_id = ? AND cycle_date = ?
+                """,
+                (safe_increment, safe_increment, now, now, safe_business_id, cycle),
+            )
+            async with db.execute(
+                "SELECT * FROM business_daily_tasks WHERE business_id = ? AND cycle_date = ? LIMIT 1",
+                (safe_business_id, cycle),
+            ) as cursor:
+                row = await cursor.fetchone()
+            await db.commit()
+
+        payload = dict(row) if row else {}
+        req = int(payload.get("required_actions") or required)
+        done = int(payload.get("completed_actions") or 0)
+        efficiency = round(0.35 + 0.65 * min(1.0, (done / req if req > 0 else 0.0)), 4)
+        return {
+            "ok": True,
+            "business_id": safe_business_id,
+            "cycle_date": cycle,
+            "required_actions": req,
+            "completed_actions": done,
+            "status": payload.get("status") or ("done" if done >= req else "active"),
+            "efficiency_factor": efficiency,
+        }
+
+    async def increment_private_org_daily_task_progress(
+        self,
+        org_id: int,
+        increment: int = 1,
+        cycle_date: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        await self._ensure_enterprise_task_tables()
+        safe_org_id = int(org_id or 0)
+        safe_increment = max(1, min(int(increment or 1), 10))
+        if safe_org_id <= 0:
+            return {"ok": False, "reason": "invalid_org"}
+
+        cycle = (cycle_date or datetime.now().date().isoformat()).strip()
+        now = datetime.now().isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT equipment_level FROM private_orgs WHERE id = ? LIMIT 1",
+                (safe_org_id,),
+            ) as cursor:
+                org = await cursor.fetchone()
+            if not org:
+                await db.rollback()
+                return {"ok": False, "reason": "not_found"}
+            async with db.execute(
+                "SELECT COUNT(*) FROM private_org_members WHERE org_id = ?",
+                (safe_org_id,),
+            ) as cursor:
+                member_row = await cursor.fetchone()
+            members_count = int((member_row[0] if member_row else 0) or 0)
+            required = self._private_org_required_actions(int(org["equipment_level"] or 1), members_count)
+
+            await db.execute(
+                """
+                INSERT INTO private_org_daily_tasks
+                (org_id, cycle_date, required_actions, completed_actions, status, last_action_at, updated_date)
+                VALUES (?, ?, ?, 0, 'active', NULL, ?)
+                ON CONFLICT(org_id, cycle_date) DO UPDATE SET
+                    required_actions = MAX(COALESCE(private_org_daily_tasks.required_actions, 0), excluded.required_actions),
+                    updated_date = excluded.updated_date
+                """,
+                (safe_org_id, cycle, required, now),
+            )
+            await db.execute(
+                """
+                UPDATE private_org_daily_tasks
+                SET completed_actions = MIN(required_actions, COALESCE(completed_actions, 0) + ?),
+                    status = CASE
+                        WHEN MIN(required_actions, COALESCE(completed_actions, 0) + ?) >= required_actions THEN 'done'
+                        ELSE 'active'
+                    END,
+                    last_action_at = ?,
+                    updated_date = ?
+                WHERE org_id = ? AND cycle_date = ?
+                """,
+                (safe_increment, safe_increment, now, now, safe_org_id, cycle),
+            )
+            async with db.execute(
+                "SELECT * FROM private_org_daily_tasks WHERE org_id = ? AND cycle_date = ? LIMIT 1",
+                (safe_org_id, cycle),
+            ) as cursor:
+                row = await cursor.fetchone()
+            await db.commit()
+
+        payload = dict(row) if row else {}
+        req = int(payload.get("required_actions") or required)
+        done = int(payload.get("completed_actions") or 0)
+        efficiency = round(0.35 + 0.65 * min(1.0, (done / req if req > 0 else 0.0)), 4)
+        return {
+            "ok": True,
+            "org_id": safe_org_id,
+            "cycle_date": cycle,
+            "required_actions": req,
+            "completed_actions": done,
+            "status": payload.get("status") or ("done" if done >= req else "active"),
+            "efficiency_factor": efficiency,
+        }
+
+    async def get_business_daily_task_status(
+        self,
+        business_id: int,
+        cycle_date: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        await self._ensure_enterprise_task_tables()
+        safe_business_id = int(business_id or 0)
+        cycle = (cycle_date or datetime.now().date().isoformat()).strip()
+        now = datetime.now().isoformat()
+        if safe_business_id <= 0:
+            return {
+                "business_id": safe_business_id,
+                "cycle_date": cycle,
+                "required_actions": 2,
+                "completed_actions": 0,
+                "status": "active",
+                "efficiency_factor": 0.35,
+            }
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT equipment_level FROM businesses WHERE id = ? LIMIT 1",
+                (safe_business_id,),
+            ) as cursor:
+                biz = await cursor.fetchone()
+            if not biz:
+                await db.rollback()
+                return {
+                    "business_id": safe_business_id,
+                    "cycle_date": cycle,
+                    "required_actions": 2,
+                    "completed_actions": 0,
+                    "status": "active",
+                    "efficiency_factor": 0.35,
+                }
+
+            required = self._business_required_actions(int(biz["equipment_level"] or 1))
+            await db.execute(
+                """
+                INSERT INTO business_daily_tasks
+                (business_id, cycle_date, required_actions, completed_actions, status, last_action_at, updated_date)
+                VALUES (?, ?, ?, 0, 'active', NULL, ?)
+                ON CONFLICT(business_id, cycle_date) DO UPDATE SET
+                    required_actions = MAX(COALESCE(business_daily_tasks.required_actions, 0), excluded.required_actions),
+                    updated_date = excluded.updated_date
+                """,
+                (safe_business_id, cycle, required, now),
+            )
+            async with db.execute(
+                "SELECT * FROM business_daily_tasks WHERE business_id = ? AND cycle_date = ? LIMIT 1",
+                (safe_business_id, cycle),
+            ) as cursor:
+                row = await cursor.fetchone()
+            await db.commit()
+
+        payload = dict(row) if row else {}
+        req = int(payload.get("required_actions") or required)
+        done = int(payload.get("completed_actions") or 0)
+        efficiency = round(0.35 + 0.65 * min(1.0, (done / req if req > 0 else 0.0)), 4)
+        payload.update(
+            {
+                "business_id": safe_business_id,
+                "cycle_date": cycle,
+                "required_actions": req,
+                "completed_actions": done,
+                "status": payload.get("status") or ("done" if done >= req else "active"),
+                "efficiency_factor": efficiency,
+                "remaining_actions": max(0, req - done),
+            }
+        )
+        return payload
+
+    async def get_private_org_daily_task_status(
+        self,
+        org_id: int,
+        cycle_date: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        await self._ensure_enterprise_task_tables()
+        safe_org_id = int(org_id or 0)
+        cycle = (cycle_date or datetime.now().date().isoformat()).strip()
+        now = datetime.now().isoformat()
+        if safe_org_id <= 0:
+            return {
+                "org_id": safe_org_id,
+                "cycle_date": cycle,
+                "required_actions": 2,
+                "completed_actions": 0,
+                "status": "active",
+                "efficiency_factor": 0.35,
+            }
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT equipment_level FROM private_orgs WHERE id = ? LIMIT 1",
+                (safe_org_id,),
+            ) as cursor:
+                org = await cursor.fetchone()
+            if not org:
+                await db.rollback()
+                return {
+                    "org_id": safe_org_id,
+                    "cycle_date": cycle,
+                    "required_actions": 2,
+                    "completed_actions": 0,
+                    "status": "active",
+                    "efficiency_factor": 0.35,
+                }
+            async with db.execute(
+                "SELECT COUNT(*) FROM private_org_members WHERE org_id = ?",
+                (safe_org_id,),
+            ) as cursor:
+                member_row = await cursor.fetchone()
+            members_count = int((member_row[0] if member_row else 0) or 0)
+            required = self._private_org_required_actions(int(org["equipment_level"] or 1), members_count)
+            await db.execute(
+                """
+                INSERT INTO private_org_daily_tasks
+                (org_id, cycle_date, required_actions, completed_actions, status, last_action_at, updated_date)
+                VALUES (?, ?, ?, 0, 'active', NULL, ?)
+                ON CONFLICT(org_id, cycle_date) DO UPDATE SET
+                    required_actions = MAX(COALESCE(private_org_daily_tasks.required_actions, 0), excluded.required_actions),
+                    updated_date = excluded.updated_date
+                """,
+                (safe_org_id, cycle, required, now),
+            )
+            async with db.execute(
+                "SELECT * FROM private_org_daily_tasks WHERE org_id = ? AND cycle_date = ? LIMIT 1",
+                (safe_org_id, cycle),
+            ) as cursor:
+                row = await cursor.fetchone()
+            await db.commit()
+
+        payload = dict(row) if row else {}
+        req = int(payload.get("required_actions") or required)
+        done = int(payload.get("completed_actions") or 0)
+        efficiency = round(0.35 + 0.65 * min(1.0, (done / req if req > 0 else 0.0)), 4)
+        payload.update(
+            {
+                "org_id": safe_org_id,
+                "cycle_date": cycle,
+                "required_actions": req,
+                "completed_actions": done,
+                "status": payload.get("status") or ("done" if done >= req else "active"),
+                "efficiency_factor": efficiency,
+                "remaining_actions": max(0, req - done),
+            }
+        )
+        return payload
+
+    async def process_hourly_salary_to_bank(self, hour_slot: Optional[str] = None) -> Dict[str, Any]:
+        """Почасовое начисление зарплат на банковский счет (с учетом бюджета организаций)."""
+        await self._ensure_bank_transactions_table()
+        raw_slot = (hour_slot or datetime.now().strftime("%Y-%m-%d %H")).strip()
+        slot = raw_slot[:13]
+        checkpoint_key = "economy_hourly_salary_slot"
+        if await self.get_system_state(checkpoint_key) == slot:
+            return {"status": "already_processed", "slot": slot, "paid_users": 0, "total_paid": 0.0}
+
+        now = datetime.now().isoformat()
+        paid_users = 0
+        partial_org_payments = 0
+        total_paid = 0.0
+        total_citizen_paid = 0.0
+        total_org_paid = 0.0
+        payments: List[Dict[str, Any]] = []
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            # Миграция legacy-поля users.job -> users.citizen_job:
+            # в старых профилях вакансия могла храниться только в users.job,
+            # из-за чего почасовая зарплата по вакансиям не начислялась.
+            await db.execute(
+                """
+                UPDATE users
+                SET citizen_job = TRIM(COALESCE(job, '')),
+                    citizen_salary = CASE
+                        WHEN COALESCE(citizen_salary, 0) > 0 THEN COALESCE(citizen_salary, 0)
+                        WHEN COALESCE(salary, 0) > 0 THEN COALESCE(salary, 0)
+                        ELSE ?
+                    END
+                WHERE COALESCE(citizen_job, '') = ''
+                  AND COALESCE(TRIM(COALESCE(job, '')), '') <> ''
+                """,
+                (float(MIN_CITIZEN_HOURLY_SALARY),),
+            )
+            # В части профилей могла сохраниться только citizen_salary без названия должности.
+            # Для почасовой системы это валидный рабочий профиль, поэтому авто-восстанавливаем должность.
+            await db.execute(
+                """
+                UPDATE users
+                SET citizen_job = 'Гражданская должность'
+                WHERE COALESCE(TRIM(COALESCE(citizen_job, '')), '') = ''
+                  AND COALESCE(citizen_salary, 0) > 0
+                """
+            )
+            async with db.execute("SELECT id, name, COALESCE(budget, 0) AS budget FROM organizations") as cursor:
+                org_rows = await cursor.fetchall()
+            org_budgets: Dict[int, float] = {
+                int(row["id"]): round(float(row["budget"] or 0), 2) for row in org_rows if int(row["id"] or 0) > 0
+            }
+            org_names: Dict[int, str] = {
+                int(row["id"]): str(row["name"] or f"Организация #{int(row['id'] or 0)}")
+                for row in org_rows
+                if int(row["id"] or 0) > 0
+            }
+
+            async with db.execute(
+                """
+                SELECT u.user_id,
+                       COALESCE(u.balance, 0) AS balance,
+                       COALESCE(u.bank, 0) AS bank,
+                       COALESCE(u.citizen_salary, 0) AS citizen_salary,
+                       COALESCE(u.citizen_job, '') AS citizen_job,
+                       COALESCE(u.job, '') AS legacy_job,
+                       COALESCE(u.salary, 0) AS common_salary,
+                       om.org_id,
+                       COALESCE(om.salary, 0) AS org_salary
+                FROM users u
+                LEFT JOIN organization_members om
+                    ON om.id = (
+                        SELECT om2.id
+                        FROM organization_members om2
+                        WHERE om2.user_id = u.user_id
+                        ORDER BY COALESCE(om2.salary, 0) DESC, om2.id ASC
+                        LIMIT 1
+                    )
+                ORDER BY u.user_id ASC
+                """
+            ) as cursor:
+                users = await cursor.fetchall()
+
+            for row in users:
+                user_id = int(row["user_id"] or 0)
+                if user_id <= 0:
+                    continue
+                balance_before = round(float(row["balance"] or 0), 2)
+                bank_before = round(float(row["bank"] or 0), 2)
+
+                citizen_job = str(row["citizen_job"] or "").strip()
+                legacy_job = str(row["legacy_job"] or "").strip()
+                effective_citizen_job = citizen_job or legacy_job
+                citizen_salary_raw = round(float(row["citizen_salary"] or 0.0), 2)
+                common_salary_raw = round(float(row["common_salary"] or 0.0), 2)
+                has_salary_profile = citizen_salary_raw > 0
+                has_job_profile = bool(effective_citizen_job)
+                citizen_hourly = 0.0
+                if has_job_profile or has_salary_profile:
+                    base_citizen_salary = (
+                        citizen_salary_raw
+                        if citizen_salary_raw > 0
+                        else (common_salary_raw if has_job_profile and common_salary_raw > 0 else MIN_CITIZEN_HOURLY_SALARY)
+                    )
+                    citizen_hourly = round(max(MIN_CITIZEN_HOURLY_SALARY, base_citizen_salary), 2)
+                if (not citizen_job) and legacy_job and citizen_hourly > 0:
+                    await db.execute(
+                        """
+                        UPDATE users
+                        SET citizen_job = ?,
+                            citizen_salary = CASE
+                                WHEN COALESCE(citizen_salary, 0) > 0 THEN citizen_salary
+                                ELSE ?
+                            END
+                        WHERE user_id = ?
+                        """,
+                        (legacy_job, citizen_hourly, user_id),
+                    )
+                elif (not citizen_job) and (not legacy_job) and has_salary_profile and citizen_hourly > 0:
+                    await db.execute(
+                        """
+                        UPDATE users
+                        SET citizen_job = 'Гражданская должность'
+                        WHERE user_id = ?
+                        """,
+                        (user_id,),
+                    )
+
+                org_id = int(row["org_id"] or 0)
+                org_hourly = round(float(row["org_salary"] or 0), 2) if org_id > 0 else 0.0
+                org_hourly_paid = 0.0
+                if org_id > 0 and org_hourly > 0:
+                    available = round(float(org_budgets.get(org_id, 0.0)), 2)
+                    org_hourly_paid = round(min(org_hourly, available), 2)
+                    org_budgets[org_id] = round(max(0.0, available - org_hourly_paid), 2)
+                    if org_hourly_paid < org_hourly:
+                        partial_org_payments += 1
+
+                payout = round(citizen_hourly + org_hourly_paid, 2)
+                if payout <= 0:
+                    continue
+
+                bank_after = round(bank_before + payout, 2)
+                await db.execute(
+                    "UPDATE users SET bank = ? WHERE user_id = ?",
+                    (bank_after, user_id),
+                )
+                await db.execute(
+                    """
+                    INSERT INTO bank_transactions
+                    (user_id, tx_type, amount, balance_before, balance_after, bank_before, bank_after, note, created_date)
+                    VALUES (?, 'salary_hourly', ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        payout,
+                        balance_before,
+                        balance_before,
+                        bank_before,
+                        bank_after,
+                        "Почасовая зарплата зачислена на банковский счет",
+                        now,
+                    ),
+                )
+                await db.execute(
+                    """
+                    INSERT INTO player_activity_log
+                    (user_id, activity_type, details, value, created_date)
+                    VALUES (?, 'salary_received', ?, ?, ?)
+                    """,
+                    (user_id, "Почасовая зарплата зачислена на банковский счет", payout, now),
+                )
+
+                payments.append(
+                    {
+                        "user_id": user_id,
+                        "payout_total": payout,
+                        "citizen_part": citizen_hourly,
+                        "citizen_job_title": effective_citizen_job,
+                        "org_part": org_hourly_paid,
+                        "org_expected": org_hourly,
+                        "org_name": org_names.get(org_id, ""),
+                        "bank_before": bank_before,
+                        "bank_after": bank_after,
+                    }
+                )
+
+                paid_users += 1
+                total_paid = round(total_paid + payout, 2)
+                total_citizen_paid = round(total_citizen_paid + citizen_hourly, 2)
+                total_org_paid = round(total_org_paid + org_hourly_paid, 2)
+
+            for org_id, budget_value in org_budgets.items():
+                await db.execute(
+                    "UPDATE organizations SET budget = ? WHERE id = ?",
+                    (round(max(0.0, float(budget_value or 0)), 2), int(org_id)),
+                )
+
+            await db.commit()
+
+        await self.set_system_state(checkpoint_key, slot)
+        # Legacy daily-key maintained only for compatibility with older analytics.
+        await self.set_system_state("economy_daily_salary_slot", slot[:10])
+        return {
+            "status": "processed",
+            "slot": slot,
+            "paid_users": paid_users,
+            "partial_org_payments": partial_org_payments,
+            "total_paid": total_paid,
+            "total_citizen_paid": total_citizen_paid,
+            "total_org_paid": total_org_paid,
+            "payments": payments,
+        }
+
+    async def apply_hourly_bank_interest(
+        self,
+        hour_slot: Optional[str] = None,
+        base_rate: float = 0.00025,
+    ) -> Dict[str, Any]:
+        """Почасовые проценты на банковский счет."""
+        await self._ensure_bank_transactions_table()
+        await self._ensure_bank_interest_carry_table()
+        slot = (hour_slot or datetime.now().strftime("%Y-%m-%d %H")).strip()[:13]
+        checkpoint_key = "economy_hourly_bank_interest_slot"
+        if await self.get_system_state(checkpoint_key) == slot:
+            return {"status": "already_processed", "slot": slot, "credited_users": 0, "total_interest": 0.0}
+
+        now = datetime.now().isoformat()
+        credited_users = 0
+        total_interest = 0.0
+        safe_base_rate = max(0.0, min(float(base_rate or 0.00025), 0.01))
+        credits: List[Dict[str, Any]] = []
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT user_id, COALESCE(balance, 0) AS balance, COALESCE(bank, 0) AS bank, COALESCE(education, 1) AS education, COALESCE(reputation, 50) AS reputation FROM users WHERE COALESCE(bank, 0) > 0"
+            ) as cursor:
+                users = await cursor.fetchall()
+            async with db.execute(
+                "SELECT user_id, COALESCE(carry, 0) AS carry FROM bank_interest_carry"
+            ) as cursor:
+                carry_rows = await cursor.fetchall()
+            carry_map: Dict[int, float] = {
+                int(row["user_id"]): float(row["carry"] or 0.0)
+                for row in carry_rows
+                if int(row["user_id"] or 0) > 0
+            }
+
+            for row in users:
+                user_id = int(row["user_id"] or 0)
+                if user_id <= 0:
+                    continue
+                balance_before = round(float(row["balance"] or 0), 2)
+                bank_before = round(float(row["bank"] or 0), 2)
+                if bank_before <= 0:
+                    continue
+
+                education = int(row["education"] or 1)
+                reputation = float(row["reputation"] or 50.0)
+                edu_bonus = max(0.0, min((education - 1) * 0.00001, 0.00012))
+                rep_bonus = max(0.0, min((reputation - 50.0) * 0.000002, 0.00012))
+                rate = safe_base_rate + edu_bonus + rep_bonus
+                carry_before = max(0.0, float(carry_map.get(user_id, 0.0) or 0.0))
+                raw_interest = max(0.0, bank_before * rate + carry_before)
+                interest_cents = int(raw_interest * 100.0 + 1e-9)
+                interest = round(interest_cents / 100.0, 2)
+                carry_after = round(max(0.0, raw_interest - interest), 8)
+                if interest <= 0:
+                    if carry_after > 0:
+                        await db.execute(
+                            """
+                            INSERT INTO bank_interest_carry (user_id, carry, updated_date)
+                            VALUES (?, ?, ?)
+                            ON CONFLICT(user_id) DO UPDATE SET
+                                carry = excluded.carry,
+                                updated_date = excluded.updated_date
+                            """,
+                            (user_id, carry_after, now),
+                        )
+                    else:
+                        await db.execute(
+                            "DELETE FROM bank_interest_carry WHERE user_id = ?",
+                            (user_id,),
+                        )
+                    continue
+
+                bank_after = round(bank_before + interest, 2)
+                await db.execute(
+                    "UPDATE users SET bank = ? WHERE user_id = ?",
+                    (bank_after, user_id),
+                )
+                await db.execute(
+                    """
+                    INSERT INTO bank_transactions
+                    (user_id, tx_type, amount, balance_before, balance_after, bank_before, bank_after, note, created_date)
+                    VALUES (?, 'bank_interest', ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        interest,
+                        balance_before,
+                        balance_before,
+                        bank_before,
+                        bank_after,
+                        f"Почасовой банковский процент ({rate * 100:.4f}%/ч)",
+                        now,
+                    ),
+                )
+                await db.execute(
+                    """
+                    INSERT INTO player_activity_log
+                    (user_id, activity_type, details, value, created_date)
+                    VALUES (?, 'bank_interest', ?, ?, ?)
+                    """,
+                    (user_id, "Почасовые проценты на банковский счет", interest, now),
+                )
+                if carry_after > 0:
+                    await db.execute(
+                        """
+                        INSERT INTO bank_interest_carry (user_id, carry, updated_date)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(user_id) DO UPDATE SET
+                            carry = excluded.carry,
+                            updated_date = excluded.updated_date
+                        """,
+                        (user_id, carry_after, now),
+                    )
+                else:
+                    await db.execute(
+                        "DELETE FROM bank_interest_carry WHERE user_id = ?",
+                        (user_id,),
+                    )
+                credited_users += 1
+                total_interest = round(total_interest + interest, 2)
+                credits.append(
+                    {
+                        "user_id": user_id,
+                        "amount": interest,
+                        "rate": rate,
+                        "carry_before": carry_before,
+                        "carry_after": carry_after,
+                        "bank_before": bank_before,
+                        "bank_after": bank_after,
+                    }
+                )
+
+            await db.commit()
+
+        await self.set_system_state(checkpoint_key, slot)
+        return {
+            "status": "processed",
+            "slot": slot,
+            "credited_users": credited_users,
+            "total_interest": total_interest,
+            "base_rate": safe_base_rate,
+            "credits": credits,
+        }
+
+    async def run_hourly_enterprise_income(self, hour_slot: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Почасовой автодоход бизнеса и частных организаций.
+        Эффективность зависит от выполнения ежедневных задач.
+        """
+        await self._ensure_enterprise_task_tables()
+        slot = (hour_slot or datetime.now().strftime("%Y-%m-%d %H")).strip()[:13]
+        checkpoint_key = "economy_hourly_enterprise_slot"
+        if await self.get_system_state(checkpoint_key) == slot:
+            return {
+                "status": "already_processed",
+                "slot": slot,
+                "businesses_processed": 0,
+                "private_orgs_processed": 0,
+            }
+
+        now = datetime.now().isoformat()
+        cycle_date = slot[:10]
+        businesses_processed = 0
+        private_orgs_processed = 0
+        business_total_net = 0.0
+        private_org_total_net = 0.0
+        owner_dividend_total = 0.0
+        leader_bonus_total = 0.0
+        owner_credits: List[Dict[str, Any]] = []
+        leader_credits: List[Dict[str, Any]] = []
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+
+            async with db.execute(
+                """
+                SELECT b.id, b.owner_id, b.budget, b.income_daily, b.expense_daily, b.equipment_level
+                FROM businesses b
+                WHERE COALESCE(b.status, 'active') = 'active'
+                ORDER BY b.id ASC
+                """
+            ) as cursor:
+                businesses = await cursor.fetchall()
+            async with db.execute("SELECT business_id, COALESCE(raw_materials, 0) AS raw_materials FROM business_resources") as cursor:
+                raw_business_rows = await cursor.fetchall()
+            business_raw_map = {int(r["business_id"]): round(float(r["raw_materials"] or 0), 4) for r in raw_business_rows if int(r["business_id"] or 0) > 0}
+
+            for biz in businesses:
+                business_id = int(biz["id"] or 0)
+                owner_id = int(biz["owner_id"] or 0)
+                budget = round(float(biz["budget"] or 0), 2)
+                income_daily = max(0.0, float(biz["income_daily"] or 0.0))
+                expense_daily = max(0.0, float(biz["expense_daily"] or 0.0))
+                equipment_level = max(1, int(biz["equipment_level"] or 1))
+                required_actions = self._business_required_actions(equipment_level)
+                await db.execute(
+                    """
+                    INSERT INTO business_daily_tasks
+                    (business_id, cycle_date, required_actions, completed_actions, status, last_action_at, updated_date)
+                    VALUES (?, ?, ?, 0, 'active', NULL, ?)
+                    ON CONFLICT(business_id, cycle_date) DO UPDATE SET
+                        required_actions = MAX(COALESCE(business_daily_tasks.required_actions, 0), excluded.required_actions),
+                        updated_date = excluded.updated_date
+                    """,
+                    (business_id, cycle_date, required_actions, now),
+                )
+                async with db.execute(
+                    "SELECT required_actions, completed_actions FROM business_daily_tasks WHERE business_id = ? AND cycle_date = ? LIMIT 1",
+                    (business_id, cycle_date),
+                ) as cursor:
+                    task = await cursor.fetchone()
+                req = int(task["required_actions"] or required_actions) if task else required_actions
+                done = int(task["completed_actions"] or 0) if task else 0
+                progress = min(1.0, (done / req if req > 0 else 0.0))
+                efficiency = 0.35 + (0.65 * progress)
+
+                raw_available = round(float(business_raw_map.get(business_id, 0.0)), 4)
+                raw_need = max(0.4, (income_daily / 2400.0))
+                raw_factor = 1.0
+                raw_used = 0.0
+                if raw_available <= 0.001:
+                    raw_factor = 0.55
+                else:
+                    raw_used = round(min(raw_available, raw_need), 4)
+                    if raw_used < raw_need * 0.5:
+                        raw_factor = 0.75
+                    business_raw_map[business_id] = round(max(0.0, raw_available - raw_used), 4)
+
+                variation = random.uniform(0.92, 1.08)
+                gross_hourly = (income_daily / 24.0) * efficiency * raw_factor * variation
+                expense_hourly = expense_daily / 24.0
+                net = round(gross_hourly - expense_hourly, 2)
+                budget_after = round(max(0.0, budget + net), 2)
+                owner_dividend = round(max(0.0, net * 0.22), 2)
+
+                await db.execute(
+                    "UPDATE businesses SET budget = ?, last_income_date = ? WHERE id = ?",
+                    (budget_after, now, business_id),
+                )
+                await db.execute(
+                    """
+                    UPDATE business_daily_tasks
+                    SET status = CASE WHEN COALESCE(completed_actions, 0) >= COALESCE(required_actions, 1) THEN 'done' ELSE 'active' END,
+                        updated_date = ?
+                    WHERE business_id = ? AND cycle_date = ?
+                    """,
+                    (now, business_id, cycle_date),
+                )
+                if raw_used > 0:
+                    await db.execute(
+                        """
+                        INSERT INTO business_resources (business_id, raw_materials, daily_consumption, last_order_date, updated_date)
+                        VALUES (?, ?, ?, NULL, ?)
+                        ON CONFLICT(business_id) DO UPDATE SET
+                            raw_materials = ?,
+                            daily_consumption = COALESCE(daily_consumption, 0) + ?,
+                            updated_date = excluded.updated_date
+                        """,
+                        (
+                            business_id,
+                            business_raw_map.get(business_id, 0.0),
+                            raw_used,
+                            now,
+                            business_raw_map.get(business_id, 0.0),
+                            raw_used,
+                        ),
+                    )
+                if owner_id > 0 and owner_dividend > 0:
+                    await db.execute(
+                        "UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE user_id = ?",
+                        (owner_dividend, owner_id),
+                    )
+                    owner_credits.append(
+                        {
+                            "user_id": owner_id,
+                            "amount": owner_dividend,
+                            "business_id": business_id,
+                        }
+                    )
+
+                businesses_processed += 1
+                business_total_net = round(business_total_net + net, 2)
+                owner_dividend_total = round(owner_dividend_total + owner_dividend, 2)
+
+            async with db.execute(
+                """
+                SELECT po.id, po.leader_id, po.budget, po.equipment_level
+                FROM private_orgs po
+                WHERE COALESCE(po.status, 'active') = 'active'
+                ORDER BY po.id ASC
+                """
+            ) as cursor:
+                private_orgs = await cursor.fetchall()
+            async with db.execute(
+                "SELECT org_id, COUNT(*) AS members_count FROM private_org_members GROUP BY org_id"
+            ) as cursor:
+                member_rows = await cursor.fetchall()
+            member_map = {int(r["org_id"]): int(r["members_count"] or 0) for r in member_rows if int(r["org_id"] or 0) > 0}
+            async with db.execute("SELECT org_id, COALESCE(raw_materials, 0) AS raw_materials FROM private_org_resources") as cursor:
+                private_raw_rows = await cursor.fetchall()
+            private_raw_map = {int(r["org_id"]): round(float(r["raw_materials"] or 0), 4) for r in private_raw_rows if int(r["org_id"] or 0) > 0}
+
+            for org in private_orgs:
+                org_id = int(org["id"] or 0)
+                leader_id = int(org["leader_id"] or 0)
+                budget = round(float(org["budget"] or 0), 2)
+                equipment_level = max(1, int(org["equipment_level"] or 1))
+                members_count = int(member_map.get(org_id, 0))
+                required_actions = self._private_org_required_actions(equipment_level, members_count)
+                await db.execute(
+                    """
+                    INSERT INTO private_org_daily_tasks
+                    (org_id, cycle_date, required_actions, completed_actions, status, last_action_at, updated_date)
+                    VALUES (?, ?, ?, 0, 'active', NULL, ?)
+                    ON CONFLICT(org_id, cycle_date) DO UPDATE SET
+                        required_actions = MAX(COALESCE(private_org_daily_tasks.required_actions, 0), excluded.required_actions),
+                        updated_date = excluded.updated_date
+                    """,
+                    (org_id, cycle_date, required_actions, now),
+                )
+                async with db.execute(
+                    "SELECT required_actions, completed_actions FROM private_org_daily_tasks WHERE org_id = ? AND cycle_date = ? LIMIT 1",
+                    (org_id, cycle_date),
+                ) as cursor:
+                    task = await cursor.fetchone()
+                req = int(task["required_actions"] or required_actions) if task else required_actions
+                done = int(task["completed_actions"] or 0) if task else 0
+                progress = min(1.0, (done / req if req > 0 else 0.0))
+                efficiency = 0.35 + (0.65 * progress)
+
+                raw_available = round(float(private_raw_map.get(org_id, 0.0)), 4)
+                raw_need = max(0.5, members_count * 0.08 + equipment_level * 0.12)
+                raw_factor = 1.0
+                raw_used = 0.0
+                if raw_available <= 0.001:
+                    raw_factor = 0.55
+                else:
+                    raw_used = round(min(raw_available, raw_need), 4)
+                    if raw_used < raw_need * 0.5:
+                        raw_factor = 0.78
+                    private_raw_map[org_id] = round(max(0.0, raw_available - raw_used), 4)
+
+                base_revenue_hour = 80.0 + members_count * 18.0 + equipment_level * 26.0
+                base_cost_hour = 50.0 + members_count * 9.0 + equipment_level * 4.0
+                variation = random.uniform(0.90, 1.10)
+                gross_hourly = base_revenue_hour * efficiency * raw_factor * variation
+                net = round(gross_hourly - base_cost_hour, 2)
+                budget_after = round(max(0.0, budget + net), 2)
+                leader_bonus = round(max(0.0, net * 0.10), 2)
+
+                await db.execute(
+                    "UPDATE private_orgs SET budget = ? WHERE id = ?",
+                    (budget_after, org_id),
+                )
+                await db.execute(
+                    """
+                    UPDATE private_org_daily_tasks
+                    SET status = CASE WHEN COALESCE(completed_actions, 0) >= COALESCE(required_actions, 1) THEN 'done' ELSE 'active' END,
+                        updated_date = ?
+                    WHERE org_id = ? AND cycle_date = ?
+                    """,
+                    (now, org_id, cycle_date),
+                )
+                if raw_used > 0:
+                    await db.execute(
+                        """
+                        INSERT INTO private_org_resources (org_id, raw_materials, daily_consumption, last_order_date, updated_date)
+                        VALUES (?, ?, ?, NULL, ?)
+                        ON CONFLICT(org_id) DO UPDATE SET
+                            raw_materials = ?,
+                            daily_consumption = COALESCE(daily_consumption, 0) + ?,
+                            updated_date = excluded.updated_date
+                        """,
+                        (
+                            org_id,
+                            private_raw_map.get(org_id, 0.0),
+                            raw_used,
+                            now,
+                            private_raw_map.get(org_id, 0.0),
+                            raw_used,
+                        ),
+                    )
+                if leader_id > 0 and leader_bonus > 0:
+                    await db.execute(
+                        "UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE user_id = ?",
+                        (leader_bonus, leader_id),
+                    )
+                    leader_credits.append(
+                        {
+                            "user_id": leader_id,
+                            "amount": leader_bonus,
+                            "org_id": org_id,
+                        }
+                    )
+
+                private_orgs_processed += 1
+                private_org_total_net = round(private_org_total_net + net, 2)
+                leader_bonus_total = round(leader_bonus_total + leader_bonus, 2)
+
+            await db.commit()
+
+        await self.set_system_state(checkpoint_key, slot)
+        return {
+            "status": "processed",
+            "slot": slot,
+            "cycle_date": cycle_date,
+            "businesses_processed": businesses_processed,
+            "private_orgs_processed": private_orgs_processed,
+            "business_total_net": business_total_net,
+            "private_org_total_net": private_org_total_net,
+            "owner_dividend_total": owner_dividend_total,
+            "leader_bonus_total": leader_bonus_total,
+            "owner_credits": owner_credits,
+            "leader_credits": leader_credits,
+        }
+
     async def _ensure_police_court_tables(self) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS court_cases (
@@ -11332,11 +20158,22 @@ class AsyncDatabase:
                 )
                 """
             )
+            async with db.execute("PRAGMA table_info(court_cases)") as cursor:
+                cols = [str(row[1]).lower() for row in await cursor.fetchall()]
+            if "parent_case_id" not in cols:
+                await db.execute("ALTER TABLE court_cases ADD COLUMN parent_case_id INTEGER")
+            if "hearing_date" not in cols:
+                await db.execute("ALTER TABLE court_cases ADD COLUMN hearing_date TEXT")
+            if "priority" not in cols:
+                await db.execute("ALTER TABLE court_cases ADD COLUMN priority INTEGER DEFAULT 0")
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_court_cases_status ON court_cases(status, created_date DESC)"
             )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_court_cases_defendant ON court_cases(defendant_id, created_date DESC)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_court_cases_parent ON court_cases(parent_case_id, created_date DESC)"
             )
             await db.execute(
                 """
@@ -11365,7 +20202,494 @@ class AsyncDatabase:
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_police_arrests_status ON police_arrests(status, created_date DESC)"
             )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS court_case_evidence (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    case_id INTEGER NOT NULL,
+                    author_id INTEGER NOT NULL,
+                    evidence_type TEXT DEFAULT 'statement',
+                    content TEXT NOT NULL,
+                    is_secret INTEGER DEFAULT 0,
+                    created_date TEXT NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_court_case_evidence_case ON court_case_evidence(case_id, created_date DESC)"
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS court_case_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    case_id INTEGER NOT NULL,
+                    actor_id INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    event_text TEXT,
+                    created_date TEXT NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_court_case_events_case ON court_case_events(case_id, created_date DESC)"
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS security_investigations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agency TEXT NOT NULL,
+                    investigator_id INTEGER NOT NULL,
+                    target_id INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    cost REAL NOT NULL DEFAULT 0,
+                    started_at TEXT NOT NULL,
+                    ready_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    access_expires_at TEXT,
+                    notes TEXT,
+                    created_date TEXT NOT NULL,
+                    updated_date TEXT NOT NULL
+                )
+                """
+            )
+            async with db.execute("PRAGMA table_info(security_investigations)") as cursor:
+                inv_cols = [str(row[1]).lower() for row in await cursor.fetchall()]
+            if "completed_at" not in inv_cols:
+                await db.execute("ALTER TABLE security_investigations ADD COLUMN completed_at TEXT")
+            if "access_expires_at" not in inv_cols:
+                await db.execute("ALTER TABLE security_investigations ADD COLUMN access_expires_at TEXT")
+            if "notes" not in inv_cols:
+                await db.execute("ALTER TABLE security_investigations ADD COLUMN notes TEXT")
+            if "created_date" not in inv_cols:
+                await db.execute("ALTER TABLE security_investigations ADD COLUMN created_date TEXT")
+            if "updated_date" not in inv_cols:
+                await db.execute("ALTER TABLE security_investigations ADD COLUMN updated_date TEXT")
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_security_inv_actor ON security_investigations(investigator_id, status, ready_at)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_security_inv_target ON security_investigations(target_id, status, ready_at)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_security_inv_agency ON security_investigations(agency, status, ready_at)"
+            )
             await db.commit()
+
+    def _security_investigation_settings(self, agency: str) -> Optional[Dict[str, Any]]:
+        agency_lc = str(agency or "").strip().lower()
+        cfg = SECURITY_INVESTIGATION_CONFIG.get(agency_lc)
+        if not cfg:
+            return None
+        return {
+            "agency": agency_lc,
+            "cost": round(max(0.0, float(cfg.get("cost") or 0.0)), 2),
+            "duration_minutes": max(1, int(cfg.get("duration_minutes") or 60)),
+            "access_minutes": max(30, int(SECURITY_INVESTIGATION_ACCESS_MINUTES or 1440)),
+        }
+
+    async def _is_security_agency_actor(
+        self,
+        actor_id: int,
+        agency: str,
+        actor: Optional[Dict[str, Any]] = None,
+        authority: Optional[str] = None,
+    ) -> bool:
+        safe_actor = int(actor_id or 0)
+        agency_lc = str(agency or "").strip().lower()
+        if safe_actor <= 0 or agency_lc not in {"police", "fbi"}:
+            return False
+
+        info = actor or await self.get_user(safe_actor) or {}
+        role_lc = str(info.get("role") or "").lower()
+        org_lc = str(info.get("organization") or "").lower()
+        authority_lc = (authority or await self.get_government_authority(safe_actor) or "").strip().lower()
+
+        is_police_actor = (
+            ("полиц" in role_lc)
+            or ("police" in role_lc)
+            or ("полиц" in org_lc)
+            or ("police" in org_lc)
+            or await self.is_user_in_org_type(safe_actor, "police")
+        )
+        is_fbi_actor = (
+            ("фбр" in role_lc)
+            or ("fbi" in role_lc)
+            or ("фбр" in org_lc)
+            or ("fbi" in org_lc)
+            or await self.is_fbi_agent(safe_actor)
+            or await self.is_user_in_org_type(safe_actor, "fbi")
+        )
+
+        if agency_lc == "police":
+            return bool(is_police_actor or is_fbi_actor or authority_lc in {"president", "vice_president", "minister"})
+        return bool(is_fbi_actor or authority_lc in {"president", "vice_president", "minister"})
+
+    async def _refresh_security_investigation_statuses(self, db: aiosqlite.Connection) -> None:
+        now = datetime.now().isoformat()
+        await db.execute(
+            """
+            UPDATE security_investigations
+            SET status = 'completed',
+                completed_at = COALESCE(completed_at, ready_at),
+                updated_date = ?
+            WHERE status = 'pending' AND ready_at <= ?
+            """,
+            (now, now),
+        )
+        await db.execute(
+            """
+            UPDATE security_investigations
+            SET status = 'expired',
+                updated_date = ?
+            WHERE status = 'completed'
+              AND COALESCE(access_expires_at, '') != ''
+              AND access_expires_at < ?
+            """,
+            (now, now),
+        )
+
+    async def start_security_investigation(
+        self,
+        actor_id: int,
+        target_id: int,
+        agency: str,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        await self._ensure_police_court_tables()
+        safe_actor = int(actor_id or 0)
+        safe_target = int(target_id or 0)
+        if safe_actor <= 0 or safe_target <= 0:
+            return False, "Некорректные параметры расследования.", None
+        if safe_actor == safe_target:
+            return False, "Нельзя проводить расследование против самого себя.", None
+
+        settings = self._security_investigation_settings(agency)
+        if not settings:
+            return False, "Неизвестное ведомство расследования.", None
+
+        actor = await self.get_user(safe_actor) or {}
+        target = await self.get_user(safe_target)
+        if not actor or not target:
+            return False, "Следователь или цель не найдены.", None
+
+        authority = await self.get_government_authority(safe_actor)
+        if not await self._is_security_agency_actor(
+            actor_id=safe_actor,
+            agency=str(settings["agency"]),
+            actor=actor,
+            authority=authority,
+        ):
+            return False, "Недостаточно прав для запуска расследования.", None
+
+        now_dt = datetime.now()
+        now = now_dt.isoformat()
+        cost = float(settings["cost"] or 0.0)
+        duration_minutes = int(settings["duration_minutes"] or 60)
+        access_minutes = int(settings["access_minutes"] or 1440)
+        ready_dt = now_dt + timedelta(minutes=duration_minutes)
+        ready_at = ready_dt.isoformat()
+        access_expires_at = (ready_dt + timedelta(minutes=access_minutes)).isoformat()
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            await self._refresh_security_investigation_statuses(db)
+
+            async with db.execute(
+                """
+                SELECT id, status, cost, started_at, ready_at, access_expires_at
+                FROM security_investigations
+                WHERE agency = ?
+                  AND investigator_id = ?
+                  AND target_id = ?
+                  AND status IN ('pending', 'completed')
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (str(settings["agency"]), safe_actor, safe_target),
+            ) as cursor:
+                existing = await cursor.fetchone()
+            if existing:
+                status = str(existing["status"] or "").strip().lower()
+                if status == "pending":
+                    existing_ready = str(existing["ready_at"] or "")
+                    try:
+                        ready_dt_existing = datetime.fromisoformat(existing_ready) if existing_ready else now_dt
+                    except Exception:
+                        ready_dt_existing = now_dt
+                    remaining_seconds = max(0, int((ready_dt_existing - now_dt).total_seconds()))
+                    await db.rollback()
+                    return False, "Расследование уже запущено и еще не завершено.", {
+                        "agency": str(settings["agency"]),
+                        "investigation_id": int(existing["id"] or 0),
+                        "status": "pending",
+                        "ready_at": existing_ready,
+                        "remaining_seconds": remaining_seconds,
+                        "cost": float(existing["cost"] or cost),
+                    }
+                if status == "completed":
+                    expire_raw = str(existing["access_expires_at"] or "")
+                    if expire_raw and expire_raw > now:
+                        await db.rollback()
+                        return False, "Доступ к досье уже открыт по прошлому расследованию.", {
+                            "agency": str(settings["agency"]),
+                            "investigation_id": int(existing["id"] or 0),
+                            "status": "completed",
+                            "access_expires_at": expire_raw,
+                            "remaining_seconds": 0,
+                        }
+
+            async with db.execute(
+                "SELECT balance FROM users WHERE user_id = ? LIMIT 1",
+                (safe_actor,),
+            ) as cursor:
+                actor_row = await cursor.fetchone()
+            actor_balance = round(float((actor_row["balance"] if actor_row else 0) or 0), 2)
+            if actor_balance < cost:
+                await db.rollback()
+                return False, (
+                    f"Недостаточно средств для расследования. "
+                    f"Требуется ${cost:,.2f}, доступно ${actor_balance:,.2f}."
+                ), {
+                    "agency": str(settings["agency"]),
+                    "status": "insufficient_funds",
+                    "cost": cost,
+                    "balance": actor_balance,
+                }
+
+            await db.execute(
+                "UPDATE users SET balance = ? WHERE user_id = ?",
+                (round(actor_balance - cost, 2), safe_actor),
+            )
+
+            budget_type = "police" if str(settings["agency"]) == "police" else "fbi"
+            async with db.execute(
+                "SELECT id FROM organizations WHERE lower(COALESCE(type, '')) = ? ORDER BY id ASC LIMIT 1",
+                (budget_type,),
+            ) as cursor:
+                org_row = await cursor.fetchone()
+            if not org_row:
+                async with db.execute(
+                    "SELECT id FROM organizations WHERE lower(COALESCE(type, '')) = 'government' ORDER BY id ASC LIMIT 1"
+                ) as cursor:
+                    org_row = await cursor.fetchone()
+            if org_row:
+                await db.execute(
+                    "UPDATE organizations SET budget = COALESCE(budget, 0) + ? WHERE id = ?",
+                    (cost, int(org_row["id"])),
+                )
+
+            cursor = await db.execute(
+                """
+                INSERT INTO security_investigations
+                (agency, investigator_id, target_id, status, cost, started_at, ready_at, completed_at, access_expires_at, notes, created_date, updated_date)
+                VALUES (?, ?, ?, 'pending', ?, ?, ?, NULL, ?, '', ?, ?)
+                """,
+                (
+                    str(settings["agency"]),
+                    safe_actor,
+                    safe_target,
+                    cost,
+                    now,
+                    ready_at,
+                    access_expires_at,
+                    now,
+                    now,
+                ),
+            )
+            investigation_id = int(cursor.lastrowid or 0)
+            await db.commit()
+
+        target_name = self.get_user_public_name(target, fallback_id=safe_target)
+        await self.log_player_activity(
+            user_id=safe_actor,
+            activity_type=f"{str(settings['agency'])}_investigation_start",
+            details=f"Запущено расследование цели {target_name} (#{safe_target})",
+            value=cost,
+        )
+        return True, (
+            f"Расследование запущено. Стоимость: ${cost:,.2f}. "
+            f"Доступ к данным откроется после {duration_minutes} мин."
+        ), {
+            "agency": str(settings["agency"]),
+            "investigation_id": investigation_id,
+            "status": "pending",
+            "cost": cost,
+            "started_at": now,
+            "ready_at": ready_at,
+            "access_expires_at": access_expires_at,
+            "duration_minutes": duration_minutes,
+            "remaining_seconds": max(0, int((ready_dt - now_dt).total_seconds())),
+        }
+
+    async def get_security_investigation_status(
+        self,
+        actor_id: int,
+        target_id: int,
+        agency: str,
+    ) -> Dict[str, Any]:
+        await self._ensure_police_court_tables()
+        settings = self._security_investigation_settings(agency)
+        if not settings:
+            return {
+                "agency": str(agency or "").strip().lower(),
+                "status": "invalid",
+                "access_granted": False,
+                "can_start": False,
+                "cost": 0.0,
+                "duration_minutes": 0,
+                "remaining_seconds": 0,
+            }
+
+        safe_actor = int(actor_id or 0)
+        safe_target = int(target_id or 0)
+        now_dt = datetime.now()
+        now = now_dt.isoformat()
+        base: Dict[str, Any] = {
+            "agency": str(settings["agency"]),
+            "investigator_id": safe_actor,
+            "target_id": safe_target,
+            "status": "none",
+            "access_granted": False,
+            "can_start": True,
+            "cost": float(settings["cost"] or 0.0),
+            "duration_minutes": int(settings["duration_minutes"] or 0),
+            "access_minutes": int(settings["access_minutes"] or 0),
+            "started_at": "",
+            "ready_at": "",
+            "access_expires_at": "",
+            "remaining_seconds": 0,
+            "investigation_id": 0,
+        }
+        if safe_actor <= 0 or safe_target <= 0:
+            base["status"] = "invalid"
+            base["can_start"] = False
+            return base
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await self._refresh_security_investigation_statuses(db)
+            await db.commit()
+            async with db.execute(
+                """
+                SELECT id, status, cost, started_at, ready_at, completed_at, access_expires_at, updated_date
+                FROM security_investigations
+                WHERE agency = ?
+                  AND investigator_id = ?
+                  AND target_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (str(settings["agency"]), safe_actor, safe_target),
+            ) as cursor:
+                row = await cursor.fetchone()
+
+        if not row:
+            return base
+
+        status = str(row["status"] or "none").strip().lower()
+        base["status"] = status
+        base["investigation_id"] = int(row["id"] or 0)
+        base["cost"] = round(float(row["cost"] or base["cost"]), 2)
+        base["started_at"] = str(row["started_at"] or "")
+        base["ready_at"] = str(row["ready_at"] or "")
+        base["access_expires_at"] = str(row["access_expires_at"] or "")
+
+        if status == "pending":
+            ready_raw = str(row["ready_at"] or "")
+            try:
+                ready_dt = datetime.fromisoformat(ready_raw) if ready_raw else now_dt
+            except Exception:
+                ready_dt = now_dt
+            remaining_seconds = max(0, int((ready_dt - now_dt).total_seconds()))
+            base["remaining_seconds"] = remaining_seconds
+            base["access_granted"] = False
+            base["can_start"] = False
+            if remaining_seconds <= 0:
+                base["status"] = "completed"
+        if base["status"] == "completed":
+            expire_raw = str(row["access_expires_at"] or "")
+            has_access = bool(expire_raw and expire_raw > now)
+            base["access_granted"] = has_access
+            base["can_start"] = not has_access
+            if not has_access:
+                base["status"] = "expired"
+        if base["status"] == "expired":
+            base["access_granted"] = False
+            base["can_start"] = True
+        return base
+
+    async def has_security_investigation_access(
+        self,
+        actor_id: int,
+        target_id: int,
+        agency: str,
+    ) -> bool:
+        status = await self.get_security_investigation_status(
+            actor_id=int(actor_id or 0),
+            target_id=int(target_id or 0),
+            agency=agency,
+        )
+        return bool(status.get("access_granted"))
+
+    async def list_security_investigations(
+        self,
+        investigator_id: int,
+        agency: Optional[str] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        await self._ensure_police_court_tables()
+        safe_investigator = int(investigator_id or 0)
+        if safe_investigator <= 0:
+            return []
+        safe_limit = max(1, min(int(limit or 20), 100))
+        agency_lc = str(agency or "").strip().lower()
+
+        where_parts = ["si.investigator_id = ?"]
+        params: List[Any] = [safe_investigator]
+        if agency_lc:
+            where_parts.append("si.agency = ?")
+            params.append(agency_lc)
+        params.append(safe_limit)
+
+        query = f"""
+            SELECT si.*,
+                   COALESCE(NULLIF(u.nickname, ''), NULLIF(u.full_name, ''), NULLIF(u.username, ''), CAST(si.target_id AS TEXT)) AS target_name
+            FROM security_investigations si
+            LEFT JOIN users u ON u.user_id = si.target_id
+            WHERE {' AND '.join(where_parts)}
+            ORDER BY si.id DESC
+            LIMIT ?
+        """
+
+        now_dt = datetime.now()
+        now = now_dt.isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await self._refresh_security_investigation_statuses(db)
+            await db.commit()
+            async with db.execute(query, tuple(params)) as cursor:
+                rows = await cursor.fetchall()
+
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            status = str(item.get("status") or "").strip().lower()
+            remaining_seconds = 0
+            if status == "pending":
+                ready_raw = str(item.get("ready_at") or "")
+                try:
+                    ready_dt = datetime.fromisoformat(ready_raw) if ready_raw else now_dt
+                except Exception:
+                    ready_dt = now_dt
+                remaining_seconds = max(0, int((ready_dt - now_dt).total_seconds()))
+            elif status == "completed":
+                expire_raw = str(item.get("access_expires_at") or "")
+                if not expire_raw or expire_raw <= now:
+                    status = "expired"
+            item["status"] = status
+            item["remaining_seconds"] = remaining_seconds
+            result.append(item)
+        return result
 
     async def get_police_suspects(
         self,
@@ -11416,7 +20740,7 @@ class AsyncDatabase:
             ORDER BY risk_score DESC, COALESCE(u.crimes_committed, 0) DESC, u.user_id ASC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, tuple(params)) as cursor:
                 rows = await cursor.fetchall()
@@ -11439,7 +20763,7 @@ class AsyncDatabase:
         penalty = max(0.0, round(float(requested_penalty or 0), 2))
         now = datetime.now().isoformat()
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute("SELECT user_id FROM users WHERE user_id = ?", (int(defendant_id),)) as cursor:
@@ -11466,6 +20790,13 @@ class AsyncDatabase:
                 ),
             )
             case_id = int(cursor.lastrowid or 0)
+            await db.execute(
+                """
+                INSERT INTO court_case_events (case_id, actor_id, event_type, event_text, created_date)
+                VALUES (?, ?, 'case_open', ?, ?)
+                """,
+                (case_id, int(filed_by_id), "Судебное дело зарегистрировано.", now),
+            )
             await db.commit()
 
         await self.log_player_activity(
@@ -11482,34 +20813,82 @@ class AsyncDatabase:
         suspect_id: int,
         reason: str,
         fine_amount: float = 0,
-        jail_minutes: int = 120,
+        jail_minutes: int = 60,
     ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
         await self._ensure_police_court_tables()
-        if int(officer_id) == int(suspect_id):
+        safe_officer = int(officer_id or 0)
+        safe_suspect = int(suspect_id or 0)
+        if safe_officer == safe_suspect:
             return False, "Нельзя арестовать самого себя.", None
+        if safe_officer <= 0 or safe_suspect <= 0:
+            return False, "Некорректные параметры ареста.", None
+
+        officer_user = await self.get_user(safe_officer)
+        suspect_user = await self.get_user(safe_suspect)
+        if not officer_user or not suspect_user:
+            return False, "Офицер или подозреваемый не найден.", None
+
+        authority = await self.get_government_authority(safe_officer)
+        allowed_actor = await self._is_security_agency_actor(
+            actor_id=safe_officer,
+            agency="police",
+            actor=officer_user,
+            authority=authority,
+        )
+        if not allowed_actor:
+            return False, "Недостаточно прав для ареста.", None
+
+        has_police_access = await self.has_security_investigation_access(
+            actor_id=safe_officer,
+            target_id=safe_suspect,
+            agency="police",
+        )
+        has_fbi_access = await self.has_security_investigation_access(
+            actor_id=safe_officer,
+            target_id=safe_suspect,
+            agency="fbi",
+        )
+        if not (has_police_access or has_fbi_access):
+            status = await self.get_security_investigation_status(
+                actor_id=safe_officer,
+                target_id=safe_suspect,
+                agency="police",
+            )
+            if str(status.get("status") or "").lower() == "pending":
+                return False, "Расследование еще не завершено. Дождитесь готовности досье.", {
+                    "need_investigation": True,
+                    "status": "pending",
+                    "remaining_seconds": int(status.get("remaining_seconds") or 0),
+                    "ready_at": status.get("ready_at"),
+                }
+            return False, "Перед арестом нужно завершить дорогое расследование по цели.", {
+                "need_investigation": True,
+                "status": str(status.get("status") or "none"),
+                "cost": float(status.get("cost") or 0.0),
+            }
 
         clean_reason = " ".join((reason or "").strip().split())
         if len(clean_reason) < 3:
             clean_reason = "Проверка по подозрению"
         safe_fine = max(0.0, min(round(float(fine_amount or 0), 2), 10_000_000))
-        safe_minutes = max(30, min(int(jail_minutes or 120), 24 * 7 * 60))
+        safe_minutes = max(MIN_PUNISHMENT_MINUTES, min(int(jail_minutes or 60), MAX_PUNISHMENT_MINUTES))
 
         now_dt = datetime.now()
         now = now_dt.isoformat()
         arrested_until = (now_dt + timedelta(minutes=safe_minutes)).isoformat()
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
 
             async with db.execute(
                 "SELECT user_id, balance, fines_paid, arrested, arrested_until FROM users WHERE user_id = ?",
-                (int(suspect_id),),
+                (safe_suspect,),
             ) as cursor:
                 suspect = await cursor.fetchone()
             async with db.execute(
                 "SELECT user_id, arrests_made FROM users WHERE user_id = ?",
-                (int(officer_id),),
+                (safe_officer,),
             ) as cursor:
                 officer = await cursor.fetchone()
 
@@ -11533,7 +20912,7 @@ class AsyncDatabase:
                 SET balance = ?, fines_paid = ?, arrested = 1, arrested_until = ?
                 WHERE user_id = ?
                 """,
-                (suspect_balance_after, fines_paid_total, arrested_until, int(suspect_id)),
+                (suspect_balance_after, fines_paid_total, arrested_until, safe_suspect),
             )
             await db.execute(
                 """
@@ -11541,10 +20920,10 @@ class AsyncDatabase:
                 SET arrests_made = COALESCE(arrests_made, 0) + 1
                 WHERE user_id = ?
                 """,
-                (int(officer_id),),
+                (safe_officer,),
             )
 
-            case_title = f"Арест игрока #{int(suspect_id)}"
+            case_title = f"Арест игрока #{safe_suspect}"
             case_desc = f"Основание ареста: {clean_reason}"
             case_cursor = await db.execute(
                 """
@@ -11553,8 +20932,8 @@ class AsyncDatabase:
                 VALUES (?, ?, NULL, ?, ?, ?, 0, 'open', '', ?, ?, NULL)
                 """,
                 (
-                    int(officer_id),
-                    int(suspect_id),
+                    safe_officer,
+                    safe_suspect,
                     case_title[:200],
                     case_desc[:2500],
                     safe_fine,
@@ -11563,6 +20942,13 @@ class AsyncDatabase:
                 ),
             )
             case_id = int(case_cursor.lastrowid or 0)
+            await db.execute(
+                """
+                INSERT INTO court_case_events (case_id, actor_id, event_type, event_text, created_date)
+                VALUES (?, ?, 'arrest_case_open', ?, ?)
+                """,
+                (case_id, safe_officer, f"Дело открыто после ареста: {clean_reason[:350]}", now),
+            )
 
             arrest_cursor = await db.execute(
                 """
@@ -11571,8 +20957,8 @@ class AsyncDatabase:
                 VALUES (?, ?, ?, ?, ?, 'active', ?, ?, NULL, ?, '')
                 """,
                 (
-                    int(officer_id),
-                    int(suspect_id),
+                    safe_officer,
+                    safe_suspect,
                     clean_reason[:500],
                     safe_fine,
                     safe_minutes,
@@ -11591,13 +20977,13 @@ class AsyncDatabase:
             await db.commit()
 
         await self.log_player_activity(
-            user_id=officer_id,
+            user_id=safe_officer,
             activity_type="police_arrest",
-            details=f"Арест игрока #{int(suspect_id)} ({clean_reason})",
+            details=f"Арест игрока #{safe_suspect} ({clean_reason})",
             value=fine_paid,
         )
         await self.log_player_activity(
-            user_id=suspect_id,
+            user_id=safe_suspect,
             activity_type="got_arrested",
             details=f"Арест: {clean_reason}",
             value=fine_paid,
@@ -11665,13 +21051,37 @@ class AsyncDatabase:
             allowed = is_fbi_actor or authority in {"president", "vice_president", "minister"}
         if not allowed:
             return False, "Недостаточно прав для выдачи такого наказания.", None
+        has_investigation_access = await self.has_security_investigation_access(
+            actor_id=safe_actor,
+            target_id=safe_target,
+            agency=agency_lc,
+        )
+        if not has_investigation_access:
+            status = await self.get_security_investigation_status(
+                actor_id=safe_actor,
+                target_id=safe_target,
+                agency=agency_lc,
+            )
+            remaining_seconds = int(status.get("remaining_seconds") or 0)
+            if status.get("status") == "pending":
+                return False, "Расследование еще не завершено. Дождитесь готовности досье.", {
+                    "need_investigation": True,
+                    "status": "pending",
+                    "remaining_seconds": remaining_seconds,
+                    "ready_at": status.get("ready_at"),
+                }
+            return False, "Перед наказанием нужно завершить дорогое расследование по цели.", {
+                "need_investigation": True,
+                "status": str(status.get("status") or "none"),
+                "cost": float(status.get("cost") or 0.0),
+            }
 
         clean_reason = " ".join((reason or "").strip().split())[:500]
         if len(clean_reason) < 4:
             clean_reason = "Служебное наказание"
 
         safe_fine = max(0.0, min(round(float(fine_amount or 0), 2), 10_000_000.0))
-        safe_ban = max(0, min(int(ban_minutes or 0), 60 * 24 * 7))
+        safe_ban = max(0, min(int(ban_minutes or 0), MAX_PUNISHMENT_MINUTES))
         safe_rep_delta = round(float(reputation_delta or 0), 2)
         safe_tax_delta = max(0.0, round(float(tax_debt_delta or 0), 2))
         safe_corr_delta = max(0, min(int(corruption_delta or 0), 100))
@@ -11682,7 +21092,7 @@ class AsyncDatabase:
         actor_name = self.get_user_public_name(actor, fallback_id=safe_actor)
         target_name = self.get_user_public_name(target, fallback_id=safe_target)
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
 
@@ -11821,7 +21231,7 @@ class AsyncDatabase:
         await self.send_private_message(
             sender_id=safe_actor,
             recipient_id=safe_target,
-            subject=f"⚖️ Наказание ({'ФБР' if agency_lc == 'fbi' else 'Полиция'})",
+            subject=f"?? Наказание ({'ФБР' if agency_lc == 'fbi' else 'Полиция'})",
             content=target_notice_text,
             message_type="system",
         )
@@ -11886,7 +21296,7 @@ class AsyncDatabase:
             ORDER BY pa.created_date DESC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, tuple(params)) as cursor:
                 rows = await cursor.fetchall()
@@ -11897,37 +21307,32 @@ class AsyncDatabase:
         officer_id: Optional[int] = None,
         limit: int = 30,
     ) -> List[Dict[str, Any]]:
-        await self._ensure_police_court_tables()
-        safe_limit = max(1, min(int(limit or 30), 100))
-        where_parts = ["(pa.status = 'active' OR cc.status IN ('open', 'hearing'))"]
-        params: List[Any] = []
-        if officer_id is not None:
-            where_parts.append("pa.officer_id = ?")
-            params.append(int(officer_id))
-        params.append(safe_limit)
-        query = f"""
-            SELECT pa.id AS arrest_id,
-                   pa.created_date,
-                   pa.reason,
-                   pa.fine_amount,
-                   pa.jail_minutes,
-                   pa.status AS arrest_status,
-                   pa.case_id,
-                   cc.status AS case_status,
-                   cc.title AS case_title,
-                   COALESCE(NULLIF(su.nickname, ''), NULLIF(su.full_name, ''), NULLIF(su.username, ''), CAST(pa.suspect_id AS TEXT)) AS suspect_name
-            FROM police_arrests pa
-            LEFT JOIN court_cases cc ON cc.id = pa.case_id
-            LEFT JOIN users su ON su.user_id = pa.suspect_id
-            WHERE {' AND '.join(where_parts)}
-            ORDER BY pa.created_date DESC
-            LIMIT ?
-        """
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(query, tuple(params)) as cursor:
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
+        safe_officer = int(officer_id or 0)
+        if safe_officer <= 0:
+            return []
+        rows = await self.list_security_investigations(
+            investigator_id=safe_officer,
+            agency="police",
+            limit=limit,
+        )
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            status = str(row.get("status") or "pending")
+            result.append(
+                {
+                    "investigation_id": int(row.get("id") or 0),
+                    "created_date": str(row.get("started_at") or row.get("created_date") or ""),
+                    "suspect_name": row.get("target_name") or f"#{int(row.get('target_id') or 0)}",
+                    "target_id": int(row.get("target_id") or 0),
+                    "status": status,
+                    "agency": str(row.get("agency") or "police"),
+                    "cost": round(float(row.get("cost") or 0), 2),
+                    "ready_at": str(row.get("ready_at") or ""),
+                    "access_expires_at": str(row.get("access_expires_at") or ""),
+                    "remaining_seconds": int(row.get("remaining_seconds") or 0),
+                }
+            )
+        return result
 
     async def get_court_cases(
         self,
@@ -11970,11 +21375,287 @@ class AsyncDatabase:
                 cc.updated_date DESC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, tuple(params)) as cursor:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
+
+    async def get_court_case_by_id(self, case_id: int) -> Optional[Dict[str, Any]]:
+        await self._ensure_police_court_tables()
+        safe_case_id = int(case_id or 0)
+        if safe_case_id <= 0:
+            return None
+        query = """
+            SELECT cc.*,
+                   COALESCE(NULLIF(fu.nickname, ''), NULLIF(fu.full_name, ''), NULLIF(fu.username, ''), CAST(cc.filed_by_id AS TEXT)) AS filed_by_name,
+                   COALESCE(NULLIF(du.nickname, ''), NULLIF(du.full_name, ''), NULLIF(du.username, ''), CAST(cc.defendant_id AS TEXT)) AS defendant_name,
+                   COALESCE(NULLIF(ju.nickname, ''), NULLIF(ju.full_name, ''), NULLIF(ju.username, ''), CAST(cc.judge_id AS TEXT)) AS judge_name
+            FROM court_cases cc
+            LEFT JOIN users fu ON fu.user_id = cc.filed_by_id
+            LEFT JOIN users du ON du.user_id = cc.defendant_id
+            LEFT JOIN users ju ON ju.user_id = cc.judge_id
+            WHERE cc.id = ?
+            LIMIT 1
+        """
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, (safe_case_id,)) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def get_court_case_evidence(
+        self,
+        case_id: int,
+        viewer_id: Optional[int] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        await self._ensure_police_court_tables()
+        safe_case_id = int(case_id or 0)
+        safe_limit = max(1, min(int(limit or 20), 100))
+        if safe_case_id <= 0:
+            return []
+
+        where_parts = ["e.case_id = ?"]
+        params: List[Any] = [safe_case_id]
+        can_view_secret = False
+        if viewer_id is not None:
+            case_row = await self.get_court_case_by_id(safe_case_id)
+            user = await self.get_user(int(viewer_id)) or {}
+            role_lc = str(user.get("role") or "").lower()
+            org_lc = str(user.get("organization") or "").lower()
+            authority = await self.get_government_authority(int(viewer_id))
+            can_view_secret = (
+                authority == "president"
+                or "суд" in role_lc
+                or "court" in role_lc
+                or "суд" in org_lc
+                or "court" in org_lc
+                or await self.is_user_in_org_type(int(viewer_id), "court")
+                or (case_row and int(viewer_id) in {int(case_row.get("filed_by_id") or 0), int(case_row.get("defendant_id") or 0), int(case_row.get("judge_id") or 0)})
+            )
+        if not can_view_secret:
+            where_parts.append("COALESCE(e.is_secret, 0) = 0")
+        params.append(safe_limit)
+        query = f"""
+            SELECT e.*,
+                   COALESCE(NULLIF(u.nickname, ''), NULLIF(u.full_name, ''), NULLIF(u.username, ''), CAST(e.author_id AS TEXT)) AS author_name
+            FROM court_case_evidence e
+            LEFT JOIN users u ON u.user_id = e.author_id
+            WHERE {' AND '.join(where_parts)}
+            ORDER BY e.created_date DESC
+            LIMIT ?
+        """
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, tuple(params)) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+    async def get_court_case_events(self, case_id: int, limit: int = 30) -> List[Dict[str, Any]]:
+        await self._ensure_police_court_tables()
+        safe_case_id = int(case_id or 0)
+        safe_limit = max(1, min(int(limit or 30), 120))
+        if safe_case_id <= 0:
+            return []
+        query = """
+            SELECT ev.*,
+                   COALESCE(NULLIF(u.nickname, ''), NULLIF(u.full_name, ''), NULLIF(u.username, ''), CAST(ev.actor_id AS TEXT)) AS actor_name
+            FROM court_case_events ev
+            LEFT JOIN users u ON u.user_id = ev.actor_id
+            WHERE ev.case_id = ?
+            ORDER BY ev.created_date DESC
+            LIMIT ?
+        """
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, (safe_case_id, safe_limit)) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+    async def add_court_case_evidence(
+        self,
+        actor_id: int,
+        case_id: int,
+        evidence_text: str,
+        evidence_type: str = "statement",
+        is_secret: bool = False,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        await self._ensure_police_court_tables()
+        safe_actor = int(actor_id or 0)
+        safe_case_id = int(case_id or 0)
+        if safe_actor <= 0 or safe_case_id <= 0:
+            return False, "Некорректные параметры доказательства.", None
+        clean_text = " ".join((evidence_text or "").strip().split())
+        if len(clean_text) < 8:
+            return False, "Доказательство слишком короткое.", None
+        if len(clean_text) > 2500:
+            return False, "Доказательство слишком длинное.", None
+
+        safe_type = str(evidence_type or "statement").strip().lower()
+        if safe_type not in {"statement", "document", "photo", "audio", "other"}:
+            safe_type = "statement"
+
+        case_row = await self.get_court_case_by_id(safe_case_id)
+        if not case_row:
+            return False, "Судебное дело не найдено.", None
+
+        actor = await self.get_user(safe_actor) or {}
+        role_lc = str(actor.get("role") or "").lower()
+        org_lc = str(actor.get("organization") or "").lower()
+        authority = await self.get_government_authority(safe_actor)
+        can_add = (
+            authority == "president"
+            or safe_actor in {
+                int(case_row.get("filed_by_id") or 0),
+                int(case_row.get("defendant_id") or 0),
+                int(case_row.get("judge_id") or 0),
+            }
+            or "суд" in role_lc
+            or "court" in role_lc
+            or "суд" in org_lc
+            or "court" in org_lc
+            or await self.is_user_in_org_type(safe_actor, "court")
+        )
+        if not can_add:
+            return False, "Недостаточно прав для добавления доказательства.", None
+
+        now = datetime.now().isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                """
+                INSERT INTO court_case_evidence
+                (case_id, author_id, evidence_type, content, is_secret, created_date)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (safe_case_id, safe_actor, safe_type, clean_text, 1 if is_secret else 0, now),
+            )
+            evidence_id = int(cursor.lastrowid or 0)
+            await db.execute(
+                "UPDATE court_cases SET updated_date = ? WHERE id = ?",
+                (now, safe_case_id),
+            )
+            await db.execute(
+                """
+                INSERT INTO court_case_events (case_id, actor_id, event_type, event_text, created_date)
+                VALUES (?, ?, 'evidence', ?, ?)
+                """,
+                (safe_case_id, safe_actor, f"Добавлено доказательство ({safe_type})", now),
+            )
+            await db.commit()
+
+        await self.log_player_activity(
+            user_id=safe_actor,
+            activity_type="court_evidence_add",
+            details=f"Добавлено доказательство в дело #{safe_case_id}",
+            value=0,
+        )
+        return True, "Доказательство добавлено.", {
+            "case_id": safe_case_id,
+            "evidence_id": evidence_id,
+            "evidence_type": safe_type,
+            "is_secret": bool(is_secret),
+        }
+
+    async def file_court_appeal(
+        self,
+        actor_id: int,
+        case_id: int,
+        reason: str,
+        requested_penalty: Optional[float] = None,
+    ) -> tuple[bool, str, Optional[Dict[str, Any]]]:
+        await self._ensure_police_court_tables()
+        safe_actor = int(actor_id or 0)
+        safe_case_id = int(case_id or 0)
+        if safe_actor <= 0 or safe_case_id <= 0:
+            return False, "Некорректные параметры апелляции.", None
+        clean_reason = " ".join((reason or "").strip().split())
+        if len(clean_reason) < 12:
+            return False, "Апелляция слишком короткая.", None
+        if len(clean_reason) > 2500:
+            return False, "Апелляция слишком длинная.", None
+
+        case_row = await self.get_court_case_by_id(safe_case_id)
+        if not case_row:
+            return False, "Исходное дело не найдено.", None
+        source_status = str(case_row.get("status") or "").lower()
+        if source_status not in {"closed", "dismissed"}:
+            return False, "Апелляцию можно подать только по завершенному делу.", None
+        is_party = safe_actor in {
+            int(case_row.get("filed_by_id") or 0),
+            int(case_row.get("defendant_id") or 0),
+        }
+        if not is_party:
+            return False, "Апелляцию может подать только истец или ответчик.", None
+
+        penalty = max(0.0, round(float(requested_penalty if requested_penalty is not None else (case_row.get("imposed_penalty") or case_row.get("requested_penalty") or 0)), 2))
+        now = datetime.now().isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                """
+                SELECT id
+                FROM court_cases
+                WHERE parent_case_id = ?
+                  AND status IN ('open', 'hearing')
+                LIMIT 1
+                """,
+                (safe_case_id,),
+            ) as cursor:
+                active_appeal = await cursor.fetchone()
+            if active_appeal:
+                await db.rollback()
+                return False, "По этому делу уже есть активная апелляция.", None
+
+            cursor = await db.execute(
+                """
+                INSERT INTO court_cases
+                (filed_by_id, defendant_id, judge_id, title, description, requested_penalty, imposed_penalty, status, verdict_text, created_date, updated_date, closed_date, parent_case_id, hearing_date, priority)
+                VALUES (?, ?, ?, ?, ?, ?, 0, 'open', '', ?, ?, NULL, ?, NULL, 1)
+                """,
+                (
+                    safe_actor,
+                    int(case_row.get("defendant_id") or 0),
+                    int(case_row.get("judge_id") or 0) if case_row.get("judge_id") else None,
+                    f"Апелляция по делу #{safe_case_id}",
+                    clean_reason,
+                    penalty,
+                    now,
+                    now,
+                    safe_case_id,
+                ),
+            )
+            appeal_case_id = int(cursor.lastrowid or 0)
+            await db.execute(
+                """
+                INSERT INTO court_case_events (case_id, actor_id, event_type, event_text, created_date)
+                VALUES (?, ?, 'appeal', ?, ?)
+                """,
+                (safe_case_id, safe_actor, f"Подана апелляция: дело #{appeal_case_id}", now),
+            )
+            await db.execute(
+                """
+                INSERT INTO court_case_events (case_id, actor_id, event_type, event_text, created_date)
+                VALUES (?, ?, 'appeal_open', ?, ?)
+                """,
+                (appeal_case_id, safe_actor, f"Апелляция создана на основе дела #{safe_case_id}", now),
+            )
+            await db.commit()
+
+        await self.log_player_activity(
+            user_id=safe_actor,
+            activity_type="court_appeal_file",
+            details=f"Подана апелляция #{appeal_case_id} по делу #{safe_case_id}",
+            value=penalty,
+        )
+        return True, "Апелляция зарегистрирована.", {
+            "appeal_case_id": appeal_case_id,
+            "source_case_id": safe_case_id,
+            "requested_penalty": penalty,
+        }
 
     async def update_court_case_status(
         self,
@@ -12007,7 +21688,7 @@ class AsyncDatabase:
         if safe_penalty is not None and safe_penalty < 0:
             safe_penalty = 0.0
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -12032,7 +21713,7 @@ class AsyncDatabase:
             requested_penalty = round(float(case_row["requested_penalty"] or 0), 2)
             if safe_penalty is None:
                 if target_status == "closed":
-                    safe_penalty = requested_penalty if requested_penalty > 0 else 2_000.0
+                    safe_penalty = requested_penalty if requested_penalty > 0 else 1_200.0
                 else:
                     safe_penalty = round(float(case_row["imposed_penalty"] or 0), 2)
 
@@ -12058,6 +21739,13 @@ class AsyncDatabase:
                             (collected_penalty,),
                         )
 
+            hearing_date = str(case_row["hearing_date"] or "").strip()
+            if target_status == "hearing":
+                if not hearing_date:
+                    hearing_date = (datetime.now() + timedelta(hours=2)).isoformat()
+            elif target_status in {"closed", "dismissed"}:
+                hearing_date = None
+
             closed_date = now if target_status in {"closed", "dismissed"} else None
             await db.execute(
                 """
@@ -12066,6 +21754,7 @@ class AsyncDatabase:
                     verdict_text = ?,
                     imposed_penalty = ?,
                     judge_id = COALESCE(judge_id, ?),
+                    hearing_date = ?,
                     updated_date = ?,
                     closed_date = ?
                 WHERE id = ?
@@ -12075,10 +21764,23 @@ class AsyncDatabase:
                     clean_verdict,
                     round(float(safe_penalty or 0), 2),
                     int(actor_id),
+                    hearing_date,
                     now,
                     closed_date,
                     int(case_id),
                 ),
+            )
+            event_text = (
+                clean_verdict
+                if clean_verdict
+                else ("Назначено судебное слушание." if target_status == "hearing" else f"Статус дела изменен: {target_status}")
+            )
+            await db.execute(
+                """
+                INSERT INTO court_case_events (case_id, actor_id, event_type, event_text, created_date)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (int(case_id), int(actor_id), f"status_{target_status}", event_text[:900], now),
             )
 
             if target_status in {"closed", "dismissed"}:
@@ -12126,7 +21828,7 @@ class AsyncDatabase:
             ORDER BY active_cases DESC, convictions DESC, cc.defendant_id ASC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (safe_limit,)) as cursor:
                 rows = await cursor.fetchall()
@@ -12141,7 +21843,7 @@ class AsyncDatabase:
             "dismissed_cases": 0,
             "recent": [],
         }
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 """
@@ -12193,12 +21895,36 @@ class AsyncDatabase:
         target = await self.get_user(target_id)
         if not target:
             return False, "Цель не найдена.", None
+        has_investigation_access = await self.has_security_investigation_access(
+            actor_id=int(actor_id),
+            target_id=int(target_id),
+            agency="fbi",
+        )
+        if not has_investigation_access:
+            status = await self.get_security_investigation_status(
+                actor_id=int(actor_id),
+                target_id=int(target_id),
+                agency="fbi",
+            )
+            remaining_seconds = int(status.get("remaining_seconds") or 0)
+            if str(status.get("status") or "").lower() == "pending":
+                return False, "Операция заблокирована: расследование ФБР еще не завершено.", {
+                    "need_investigation": True,
+                    "status": "pending",
+                    "remaining_seconds": remaining_seconds,
+                    "ready_at": status.get("ready_at"),
+                }
+            return False, "Операция заблокирована: сначала нужно завершить дорогое расследование ФБР.", {
+                "need_investigation": True,
+                "status": str(status.get("status") or "none"),
+                "cost": float(status.get("cost") or 0.0),
+            }
         actor_name = await self.get_user_public_name_by_id(int(actor_id))
         target_name = self.get_user_public_name(target, fallback_id=int(target_id))
 
         if op == "arrest":
-            fine = random.randint(2_500, 12_500)
-            jail_minutes = random.randint(90, 360)
+            fine = random.randint(1_200, 7_000)
+            jail_minutes = random.randint(MIN_PUNISHMENT_MINUTES, MAX_PUNISHMENT_MINUTES)
             ok, msg, payload = await self.register_police_arrest(
                 officer_id=actor_id,
                 suspect_id=target_id,
@@ -12210,7 +21936,7 @@ class AsyncDatabase:
                 return False, msg, None
 
             now = datetime.now().isoformat()
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect() as db:
                 await db.execute(
                     """
                     INSERT INTO corruption_ops
@@ -12244,7 +21970,7 @@ class AsyncDatabase:
             await self.send_private_message(
                 sender_id=int(actor_id),
                 recipient_id=int(target_id),
-                subject="🚨 Операция ФБР: задержание",
+                subject="?? Операция ФБР: задержание",
                 content=target_notice_text,
                 message_type="system",
             )
@@ -12258,7 +21984,7 @@ class AsyncDatabase:
             }
 
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -12286,28 +22012,28 @@ class AsyncDatabase:
             details = ""
 
             if op == "expose":
-                delta_reputation = -float(random.randint(4, 11))
+                delta_reputation = -float(random.randint(2, 6))
                 delta_corruption = 2
                 risk = 22
                 details = "Публикация закрытых материалов"
             elif op == "scandal":
-                delta_reputation = -float(random.randint(8, 16))
-                delta_tax_debt = float(random.randint(2_000, 12_000))
+                delta_reputation = -float(random.randint(4, 9))
+                delta_tax_debt = float(random.randint(800, 4_500))
                 delta_corruption = 3
                 risk = 30
                 details = "Запуск публичного скандала"
             elif op == "freeze":
-                frozen = round(min(balance, random.uniform(1200, max(1800, balance * 0.5))), 2)
+                frozen = round(min(balance, random.uniform(600, max(1000, balance * 0.35))), 2)
                 delta_balance = -frozen
-                delta_tax_debt = round(frozen * 0.2, 2)
+                delta_tax_debt = round(frozen * 0.12, 2)
                 delta_corruption = 2
                 risk = 34
                 details = f"Заморозка средств: {frozen:.2f}"
             else:  # blackmail
-                payoff = round(min(balance, random.uniform(1500, 8000)), 2)
+                payoff = round(min(balance, random.uniform(800, 4_500)), 2)
                 delta_balance = -payoff
-                actor_shadow_gain = round(payoff * 0.75, 2)
-                delta_reputation = -float(random.randint(5, 10))
+                actor_shadow_gain = round(payoff * 0.6, 2)
+                delta_reputation = -float(random.randint(3, 7))
                 delta_corruption = 4
                 risk = 48
                 details = f"Извлечено через шантаж: {payoff:.2f}"
@@ -12371,10 +22097,10 @@ class AsyncDatabase:
             "blackmail": "шантаж",
         }
         op_subjects = {
-            "expose": "📂 Операция ФБР: раскрытие материалов",
-            "scandal": "📰 Операция ФБР: публичный скандал",
-            "freeze": "🔒 Операция ФБР: заморозка активов",
-            "blackmail": "🤐 Операция ФБР: шантаж",
+            "expose": "?? Операция ФБР: раскрытие материалов",
+            "scandal": "?? Операция ФБР: публичный скандал",
+            "freeze": "?? Операция ФБР: заморозка активов",
+            "blackmail": "?? Операция ФБР: шантаж",
         }
         impact_lines: List[str] = []
         if delta_balance < 0:
@@ -12397,7 +22123,7 @@ class AsyncDatabase:
         await self.send_private_message(
             sender_id=int(actor_id),
             recipient_id=int(target_id),
-            subject=op_subjects.get(op, "⚠️ Операция ФБР"),
+            subject=op_subjects.get(op, "?? Операция ФБР"),
             content=target_notice_text,
             message_type="system",
         )
@@ -12455,7 +22181,7 @@ class AsyncDatabase:
             ORDER BY oa.applied_date ASC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, tuple(params)) as cursor:
                 rows = await cursor.fetchall()
@@ -12471,7 +22197,7 @@ class AsyncDatabase:
         now = datetime.now().isoformat()
         clean_note = " ".join((note or "").strip().split())[:600]
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
 
@@ -12603,7 +22329,7 @@ class AsyncDatabase:
         safe_budget = round(max(1_000.0, float(budget_spent or 100_000.0)), 2)
         now = datetime.now().isoformat()
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
 
@@ -12674,7 +22400,7 @@ class AsyncDatabase:
             ORDER BY r.started_date DESC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (safe_limit,)) as cursor:
                 rows = await cursor.fetchall()
@@ -12689,7 +22415,7 @@ class AsyncDatabase:
             WHERE r.id = ?
             LIMIT 1
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (int(revolution_id),)) as cursor:
                 row = await cursor.fetchone()
@@ -12697,7 +22423,7 @@ class AsyncDatabase:
 
     async def add_revolution_supporter(self, user_id: int, revolution_id: int) -> tuple[bool, str]:
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -12761,7 +22487,7 @@ class AsyncDatabase:
     async def boost_revolution_support(self, revolution_id: int, delta: int = 1) -> tuple[bool, str, Optional[Dict[str, Any]]]:
         inc = max(1, min(int(delta or 1), 5))
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
@@ -12817,7 +22543,7 @@ class AsyncDatabase:
             ORDER BY rs.joined_date ASC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (int(revolution_id), safe_limit)) as cursor:
                 rows = await cursor.fetchall()
@@ -12834,7 +22560,7 @@ class AsyncDatabase:
             ORDER BY COALESCE(r.ended_date, r.started_date) DESC
             LIMIT ?
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, (safe_limit,)) as cursor:
                 rows = await cursor.fetchall()
@@ -12850,7 +22576,7 @@ class AsyncDatabase:
 
     async def _ensure_stock_exchange_tables(self, db_conn: Optional[aiosqlite.Connection] = None) -> None:
         own_connection = db_conn is None
-        db = db_conn or await aiosqlite.connect(self.db_path)
+        db = db_conn or await self._connect()
         try:
             await db.execute(
                 """
@@ -12970,7 +22696,7 @@ class AsyncDatabase:
         changed_symbols: List[str] = []
         abs_changes: List[float] = []
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             await self._ensure_stock_exchange_tables(db)
@@ -13044,7 +22770,7 @@ class AsyncDatabase:
         user = await self.get_user(int(user_id)) or {}
         payload["balance"] = round(float(user.get("balance") or 0.0), 2)
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await self._ensure_stock_exchange_tables(db)
 
@@ -13173,7 +22899,7 @@ class AsyncDatabase:
             return False, "Сумма слишком большая.", None
 
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             await self._ensure_stock_exchange_tables(db)
@@ -13306,7 +23032,7 @@ class AsyncDatabase:
             return False, "Некорректный тикер.", None
 
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             await self._ensure_stock_exchange_tables(db)
@@ -13427,7 +23153,7 @@ class AsyncDatabase:
 
     async def get_stock_exchange_recent_trades(self, user_id: int, limit: int = 12) -> List[Dict[str, Any]]:
         safe_limit = max(1, min(int(limit or 12), 50))
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await self._ensure_stock_exchange_tables(db)
             async with db.execute(
@@ -13484,7 +23210,7 @@ class AsyncDatabase:
             return False, "Для sell-ордера нужен процент 1-100.", None
 
         now = datetime.now().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             await self._ensure_stock_exchange_tables(db)
@@ -13566,7 +23292,7 @@ class AsyncDatabase:
         query += " ORDER BY o.id DESC LIMIT ?"
         params.append(safe_limit)
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await self._ensure_stock_exchange_tables(db)
             async with db.execute(query, tuple(params)) as cursor:
@@ -13580,7 +23306,7 @@ class AsyncDatabase:
 
         now = datetime.now().isoformat()
         await self._ensure_stock_exchange_tables()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             await self._ensure_stock_exchange_tables(db)
@@ -13611,7 +23337,7 @@ class AsyncDatabase:
         safe_limit = max(1, min(int(max_orders or 80), 400))
         await self._ensure_stock_exchange_tables()
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await self._ensure_stock_exchange_tables(db)
             async with db.execute(
@@ -13662,7 +23388,7 @@ class AsyncDatabase:
                 )
 
             now = datetime.now().isoformat()
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect() as db:
                 await self._ensure_stock_exchange_tables(db)
                 if success:
                     executed += 1
@@ -13735,7 +23461,7 @@ class AsyncDatabase:
         key = f"stock_dividend_last_{int(user_id)}"
         await self._ensure_stock_exchange_tables()
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             await self._ensure_stock_exchange_tables(db)
@@ -13846,7 +23572,7 @@ class AsyncDatabase:
 
     async def get_economy_statistics(self) -> Dict[str, Any]:
         """Получить макроэкономическую статистику: ВВП, денежная масса, и т.д."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             # Общий актив игроков
             async with db.execute(
                 "SELECT COALESCE(SUM(balance + bank + cash + shadow_balance), 0.0) FROM users"
@@ -13895,10 +23621,24 @@ class AsyncDatabase:
 
     async def get_money_flow_report(self) -> Dict[str, Any]:
         """Получить отчет о движении денег в экономике (за последний день)."""
-        yesterday = (datetime.now() - timedelta(days=1)).date().isoformat()
         today = datetime.now().date().isoformat()
         
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
+            async with db.execute("PRAGMA table_info(player_activity_log)") as cursor:
+                pal_cols = {str(col[1]).lower() for col in (await cursor.fetchall())}
+            pal_value_col = "value" if "value" in pal_cols else ("amount" if "amount" in pal_cols else None)
+            pal_date_col = "created_date" if "created_date" in pal_cols else ("created_at" if "created_at" in pal_cols else None)
+
+            async with db.execute("PRAGMA table_info(loans)") as cursor:
+                loan_cols = {str(col[1]).lower() for col in (await cursor.fetchall())}
+            loan_amount_col = "amount" if "amount" in loan_cols else ("principal" if "principal" in loan_cols else None)
+            loan_date_col = (
+                "application_date"
+                if "application_date" in loan_cols
+                else ("created_date" if "created_date" in loan_cols else ("approval_date" if "approval_date" in loan_cols else None))
+            )
+            has_loan_status = "status" in loan_cols
+
             # Налоги собраны
             async with db.execute(
                 """
@@ -13927,48 +23667,57 @@ class AsyncDatabase:
                 taxes_charged = float((await cursor.fetchone())[0] or 0.0)
             
             # Зарплаты выплачены
-            async with db.execute(
-                """
-                SELECT COALESCE(SUM(amount), 0.0)
-                FROM player_activity_log
-                WHERE activity_type = 'salary_received' AND DATE(created_date) = ?
-                """,
-                (today,),
-            ) as cursor:
-                salaries_paid = float((await cursor.fetchone())[0] or 0.0)
+            salaries_paid = 0.0
+            if pal_value_col and pal_date_col:
+                async with db.execute(
+                    f"""
+                    SELECT COALESCE(SUM(COALESCE({pal_value_col}, 0)), 0.0)
+                    FROM player_activity_log
+                    WHERE activity_type = 'salary_received' AND DATE({pal_date_col}) = ?
+                    """,
+                    (today,),
+                ) as cursor:
+                    salaries_paid = float((await cursor.fetchone())[0] or 0.0)
             
             # Кредиты выданы
-            async with db.execute(
-                """
-                SELECT COALESCE(SUM(principal), 0.0)
-                FROM loans
-                WHERE status IN ('approved', 'active') AND DATE(application_date) = ?
-                """,
-                (today,),
-            ) as cursor:
-                loans_issued = float((await cursor.fetchone())[0] or 0.0)
+            loans_issued = 0.0
+            if loan_amount_col and loan_date_col:
+                loan_status_clause = "status IN ('approved', 'active') AND " if has_loan_status else ""
+                async with db.execute(
+                    f"""
+                    SELECT COALESCE(SUM(COALESCE({loan_amount_col}, 0)), 0.0)
+                    FROM loans
+                    WHERE {loan_status_clause}DATE({loan_date_col}) = ?
+                    """,
+                    (today,),
+                ) as cursor:
+                    loans_issued = float((await cursor.fetchone())[0] or 0.0)
             
             # Кредиты погашены
-            async with db.execute(
-                """
-                SELECT COALESCE(SUM(amount), 0.0)
-                FROM player_activity_log
-                WHERE activity_type = 'loan_payment' AND DATE(created_date) = ?
-                """,
-                (today,),
-            ) as cursor:
-                loans_repaid = float((await cursor.fetchone())[0] or 0.0)
+            loans_repaid = 0.0
+            if pal_value_col and pal_date_col:
+                async with db.execute(
+                    f"""
+                    SELECT COALESCE(SUM(COALESCE({pal_value_col}, 0)), 0.0)
+                    FROM player_activity_log
+                    WHERE activity_type = 'loan_payment' AND DATE({pal_date_col}) = ?
+                    """,
+                    (today,),
+                ) as cursor:
+                    loans_repaid = float((await cursor.fetchone())[0] or 0.0)
             
             # Штрафы уплачены
-            async with db.execute(
-                """
-                SELECT COALESCE(SUM(amount), 0.0)
-                FROM player_activity_log
-                WHERE activity_type = 'fine_paid' AND DATE(created_date) = ?
-                """,
-                (today,),
-            ) as cursor:
-                fines_paid = float((await cursor.fetchone())[0] or 0.0)
+            fines_paid = 0.0
+            if pal_value_col and pal_date_col:
+                async with db.execute(
+                    f"""
+                    SELECT COALESCE(SUM(COALESCE({pal_value_col}, 0)), 0.0)
+                    FROM player_activity_log
+                    WHERE activity_type = 'fine_paid' AND DATE({pal_date_col}) = ?
+                    """,
+                    (today,),
+                ) as cursor:
+                    fines_paid = float((await cursor.fetchone())[0] or 0.0)
             
             # Общие движения денег
             inflows = round(taxes_collected + loans_repaid + salaries_paid, 2)  # в гос бюджет
@@ -13989,6 +23738,85 @@ class AsyncDatabase:
                 "net_flow": net_flow,
             }
 
+    async def donate_to_charity(
+        self,
+        user_id: int,
+        amount: float,
+        note: str = "",
+    ) -> tuple[bool, str, Dict[str, Any]]:
+        safe_user_id = int(user_id or 0)
+        safe_amount = round(float(amount or 0), 2)
+        if safe_user_id <= 0:
+            return False, "Некорректный игрок.", {}
+        if safe_amount < 100:
+            return False, "Минимальное пожертвование: $100.", {}
+        if safe_amount > 50_000_000:
+            return False, "Слишком большая сумма пожертвования.", {}
+
+        clean_note = " ".join((note or "").strip().split())[:180]
+        now = datetime.now().isoformat()
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            async with db.execute(
+                "SELECT balance, reputation FROM users WHERE user_id = ? LIMIT 1",
+                (safe_user_id,),
+            ) as cursor:
+                user_row = await cursor.fetchone()
+            if not user_row:
+                await db.rollback()
+                return False, "Игрок не найден.", {}
+
+            balance_before = round(float(user_row["balance"] or 0), 2)
+            rep_before = round(float(user_row["reputation"] or 0), 2)
+            if balance_before < safe_amount:
+                await db.rollback()
+                return False, "Недостаточно средств.", {
+                    "required": safe_amount,
+                    "balance": balance_before,
+                }
+
+            balance_after = round(balance_before - safe_amount, 2)
+            rep_bonus = round(min(3.0, 0.25 + safe_amount / 20_000.0), 2)
+            rep_after = round(min(100.0, rep_before + rep_bonus), 2)
+
+            await db.execute(
+                "UPDATE users SET balance = ?, reputation = ? WHERE user_id = ?",
+                (balance_after, rep_after, safe_user_id),
+            )
+            await db.execute(
+                """
+                INSERT INTO charity_donations
+                (user_id, amount, rep_bonus, note, created_date)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (safe_user_id, safe_amount, rep_bonus, clean_note, now),
+            )
+            budget_credit = await self._credit_public_budgets(
+                db,
+                safe_amount,
+                tax_share=0.30,
+            )
+            await db.commit()
+
+        await self.log_player_activity(
+            user_id=safe_user_id,
+            activity_type="charity_donation",
+            details=f"Пожертвование в charity-фонд: ${safe_amount:,.2f}",
+            value=safe_amount,
+        )
+        return True, "Пожертвование отправлено в городской фонд.", {
+            "amount": safe_amount,
+            "balance_before": balance_before,
+            "balance_after": balance_after,
+            "rep_before": rep_before,
+            "rep_after": rep_after,
+            "rep_bonus": rep_bonus,
+            "government_credit": float(budget_credit.get("government_credit") or 0.0),
+            "tax_service_credit": float(budget_credit.get("tax_service_credit") or 0.0),
+        }
+
     async def destroy_money_from_economy(
         self,
         amount: float,
@@ -14002,14 +23830,26 @@ class AsyncDatabase:
         if amount <= 0:
             return False, "Сумма должна быть положительной.", {}
         
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             
             # Получить правительственный бюджет
             async with db.execute(
-                "SELECT id, budget FROM organizations WHERE name = 'Правительство' LIMIT 1"
+                """
+                SELECT id, budget
+                FROM organizations
+                WHERE lower(COALESCE(type, '')) = 'government'
+                ORDER BY id ASC
+                LIMIT 1
+                """
             ) as cursor:
                 gov = await cursor.fetchone()
+            if not gov:
+                async with db.execute(
+                    "SELECT id, budget FROM organizations WHERE name = ? ORDER BY id ASC LIMIT 1",
+                    ("Правительство",),
+                ) as cursor:
+                    gov = await cursor.fetchone()
             
             if not gov:
                 return False, "Правительство не найдено.", {}
@@ -14044,7 +23884,7 @@ class AsyncDatabase:
             
             await db.commit()
         
-        return True, f"✅ ${amount:,.2f} удалено из экономики.", {
+        return True, f"? ${amount:,.2f} удалено из экономики.", {
             "amount": amount,
             "reason": reason,
             "budget_before": gov_budget,
@@ -14068,7 +23908,7 @@ class AsyncDatabase:
         if safe_direction not in {"sent", "received", ""}:
             safe_direction = ""
         
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             
             if safe_direction == "sent":
@@ -14143,7 +23983,7 @@ class AsyncDatabase:
         if not note_clean:
             note_clean = "Перевод между банковскими счетами"
         
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             
@@ -14200,7 +24040,7 @@ class AsyncDatabase:
                     sender_balance_before,
                     sender_bank_before,
                     sender_bank_after,
-                    f"[Счет→Счет] Кому: #{safe_recipient_id}. ${safe_amount:,.2f}{commission_note}. {note_clean}",
+                    f"[Счет>Счет] Кому: #{safe_recipient_id}. ${safe_amount:,.2f}{commission_note}. {note_clean}",
                     now,
                 ),
             )
@@ -14219,7 +24059,7 @@ class AsyncDatabase:
                     recipient_balance_before,
                     recipient_bank_before,
                     recipient_bank_after,
-                    f"[Счет←Счет] От: #{safe_sender_id}. ${safe_amount:,.2f}. {note_clean}",
+                    f"[Счет<Счет] От: #{safe_sender_id}. ${safe_amount:,.2f}. {note_clean}",
                     now,
                 ),
             )
@@ -14235,7 +24075,7 @@ class AsyncDatabase:
                     (
                         0,  # Система/Правительство
                         commission,
-                        f"Банковская комиссия: перевод #{safe_sender_id}→#{safe_recipient_id}",
+                        f"Банковская комиссия: перевод #{safe_sender_id}>#{safe_recipient_id}",
                         now,
                     ),
                 )
@@ -14266,6 +24106,4 @@ class AsyncDatabase:
         }
 
 db = AsyncDatabase()
-
-
 

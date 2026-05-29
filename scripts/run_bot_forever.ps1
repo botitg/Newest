@@ -24,6 +24,15 @@ if (-not (Test-Path $logsDir)) {
     New-Item -ItemType Directory -Path $logsDir | Out-Null
 }
 
+$mutexName = "Global\MirnastanBotRunner_" + [Math]::Abs($ProjectDir.ToLowerInvariant().GetHashCode())
+$createdNew = $false
+$runnerMutex = New-Object System.Threading.Mutex($true, $mutexName, [ref]$createdNew)
+if (-not $createdNew) {
+    Write-Host "Another runner instance is already active. Exiting duplicate runner."
+    try { $runnerMutex.Dispose() } catch {}
+    exit 0
+}
+
 $pythonExe = Join-Path $ProjectDir '.venv\Scripts\python.exe'
 if (-not (Test-Path $pythonExe)) {
     $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
@@ -41,6 +50,7 @@ if (-not (Test-Path $mainScript)) {
 }
 
 $logFile = Join-Path $logsDir 'bot_runner.log'
+$executionStateFlags = $null
 
 function Write-RunnerLog([string]$Text) {
     $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
@@ -57,10 +67,11 @@ public static class PowerState {
 }
 "@ -ErrorAction SilentlyContinue | Out-Null
 
-    $ES_CONTINUOUS = 0x80000000
-    $ES_SYSTEM_REQUIRED = 0x00000001
-    $ES_AWAYMODE_REQUIRED = 0x00000040
-    [PowerState]::SetThreadExecutionState($ES_CONTINUOUS -bor $ES_SYSTEM_REQUIRED -bor $ES_AWAYMODE_REQUIRED) | Out-Null
+    $ES_CONTINUOUS = [uint32]'0x80000000'
+    $ES_SYSTEM_REQUIRED = [uint32]0x00000001
+    $ES_AWAYMODE_REQUIRED = [uint32]0x00000040
+    $executionStateFlags = [uint32]($ES_CONTINUOUS -bor $ES_SYSTEM_REQUIRED -bor $ES_AWAYMODE_REQUIRED)
+    [PowerState]::SetThreadExecutionState($executionStateFlags) | Out-Null
     Write-RunnerLog "KeepAwake enabled (sleep prevention for this process)."
 }
 
@@ -78,12 +89,21 @@ while ($true) {
 
     Write-RunnerLog "Bot stopped (exit code: $exitCode). Restarting in $RestartDelaySeconds sec..."
 
-    if ($keepAwakeEnabled) {
-        $ES_CONTINUOUS = 0x80000000
-        $ES_SYSTEM_REQUIRED = 0x00000001
-        $ES_AWAYMODE_REQUIRED = 0x00000040
-        [PowerState]::SetThreadExecutionState($ES_CONTINUOUS -bor $ES_SYSTEM_REQUIRED -bor $ES_AWAYMODE_REQUIRED) | Out-Null
+    if ($exitCode -eq 11) {
+        Write-RunnerLog "Main instance already running (lock busy). Exiting duplicate runner to avoid extra terminal."
+        break
+    }
+
+    if ($keepAwakeEnabled -and $executionStateFlags -ne $null) {
+        [PowerState]::SetThreadExecutionState($executionStateFlags) | Out-Null
     }
 
     Start-Sleep -Seconds $RestartDelaySeconds
 }
+
+try {
+    if ($runnerMutex) {
+        try { $runnerMutex.ReleaseMutex() } catch {}
+        $runnerMutex.Dispose()
+    }
+} catch {}

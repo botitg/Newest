@@ -71,12 +71,27 @@ class EnsureUserMiddleware(BaseMiddleware):
 class MandatoryNicknameMiddleware(BaseMiddleware):
     """Блокирует игровой функционал, пока пользователь не задаст ник."""
 
-    ALLOWED_COMMANDS = {"/start", "/nick", "/help", "/id"}
+    ALLOWED_COMMANDS = {
+        "/start",
+        "/nick",
+        "/help",
+        "/id",
+        "/marry",
+        "/брак",
+        "/divorce",
+        "/развод",
+        "/plus",
+        "/rep",
+        "/botadmin",
+        "/adminpanel",
+        "/grantdonate",
+    }
     ALLOWED_CALLBACK_PREFIXES = {
         "set_nick_start",
         "set_nick_reset",
         "help_menu",
         "menu:help_menu",
+        "bot_admin_",
     }
     GROUP_INTERACTION_PREFIXES = {
         "кости",
@@ -92,6 +107,15 @@ class MandatoryNicknameMiddleware(BaseMiddleware):
         "баскетбол",
         "basket",
         "basketball",
+        "брак",
+        "развод",
+        "обнять",
+        "поцеловать",
+        "погладить",
+        "marry",
+        "divorce",
+        "+",
+        "плюс",
     }
 
     def __init__(self, notify_cooldown_seconds: float = 15.0):
@@ -126,6 +150,9 @@ class MandatoryNicknameMiddleware(BaseMiddleware):
         if content.startswith("/"):
             return True
         first = content.split(" ", 1)[0].lower()
+        if "@" in first:
+            first = first.split("@", 1)[0]
+        first = first.strip(".,!?;:()[]{}<>\"'`«»")
         return first in cls.GROUP_INTERACTION_PREFIXES
 
     def _should_notify(self, scope: str, user_id: int) -> bool:
@@ -178,6 +205,8 @@ class MandatoryNicknameMiddleware(BaseMiddleware):
         is_nickname_state = current_state == MainStates.setting_nickname.state
 
         if isinstance(event, Message):
+            if getattr(event, "successful_payment", None):
+                return await handler(event, data)
             text = str(event.text or "")
             command = self._command_from_text(text)
             if command in self.ALLOWED_COMMANDS:
@@ -366,6 +395,7 @@ class GlobalLockMiddleware(BaseMiddleware):
         "back_to_main",
         "help_menu",
         "menu:help_menu",
+        "bot_admin_",
     ]
 
     def __init__(self, cache_ttl_seconds: float = 3.0):
@@ -434,7 +464,20 @@ class GlobalLockMiddleware(BaseMiddleware):
             command = (event.text or "").strip().split(" ", 1)[0].lower()
             if "@" in command:
                 command = command.split("@", 1)[0]
-            if command in {"/start", "/menu", "/help", "/id"}:
+            if command in {"/start", "/menu", "/help", "/id", "/marry", "/брак", "/divorce", "/развод", "/plus", "/rep", "/botadmin", "/adminpanel", "/grantdonate"}:
+                return await handler(event, data)
+            token = command.lstrip("/").strip(".,!?;:()[]{}<>\"'`«»")
+            if event.reply_to_message and token in {
+                "брак",
+                "marry",
+                "развод",
+                "divorce",
+                "обнять",
+                "поцеловать",
+                "погладить",
+                "+",
+                "плюс",
+            }:
                 return await handler(event, data)
 
             await event.answer(

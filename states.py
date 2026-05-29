@@ -13,6 +13,7 @@ class MainStates(StatesGroup):
     setting_nickname = State()
     sending_gov_radio = State()
     sending_president_appeal = State()
+    charity_custom_amount = State()
 
 
 class ElectionStates(StatesGroup):

@@ -13,7 +13,7 @@ DAILY_PROPERTY_TAX_RATE = 0.00025
 DAILY_BUSINESS_TAX_RATE = 0.001
 DAILY_PRIVATE_ORG_TAX_RATE = 0.0015
 DAILY_LOAN_PENALTY_RATE = 0.01
-BUSINESS_EQUIP_BASE_COST = 25000.0
+BUSINESS_EQUIP_BASE_COST = 35000.0
 PRIVATE_ORG_EQUIP_MULTIPLIER = 5.0
 EDUCATION_DAILY_REPUTATION_GAIN = 0.05
 EDUCATION_COMPLETION_REPUTATION_GAIN = 1.5
@@ -527,17 +527,48 @@ class OrganizationSystem:
         c.execute('SELECT COUNT(*) FROM education_programs')
         if c.fetchone()[0] == 0:
             programs = [
-                ('Базовая школа', 'Обязательная школьная программа с базовой подготовкой.', 7, 1200, 1, 0),
-                ('Технический колледж', 'Практическая программа для рабочих специальностей.', 10, 2600, 2, 30),
-                ('Экономический факультет', 'Финансы, управление и основы экономики.', 14, 4200, 3, 45),
-                ('Юридический факультет', 'Право, судебная практика и правоприменение.', 16, 4800, 3, 55),
-                ('Медицинская академия', 'Профессиональная медицинская подготовка.', 18, 5600, 4, 60),
+                ('Базовая школа', 'Обязательная школьная программа с базовой подготовкой.', 8, 1800, 1, 10),
+                ('Технический колледж', 'Практическая программа для рабочих специальностей.', 12, 3200, 2, 40),
+                ('Экономический факультет', 'Финансы, управление и основы экономики.', 16, 5200, 3, 55),
+                ('Юридический факультет', 'Право, судебная практика и правоприменение.', 18, 6200, 4, 65),
+                ('Медицинская академия', 'Профессиональная медицинская подготовка.', 20, 7400, 4, 70),
             ]
             for p in programs:
                 c.execute('''INSERT INTO education_programs
                              (name, description, duration_days, tuition_fee, min_education, min_reputation, active, created_date)
                              VALUES (?, ?, ?, ?, ?, ?, 1, ?)''',
                           (p[0], p[1], p[2], p[3], p[4], p[5], datetime.now().isoformat()))
+        # Балансируем существующие записи при обновлении проекта.
+        c.execute('''UPDATE education_programs
+                     SET duration_days = MAX(duration_days, 8),
+                         tuition_fee = MAX(tuition_fee, 1800),
+                         min_education = MAX(min_education, 1),
+                         min_reputation = MAX(min_reputation, 10)
+                     WHERE name = 'Базовая школа' ''')
+        c.execute('''UPDATE education_programs
+                     SET duration_days = MAX(duration_days, 12),
+                         tuition_fee = MAX(tuition_fee, 3200),
+                         min_education = MAX(min_education, 2),
+                         min_reputation = MAX(min_reputation, 40)
+                     WHERE name = 'Технический колледж' ''')
+        c.execute('''UPDATE education_programs
+                     SET duration_days = MAX(duration_days, 16),
+                         tuition_fee = MAX(tuition_fee, 5200),
+                         min_education = MAX(min_education, 3),
+                         min_reputation = MAX(min_reputation, 55)
+                     WHERE name = 'Экономический факультет' ''')
+        c.execute('''UPDATE education_programs
+                     SET duration_days = MAX(duration_days, 18),
+                         tuition_fee = MAX(tuition_fee, 6200),
+                         min_education = MAX(min_education, 4),
+                         min_reputation = MAX(min_reputation, 65)
+                     WHERE name = 'Юридический факультет' ''')
+        c.execute('''UPDATE education_programs
+                     SET duration_days = MAX(duration_days, 20),
+                         tuition_fee = MAX(tuition_fee, 7400),
+                         min_education = MAX(min_education, 4),
+                         min_reputation = MAX(min_reputation, 70)
+                     WHERE name = 'Медицинская академия' ''')
 
         c.execute('''CREATE TABLE IF NOT EXISTS businesses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1587,7 +1618,7 @@ class OrganizationSystem:
                     unpaid = effective_due - paid_loan
                     remaining_balance += unpaid * DAILY_LOAN_PENALTY_RATE
                     defaults_inc += 1
-                    rep_delta -= 0.4
+                    rep_delta -= 0.2
 
                 if remaining_balance <= 0.01:
                     remaining_balance = 0.0
@@ -1603,7 +1634,7 @@ class OrganizationSystem:
 
             # Репутация: поощрение за дисциплину / штраф за долги
             if debt_today > 0:
-                rep_delta -= min(2.0, 0.6 + debt_today / 2000.0)
+                rep_delta -= min(1.2, 0.35 + debt_today / 3500.0)
             else:
                 rep_delta += 0.15
 
@@ -2266,7 +2297,7 @@ class OrganizationSystem:
                      WHERE id = ?''', (verdict, sentence, fine, datetime.now().isoformat(), case_id))
         conn.commit()
         conn.close()
-        fine = float(fine or 0)
+        fine = max(0.0, min(7000.0, float(fine or 0)))
         lowered = str(verdict or "").lower()
 
         if fine > 0 and defendant_id:
@@ -2283,17 +2314,17 @@ class OrganizationSystem:
 
         if "винов" in lowered:
             if defendant_id:
-                self.adjust_reputation(defendant_id, -6, "Решение суда")
+                self.adjust_reputation(defendant_id, -3.5, "Решение суда")
             if plaintiff_id:
-                self.adjust_reputation(plaintiff_id, 1, "Участие в судебном процессе")
+                self.adjust_reputation(plaintiff_id, 0.8, "Участие в судебном процессе")
         elif "отклон" in lowered or "не винов" in lowered:
             if defendant_id:
-                self.adjust_reputation(defendant_id, 2, "Решение суда")
+                self.adjust_reputation(defendant_id, 1.2, "Решение суда")
             if plaintiff_id:
-                self.adjust_reputation(plaintiff_id, -1, "Необоснованный иск")
+                self.adjust_reputation(plaintiff_id, -0.5, "Необоснованный иск")
 
         if judge_id:
-            self.adjust_reputation(judge_id, 1, "Завершение судебного дела")
+            self.adjust_reputation(judge_id, 0.6, "Завершение судебного дела")
         return True, "✅ Дело закрыто."
 
     def add_case_evidence(self, case_id, user_id, evidence_text):
@@ -2365,16 +2396,16 @@ class OrganizationSystem:
         
         # Определяем срок ареста
         if fine > 0:
-            hours = min(24, int(fine // 1000))  # 1 час за каждые $1000 штрафа
+            hours = max(1, min(12, int(fine // 1500)))  # мягче по срокам: 1 час за ~$1500
         else:
             # Зависит от репутации подозреваемого
             suspect_reputation = suspect.get('reputation', 50) if suspect else 50
             if suspect_reputation < 30:
-                hours = 24
-            elif suspect_reputation < 60:
                 hours = 12
+            elif suspect_reputation < 60:
+                hours = 8
             else:
-                hours = 6
+                hours = 4
         
         arrest_until = datetime.now() + timedelta(hours=hours)
         
@@ -2398,7 +2429,7 @@ class OrganizationSystem:
                 arrested=1,
                 arrested_until=arrest_until.isoformat()
             )
-            self.adjust_reputation(suspect_id, -6, "Арест полицией")
+            self.adjust_reputation(suspect_id, -3, "Арест полицией")
         
         # Обновляем статистику офицера
         if officer:
@@ -2406,7 +2437,7 @@ class OrganizationSystem:
                 officer_id,
                 arrests_made=officer.get('arrests_made', 0) + 1
             )
-            self.adjust_reputation(officer_id, 2, "Служебный арест")
+            self.adjust_reputation(officer_id, 1, "Служебный арест")
         
         # Отправляем уведомление
         officer_name = officer.get('full_name', 'Офицер') if officer else 'Офицер'
@@ -3806,11 +3837,11 @@ class OrganizationSystem:
 
     def list_citizen_jobs(self):
         return [
-            {'code': 'courier', 'title': 'Курьер', 'salary': 800, 'edu_required': 1, 'rep_required': 20},
-            {'code': 'taxi', 'title': 'Таксист', 'salary': 1100, 'edu_required': 2, 'rep_required': 30},
-            {'code': 'builder', 'title': 'Строитель', 'salary': 1300, 'edu_required': 2, 'rep_required': 35},
-            {'code': 'clerk', 'title': 'Офисный сотрудник', 'salary': 900, 'edu_required': 3, 'rep_required': 40},
-            {'code': 'mechanic', 'title': 'Механик', 'salary': 1250, 'edu_required': 3, 'rep_required': 45},
+            {'code': 'courier', 'title': 'Курьер', 'salary': 800, 'edu_required': 2, 'rep_required': 35},
+            {'code': 'taxi', 'title': 'Таксист', 'salary': 1100, 'edu_required': 3, 'rep_required': 45},
+            {'code': 'builder', 'title': 'Строитель', 'salary': 1300, 'edu_required': 3, 'rep_required': 50},
+            {'code': 'clerk', 'title': 'Офисный сотрудник', 'salary': 900, 'edu_required': 4, 'rep_required': 60},
+            {'code': 'mechanic', 'title': 'Механик', 'salary': 1250, 'edu_required': 5, 'rep_required': 70},
         ]
 
     def get_citizen_job(self, job_code):
@@ -3862,8 +3893,8 @@ class OrganizationSystem:
             return False, f"❌ Нужно репутации {int(job['rep_required'])}+.", None
 
         text = (application_text or "").strip()
-        if len(text) < 8:
-            return False, "❌ Заявка слишком короткая. Опишите мотивацию подробнее.", None
+        if len(text) < 16:
+            return False, "❌ Заявка слишком короткая. Нужна более подробная мотивация (16+).", None
 
         conn = get_conn()
         c = conn.cursor()
@@ -3980,7 +4011,7 @@ class OrganizationSystem:
             balance=float(user.get('balance', 0) or 0) + pay,
             last_job_shift=datetime.now().isoformat()
         )
-        self.adjust_reputation(user_id, 0.2, f"Рабочая смена: {job_name}")
+        self.adjust_reputation(user_id, 0.1, f"Рабочая смена: {job_name}")
         return True, f"✅ Смена отработана. Выплата: ${pay:,.0f}."
 
     # ==================== ОБРАЗОВАНИЕ ====================
@@ -4218,6 +4249,8 @@ class OrganizationSystem:
             return False, "❌ У вас уже есть активное обучение.", None
         if self.get_user_pending_education_application(user_id):
             return False, "📭 У вас уже есть заявка на обучение.", None
+        if float(user.get('tax_debt', 0) or 0) > 5000:
+            return False, "❌ Сначала погасите налоговый долг (долг > $5,000).", None
 
         user_edu = int(user.get('education', 1) or 1)
         user_rep = float(user.get('reputation', 50) or 50)
@@ -4227,8 +4260,8 @@ class OrganizationSystem:
             return False, f"❌ Нужно репутации {int(program['min_reputation'])}+.", None
 
         text = (application_text or "").strip()
-        if len(text) < 8:
-            return False, "❌ Заявка слишком короткая. Добавьте мотивацию.", None
+        if len(text) < 16:
+            return False, "❌ Заявка слишком короткая. Нужна мотивация минимум 16 символов.", None
 
         conn = get_conn()
         c = conn.cursor()
@@ -4454,7 +4487,7 @@ class OrganizationSystem:
         if user.get('last_daily_bonus') == today:
             return False, "⏳ Бонус уже получен сегодня."
 
-        bonus = random.randint(300, 1200)
+        bonus = random.randint(200, 700)
         event = random.choice([
             "Город выдал субсидию.",
             "Вы получили подарок от анонимного спонсора.",
@@ -5748,7 +5781,7 @@ async def select_loan_applicant(update: Update, context: ContextTypes.DEFAULT_TY
         f"💰 Баланс: ${applicant.get('balance', 0):,.0f}\n"
         f"🏠 Недвижимость: {'Есть' if applicant.get('property_owner') else 'Нет'}\n\n"
         f"Введите сумму кредита:\n"
-        f"💡 Максимум: ${min(100000, applicant.get('reputation', 50) * 1000):,.0f}",
+        f"💡 Максимум: ${min(100000, applicant.get('reputation', 50) * 700):,.0f}",
         parse_mode='Markdown',
         reply_markup=back_markup("my_org_panel", "🔙 В панель")
     )
@@ -5966,9 +5999,9 @@ async def handle_arrest_fine(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await update.message.reply_text("❌ Штраф не может быть отрицательным!")
                 return
             
-            if fine > 10000:
-                await update.message.reply_text("⚠️ Штраф слишком большой! Максимум $10,000.")
-                fine = 10000
+            if fine > 7000:
+                await update.message.reply_text("⚠️ Штраф слишком большой! Максимум $7,000.")
+                fine = 7000
             
             # Производим арест
             success, message = org_system.arrest_player(officer_id, target_id, reason, "", fine)
@@ -6170,7 +6203,7 @@ async def handle_loan_applicant(update: Update, context: ContextTypes.DEFAULT_TY
                 f"💰 **Баланс:** ${applicant.get('balance', 0):,.0f}\n"
                 f"🏠 **Недвижимость:** {'Есть' if applicant.get('property_owner') else 'Нет'}\n\n"
                 f"Введите сумму кредита:\n"
-                f"💡 *Максимум: ${min(100000, applicant.get('reputation', 50) * 1000):,.0f}*\n"
+                f"💡 *Максимум: ${min(100000, applicant.get('reputation', 50) * 700):,.0f}*\n"
                 f"⚠️ *Учитывайте платежеспособность заявителя*"
             )
             
@@ -6191,7 +6224,7 @@ async def handle_loan_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
             
             # Проверяем максимальную сумму
             applicant = org_system.get_user(applicant_id)
-            max_amount = min(100000, applicant.get('reputation', 50) * 1000)
+            max_amount = min(100000, applicant.get('reputation', 50) * 700)
             
             if amount > max_amount:
                 await update.message.reply_text(
@@ -6624,7 +6657,7 @@ async def handle_loan_request_amount(update: Update, context: ContextTypes.DEFAU
                 await update.message.reply_text("❌ Сумма должна быть от 100 до 1 000 000.")
                 return
 
-            max_amount = min(1_000_000, (user.get('reputation', 50) or 50) * 1000)
+            max_amount = min(1_000_000, (user.get('reputation', 50) or 50) * 700)
             if amount > max_amount:
                 await update.message.reply_text(
                     f"⚠️ Максимум для вашей репутации: ${max_amount:,.0f}"
@@ -7675,10 +7708,40 @@ async def gang_application_decision(update: Update, context: ContextTypes.DEFAUL
 async def gang_attack_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data['awaiting_gang_attack_target'] = True
+    players = org_system.list_recent_players(exclude_user_id=query.from_user.id, limit=20)
+    if not players:
+        await query.edit_message_text(
+            "❌ Нет доступных целей.",
+            reply_markup=back_markup("gang_menu", "🔙 К бандам")
+        )
+        return
+    if 'awaiting_gang_attack_target' in context.user_data:
+        del context.user_data['awaiting_gang_attack_target']
     await query.edit_message_text(
-        "⚔️ Введите ID цели для нападения:",
-        reply_markup=back_markup("gang_menu", "🔙 Отмена")
+        "⚔️ **НАПАДЕНИЕ БАНДЫ**\n\nВыберите цель:",
+        parse_mode='Markdown',
+        reply_markup=player_picker_markup(players, "pick_gangatk_", "gang_menu", "🔙 К бандам")
+    )
+
+
+async def select_gang_attack_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    target_id = int(query.data.replace("pick_gangatk_", "", 1))
+    target = org_system.get_user(target_id)
+    if not target:
+        await query.edit_message_text("❌ Цель не найдена.", reply_markup=back_markup("gang_attack", "🔙 К выбору"))
+        return
+    if target_id == query.from_user.id:
+        await query.edit_message_text("❌ Нельзя выбрать себя.", reply_markup=back_markup("gang_attack", "🔙 К выбору"))
+        return
+    context.user_data['gang_attack_target'] = target_id
+    context.user_data['awaiting_gang_attack_severity'] = True
+    await query.edit_message_text(
+        f"🎯 Цель: {target.get('full_name', 'Игрок')}\n\n"
+        "Укажите тяжесть: `light` / `medium` / `severe` / `critical` / `kill`",
+        parse_mode='Markdown',
+        reply_markup=back_markup("gang_menu", "🔙 К бандам")
     )
 
 async def handle_gang_attack_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7742,8 +7805,40 @@ async def court_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def court_create_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data['awaiting_court_defendant'] = True
-    await query.edit_message_text("📝 Введите ID ответчика:", reply_markup=back_markup("court_menu", "🔙 Отмена"))
+    players = org_system.list_recent_players(exclude_user_id=query.from_user.id, limit=20)
+    if not players:
+        await query.edit_message_text(
+            "❌ Нет доступных ответчиков.",
+            reply_markup=back_markup("court_menu", "🔙 В суд")
+        )
+        return
+    if 'awaiting_court_defendant' in context.user_data:
+        del context.user_data['awaiting_court_defendant']
+    await query.edit_message_text(
+        "📝 **ПОДАТЬ ИСК**\n\nВыберите ответчика:",
+        parse_mode='Markdown',
+        reply_markup=player_picker_markup(players, "pick_courtdef_", "court_menu", "🔙 В суд")
+    )
+
+
+async def select_court_defendant(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    defendant_id = int(query.data.replace("pick_courtdef_", "", 1))
+    if defendant_id == query.from_user.id:
+        await query.edit_message_text("❌ Нельзя подать иск на себя.", reply_markup=back_markup("court_create", "🔙 К выбору"))
+        return
+    defendant = org_system.get_user(defendant_id)
+    if not defendant:
+        await query.edit_message_text("❌ Игрок не найден.", reply_markup=back_markup("court_create", "🔙 К выбору"))
+        return
+    context.user_data['court_defendant_id'] = defendant_id
+    context.user_data['awaiting_court_description'] = True
+    await query.edit_message_text(
+        f"⚖️ Ответчик: {defendant.get('full_name', 'Игрок')}\n\n"
+        "Опишите суть иска:",
+        reply_markup=back_markup("court_menu", "🔙 В суд")
+    )
 
 async def handle_court_defendant(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'awaiting_court_defendant' in context.user_data and update.message:
@@ -7838,10 +7933,36 @@ async def court_review_queue(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def court_evidence_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data['awaiting_court_evidence_case'] = True
+    cases = org_system.list_user_cases(query.from_user.id, limit=20)
+    if not cases:
+        await query.edit_message_text(
+            "📭 У вас нет дел для добавления доказательств.",
+            reply_markup=back_markup("court_menu", "🔙 В суд")
+        )
+        return
+
+    if 'awaiting_court_evidence_case' in context.user_data:
+        del context.user_data['awaiting_court_evidence_case']
+
+    text = "📎 **ВЫБЕРИТЕ ДЕЛО**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    keyboard = []
+    for case in cases[:12]:
+        case_id, case_number, status, opened_date = case
+        text += f"• {case_number} ({status})\n"
+        keyboard.append([InlineKeyboardButton(f"📎 {case_number}", callback_data=f"pick_cevid_{case_id}")])
+    keyboard.append([InlineKeyboardButton("🔙 В суд", callback_data="court_menu")])
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+
+async def select_court_evidence_case(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    case_id = int(query.data.replace("pick_cevid_", "", 1))
+    context.user_data['court_evidence_case_id'] = case_id
+    context.user_data['awaiting_court_evidence_text'] = True
     await query.edit_message_text(
-        "Введите ID дела для добавления доказательств:",
-        reply_markup=back_markup("court_menu", "🔙 Отмена")
+        "Введите текст доказательств:",
+        reply_markup=back_markup("court_menu", "🔙 В суд")
     )
 
 async def handle_court_evidence_case(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8775,6 +8896,42 @@ async def government_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
 
+
+async def create_rule_redirect(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await government_laws_menu(update, context)
+
+
+async def my_rules_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute('''SELECT law_number, title, status, votes_for, votes_against, proposed_date
+                 FROM laws
+                 WHERE proposed_by = ?
+                 ORDER BY proposed_date DESC
+                 LIMIT 20''', (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    text = "📜 **МОИ ЗАКОНЫ**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    if not rows:
+        text += "Пока нет созданных законопроектов."
+    else:
+        for law in rows:
+            text += (
+                f"• **{law[0]}** — {law[1]}\n"
+                f"  Статус: {law[2]} | 👍 {law[3]} / 👎 {law[4]}\n"
+                f"  Дата: {(law[5] or '')[:10]}\n"
+            )
+    keyboard = [
+        [InlineKeyboardButton("📋 К законам", callback_data="gov_laws")],
+        [InlineKeyboardButton("🔙 В правление", callback_data="government_menu")]
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
 async def elections_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Меню голосования на выборах"""
     query = update.callback_query
@@ -8979,6 +9136,55 @@ async def start_revolution_menu(update: Update, context: ContextTypes.DEFAULT_TY
     
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
+
+async def start_revolution_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    gov_type = query.data.replace("start_rev_", "", 1)
+    readable = {
+        'monarchy': 'Монархия',
+        'democracy': 'Демократия',
+        'dictatorship': 'Диктатура',
+        'anarchy': 'Анархия',
+        'aristocracy': 'Аристократия',
+    }.get(gov_type, gov_type)
+    context.user_data['revolution_new_type'] = gov_type
+    context.user_data['awaiting_revolution_reason'] = True
+    await query.edit_message_text(
+        f"🚩 **НОВОЕ ПРАВЛЕНИЕ: {readable}**\n\n"
+        "Опишите причину восстания (минимум 16 символов):",
+        parse_mode='Markdown',
+        reply_markup=back_markup("government_menu", "🔙 В правление")
+    )
+
+
+async def handle_revolution_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if 'awaiting_revolution_reason' not in context.user_data or not update.message:
+        return
+    reason = update.message.text.strip()
+    if len(reason) < 16:
+        await update.message.reply_text("❌ Причина слишком короткая. Опишите подробнее (16+).")
+        return
+
+    user_id = update.effective_user.id
+    new_type = context.user_data.get('revolution_new_type', 'democracy')
+    gov = org_system.get_organization('Правительство') or {}
+    target_leader_id = gov.get('leader_id') or 0
+    supporters_needed = 120  # игра сложнее: нужно больше поддержки
+
+    success, message = org_system.start_revolution(
+        user_id,
+        target_leader_id,
+        new_type,
+        reason,
+        supporters_needed=supporters_needed
+    )
+
+    await update.message.reply_text(message)
+    for key in ['awaiting_revolution_reason', 'revolution_new_type']:
+        if key in context.user_data:
+            del context.user_data[key]
+
 async def join_revolution_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Присоединиться к революции"""
     query = update.callback_query
@@ -9122,6 +9328,121 @@ async def messages_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+
+async def view_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    inbox = org_system.get_messages(user_id, 'inbox')
+
+    text = "📥 **ВХОДЯЩИЕ ПИСЬМА**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    if not inbox:
+        text += "📭 Входящих сообщений нет."
+    else:
+        for msg in inbox[:15]:
+            mark = "🆕" if not msg.get('read_date') else "✅"
+            text += (
+                f"{mark} **{msg.get('subject') or 'Без темы'}**\n"
+                f"От: {msg.get('sender_name') or 'Неизвестно'}\n"
+                f"Дата: {(msg.get('created_date') or '')[:16]}\n"
+                f"{(msg.get('content') or '')[:140]}\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+            )
+            if not msg.get('read_date'):
+                org_system.mark_message_read(msg['id'], user_id)
+
+    keyboard = [
+        [InlineKeyboardButton("✉️ Написать", callback_data="compose_message")],
+        [InlineKeyboardButton("🔙 К письмам", callback_data="messages_menu")]
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+
+async def view_sent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    sent = org_system.get_messages(user_id, 'sent')
+
+    text = "📤 **ОТПРАВЛЕННЫЕ ПИСЬМА**\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    if not sent:
+        text += "📭 Отправленных сообщений нет."
+    else:
+        for msg in sent[:15]:
+            text += (
+                f"✅ **{msg.get('subject') or 'Без темы'}**\n"
+                f"Кому: {msg.get('sender_name') or 'Неизвестно'}\n"
+                f"Дата: {(msg.get('created_date') or '')[:16]}\n"
+                f"{(msg.get('content') or '')[:140]}\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+            )
+
+    keyboard = [
+        [InlineKeyboardButton("✉️ Написать", callback_data="compose_message")],
+        [InlineKeyboardButton("🔙 К письмам", callback_data="messages_menu")]
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+
+async def compose_message_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    players = org_system.list_recent_players(exclude_user_id=query.from_user.id, limit=20)
+    if not players:
+        await query.edit_message_text("❌ Нет получателей для выбора.", reply_markup=back_markup("messages_menu", "🔙 К письмам"))
+        return
+    await query.edit_message_text(
+        "✉️ **НОВОЕ ПИСЬМО**\n\nВыберите получателя:",
+        parse_mode='Markdown',
+        reply_markup=player_picker_markup(players, "pick_msgto_", "messages_menu", "🔙 К письмам")
+    )
+
+
+async def select_message_recipient(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    recipient_id = int(query.data.replace("pick_msgto_", "", 1))
+    recipient = org_system.get_user(recipient_id)
+    if not recipient:
+        await query.edit_message_text("❌ Получатель не найден.", reply_markup=back_markup("compose_message", "🔙 К выбору"))
+        return
+    context.user_data['message_recipient_id'] = recipient_id
+    context.user_data['awaiting_message_subject'] = True
+    await query.edit_message_text(
+        f"📨 Получатель: {recipient.get('full_name', 'Игрок')}\n\nВведите тему письма:",
+        reply_markup=back_markup("messages_menu", "🔙 К письмам")
+    )
+
+
+async def handle_message_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if 'awaiting_message_subject' not in context.user_data or not update.message:
+        return
+    subject = update.message.text.strip()
+    if len(subject) < 3:
+        await update.message.reply_text("❌ Тема слишком короткая.")
+        return
+    context.user_data['message_subject'] = subject[:120]
+    context.user_data['awaiting_message_content'] = True
+    del context.user_data['awaiting_message_subject']
+    await update.message.reply_text("Введите текст письма:")
+
+
+async def handle_message_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if 'awaiting_message_content' not in context.user_data or not update.message:
+        return
+    content = update.message.text.strip()
+    if len(content) < 5:
+        await update.message.reply_text("❌ Текст письма слишком короткий.")
+        return
+    sender_id = update.effective_user.id
+    recipient_id = context.user_data.get('message_recipient_id')
+    subject = context.user_data.get('message_subject', 'Без темы')
+    msg_id = org_system.send_message(sender_id, recipient_id, subject, content[:2000], msg_type='private')
+    await update.message.reply_text("✅ Письмо отправлено.")
+    for key in ['awaiting_message_content', 'message_recipient_id', 'message_subject']:
+        if key in context.user_data:
+            del context.user_data[key]
 
 # ==================== ФБР ФУНКЦИИ ====================
 
@@ -9564,6 +9885,9 @@ async def private_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE
         ("awaiting_job_application_text", handle_job_application_text),
         ("awaiting_education_application_text", handle_education_application_text),
         ("awaiting_teacher_application_text", handle_teacher_application_text),
+        ("awaiting_revolution_reason", handle_revolution_reason),
+        ("awaiting_message_subject", handle_message_subject),
+        ("awaiting_message_content", handle_message_content),
         ("awaiting_report_title", handle_report_title),
         ("awaiting_report_text", handle_report_text),
     ]
@@ -9602,15 +9926,20 @@ def register_org_handlers(application):
     
     # Действия в организациях
     application.add_handler(CallbackQueryHandler(start_arrest, pattern="^police_arrest$"))
+    application.add_handler(CallbackQueryHandler(select_arrest_target, pattern="^pick_arrest_"))
     application.add_handler(CallbackQueryHandler(police_investigation_menu, pattern="^police_investigate$"))
     application.add_handler(CallbackQueryHandler(police_wanted_menu, pattern="^police_wanted$"))
     application.add_handler(CallbackQueryHandler(start_treatment, pattern="^hospital_treat$"))
+    application.add_handler(CallbackQueryHandler(select_treatment_target, pattern="^pick_treat_"))
     application.add_handler(CallbackQueryHandler(hospital_diagnose_menu, pattern="^hospital_diagnose$"))
     application.add_handler(CallbackQueryHandler(hospital_prescribe_menu, pattern="^hospital_prescribe$"))
     application.add_handler(CallbackQueryHandler(start_loan, pattern="^bank_loan$"))
+    application.add_handler(CallbackQueryHandler(select_loan_applicant, pattern="^pick_loanapp_"))
     application.add_handler(CallbackQueryHandler(bank_service_menu, pattern="^bank_serve$"))
     application.add_handler(CallbackQueryHandler(bank_account_menu, pattern="^bank_account$"))
     application.add_handler(CallbackQueryHandler(government_laws_menu, pattern="^gov_laws$"))
+    application.add_handler(CallbackQueryHandler(create_rule_redirect, pattern="^create_rule$"))
+    application.add_handler(CallbackQueryHandler(my_rules_menu, pattern="^my_rules$"))
     application.add_handler(CallbackQueryHandler(government_budget_menu, pattern="^gov_budget$"))
     application.add_handler(CallbackQueryHandler(government_appointments_menu, pattern="^gov_appointments$"))
     application.add_handler(CallbackQueryHandler(tax_report_menu, pattern="^tax_report$"))
@@ -9662,13 +9991,16 @@ def register_org_handlers(application):
     application.add_handler(CallbackQueryHandler(gang_apply, pattern="^gang_apply_"))
     application.add_handler(CallbackQueryHandler(gang_application_decision, pattern="^gang_app_"))
     application.add_handler(CallbackQueryHandler(gang_attack_start, pattern="^gang_attack$"))
+    application.add_handler(CallbackQueryHandler(select_gang_attack_target, pattern="^pick_gangatk_"))
 
     # Суд
     application.add_handler(CallbackQueryHandler(court_menu, pattern="^court_menu$"))
     application.add_handler(CallbackQueryHandler(court_create_start, pattern="^court_create$"))
+    application.add_handler(CallbackQueryHandler(select_court_defendant, pattern="^pick_courtdef_"))
     application.add_handler(CallbackQueryHandler(court_list_cases, pattern="^court_list$"))
     application.add_handler(CallbackQueryHandler(court_review_queue, pattern="^court_queue$"))
     application.add_handler(CallbackQueryHandler(court_evidence_start, pattern="^court_evidence$"))
+    application.add_handler(CallbackQueryHandler(select_court_evidence_case, pattern="^pick_cevid_"))
     application.add_handler(CallbackQueryHandler(court_case_decision, pattern="^court_(accept|reject)_"))
 
     # Запрос лечения
@@ -9735,6 +10067,7 @@ def register_org_handlers(application):
     
     application.add_handler(CallbackQueryHandler(revolutions_list, pattern="^revolutions_list$"))
     application.add_handler(CallbackQueryHandler(start_revolution_menu, pattern="^start_revolution$"))
+    application.add_handler(CallbackQueryHandler(start_revolution_type, pattern="^start_rev_"))
     application.add_handler(CallbackQueryHandler(join_revolution_action, pattern="^join_revolution_"))
     
     # Назначение на должность
@@ -9744,6 +10077,10 @@ def register_org_handlers(application):
     
     # Письма и сообщения
     application.add_handler(CallbackQueryHandler(messages_menu, pattern="^messages_menu$"))
+    application.add_handler(CallbackQueryHandler(view_inbox, pattern="^view_inbox$"))
+    application.add_handler(CallbackQueryHandler(view_sent, pattern="^view_sent$"))
+    application.add_handler(CallbackQueryHandler(compose_message_start, pattern="^compose_message$"))
+    application.add_handler(CallbackQueryHandler(select_message_recipient, pattern="^pick_msgto_"))
     
     # ФБР
     application.add_handler(CallbackQueryHandler(fbi_menu, pattern="^fbi_menu$"))

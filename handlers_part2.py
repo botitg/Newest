@@ -4,7 +4,6 @@ handlers_part2.py - Обработчики организаций, бизнес�
 """
 
 import logging
-from typing import Any
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.filters import Command
@@ -12,11 +11,12 @@ from aiogram.fsm.context import FSMContext
 
 from database import db
 from states import (
-    OrganizationStates, BusinessStates, CitizenStates
+    OrganizationStates
 )
 from keyboards import (
     get_back_button, get_organization_list_keyboard, OrgCallback
 )
+from ui_media import send_section_screen
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -94,6 +94,20 @@ async def _can_manage_org(
     return await db.can_manage_organization(user_id, org_id)
 
 
+async def _can_broadcast_org_news_to_groups(
+    user_id: int,
+    org: dict | None,
+) -> bool:
+    info = org or {}
+    safe_user = int(user_id or 0)
+    if safe_user <= 0:
+        return False
+    if safe_user == int(info.get("leader_id") or 0):
+        return True
+    authority = await db.get_government_authority(safe_user)
+    return authority == "president"
+
+
 async def _get_manageable_orgs(user_id: int) -> list[dict]:
     orgs_short = await db.list_organizations()
     manageable: list[dict] = []
@@ -163,6 +177,9 @@ def _leader_panel_keyboard(org: dict, can_fire_leader: bool = False) -> list[lis
         [
             InlineKeyboardButton(text="💰 Финансы", callback_data=f"org_finances_{org_id}"),
             InlineKeyboardButton(text="💬 Чат", callback_data=f"org_chat_{org_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="💸 Выплата игроку", callback_data=f"org_pay_start_{org_id}_0"),
         ],
         [
             InlineKeyboardButton(text="📢 Пресс-центр", callback_data=f"org_news_start_{org_id}"),
@@ -298,6 +315,7 @@ def _leader_panel_keyboard(org: dict, can_fire_leader: bool = False) -> list[lis
             ]
         )
 
+    keyboard.append([InlineKeyboardButton(text="🚀 Инициатива руководства", callback_data=f"org_initiative_{org_id}")])
     keyboard.append([InlineKeyboardButton(text="🔄 Обновить панель", callback_data=f"manage_organization_{org_id}")])
     keyboard.append(
         [
@@ -334,6 +352,81 @@ async def _render_leader_panel(callback: CallbackQuery, state: FSMContext, org: 
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode=None)
 
 
+async def _render_org_payout_player_picker(
+    callback: CallbackQuery,
+    org: dict,
+    page: int = 0,
+    notice: str = "",
+):
+    if callback.message is None:
+        return
+    org_id = int(org.get("id") or 0)
+    if org_id <= 0:
+        await callback.answer("❌ Организация не найдена.", show_alert=True)
+        return
+
+    safe_page = max(0, int(page or 0))
+    page_size = 8
+    total_players = max(0, int(await db.count_players() or 0))
+    max_page = max(0, (total_players - 1) // page_size) if total_players > 0 else 0
+    if safe_page > max_page:
+        safe_page = max_page
+    offset = safe_page * page_size
+    players = await db.get_players_page(limit=page_size, offset=offset)
+
+    lines = [
+        f"💸 ВЫПЛАТА ИЗ БЮДЖЕТА: {_safe_text(org.get('name'), 'Организация')}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Бюджет: {float(org.get('budget') or 0):,.2f} люмов",
+        f"Страница: {safe_page + 1}/{max_page + 1}",
+        "",
+    ]
+    if notice:
+        lines.append(_safe_text(notice))
+        lines.append("")
+    lines.append("Выберите игрока для выплаты:")
+
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+    if not players:
+        lines.append("• Список игроков пуст.")
+    else:
+        for player in players:
+            user_id = int(player.get("user_id") or 0)
+            if user_id <= 0:
+                continue
+            display_name = _display_name_from_row(player, fallback_id=user_id)
+            short_name = display_name if len(display_name) <= 28 else display_name[:25] + "..."
+            lines.append(f"• {display_name} (ID {user_id})")
+            keyboard_rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"👤 {short_name}",
+                        callback_data=f"org_pay_pick_{org_id}_{user_id}_{safe_page}",
+                    )
+                ]
+            )
+
+    nav_row: list[InlineKeyboardButton] = []
+    if safe_page > 0:
+        nav_row.append(
+            InlineKeyboardButton(text="⬅️", callback_data=f"org_pay_start_{org_id}_{safe_page - 1}")
+        )
+    if safe_page < max_page:
+        nav_row.append(
+            InlineKeyboardButton(text="➡️", callback_data=f"org_pay_start_{org_id}_{safe_page + 1}")
+        )
+    if nav_row:
+        keyboard_rows.append(nav_row)
+    keyboard_rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"org_pay_start_{org_id}_{safe_page}")])
+    keyboard_rows.append([InlineKeyboardButton(text="🔙 В панель", callback_data=f"manage_organization_{org_id}")])
+
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+        parse_mode=None,
+    )
+
+
 # ============================================================================
 # ОРГАНИЗАЦИИ - ОСНОВНОЕ МЕНЮ И ПРОСМОТР
 # ============================================================================
@@ -342,10 +435,7 @@ async def _render_leader_panel(callback: CallbackQuery, state: FSMContext, org: 
 @router.callback_query(F.data == "orgs_main")
 async def organizations_menu(event, state: FSMContext):
     """Главное меню организаций"""
-    if isinstance(event, Message):
-        message = event
-    else:
-        message = event.message
+    if not isinstance(event, Message):
         await event.answer()
     
     user_id = event.from_user.id
@@ -358,7 +448,7 @@ async def organizations_menu(event, state: FSMContext):
     
     if user.get('organization'):
         text += f"Ваша должность: {_safe_text(user.get('role'), 'Нет')}\n"
-        text += f"Зарплата: ${float(user.get('salary', 0) or 0):.2f}/день\n\n"
+        text += f"Зарплата: {float(user.get('salary', 0) or 0):,.2f} люмов/час\n\n"
     
     text += "Выберите организацию для просмотра или присоединения:"
     
@@ -372,10 +462,13 @@ async def organizations_menu(event, state: FSMContext):
         )
     
     await state.set_state(OrganizationStates.org_menu)
-    if isinstance(event, CallbackQuery):
-        await message.edit_text(text, reply_markup=reply_markup, parse_mode=None)
-    else:
-        await message.answer(text, reply_markup=reply_markup, parse_mode=None)
+    await send_section_screen(
+        event,
+        text=text,
+        reply_markup=reply_markup,
+        parse_mode=None,
+        section_key="org",
+    )
 
 
 @router.callback_query(OrgCallback.filter(F.action == "view_org"))
@@ -399,20 +492,28 @@ async def view_organization(callback: CallbackQuery, state: FSMContext, callback
     text = f"🏛️ {_safe_text(org.get('name'), 'Неизвестно')}\n━━━━━━━━━━━━━━━━━━━━\n\n"
     text += f"📖 Описание: {_safe_text(org.get('description'), 'Нет')}\n"
     text += f"👥 Членов: {int(org.get('members', 0) or 0)}\n"
-    text += f"💰 Бюджет: ${float(org.get('budget', 0) or 0):.2f}\n"
+    text += f"💰 Бюджет: {float(org.get('budget', 0) or 0):,.2f} люмов\n"
     text += f"⭐ Репутация: {_safe_text(org.get('reputation', 50), '50')}/100\n\n"
     
     if org.get('leader_id'):
         leader = await db.get_user(org.get('leader_id'))
         leader_name = _display_name_from_row(leader or {}, fallback_id=int(org.get('leader_id') or 0))
         text += f"👑 Лидер: {leader_name}\n\n"
-    
+
+    is_member = await db.is_user_org_member(callback.from_user.id, org_id)
+    if not is_member:
+        user_org_name = _normalized((await db.get_user(callback.from_user.id) or {}).get("organization"))
+        is_member = user_org_name == _normalized(org.get("name"))
+
     keyboard = [
         [InlineKeyboardButton(text="👥 Члены", callback_data=f"org_members_{org_id}")],
         [InlineKeyboardButton(text="💬 Чат организации", callback_data=f"org_chat_{org_id}")],
-        [InlineKeyboardButton(text="📝 Подать заявку", callback_data=f"apply_org_{org_id}")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="orgs_main")]
     ]
+    if is_member:
+        keyboard.append([InlineKeyboardButton(text="🚪 Покинуть организацию", callback_data=f"leave_org_{org_id}")])
+    else:
+        keyboard.append([InlineKeyboardButton(text="📝 Подать заявку", callback_data=f"apply_org_{org_id}")])
+    keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="orgs_main")])
 
     kind = _org_kind(org)
     service_map: dict[str, tuple[str, str]] = {
@@ -435,6 +536,24 @@ async def view_organization(callback: CallbackQuery, state: FSMContext, callback
     await state.set_state(OrganizationStates.viewing_org)
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode=None)
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("leave_org_"))
+async def leave_organization_action(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    raw = (callback.data or "").replace("leave_org_", "")
+    if not raw.isdigit():
+        await callback.answer("❌ Некорректный ID организации.", show_alert=True)
+        return
+
+    org_id = int(raw)
+    ok, msg, payload = await db.leave_organization(callback.from_user.id, org_id=org_id)
+    if ok:
+        org_name = str((payload or {}).get("org_name") or "организацию")
+        await callback.message.answer(f"✅ {msg}\nВы вышли из: {org_name}", parse_mode=None)
+    else:
+        await callback.message.answer(f"❌ {msg}", parse_mode=None)
+    await organizations_menu(callback, state)
 
 
 @router.callback_query(F.data.startswith("view_org_"))
@@ -837,6 +956,30 @@ async def review_applications_for_org(callback: CallbackQuery, state: FSMContext
     await feature_review_applications(callback, state)
 
 
+@router.callback_query(F.data.startswith("org_initiative_"))
+async def org_initiative(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    raw = (callback.data or "").replace("org_initiative_", "")
+    if not raw.isdigit():
+        await callback.answer("❌ Некорректная организация.", show_alert=True)
+        return
+    org_id = int(raw)
+    ok, msg, payload = await db.run_org_initiative(callback.from_user.id, org_id)
+    await callback.answer(("✅ " if ok else "❌ ") + msg, show_alert=not ok)
+    updated_org = await db.get_organization_by_id(org_id)
+    if updated_org and await _can_manage_org(callback.from_user.id, updated_org):
+        await _render_leader_panel(callback, state, updated_org)
+        return
+    if callback.message:
+        await callback.message.edit_text(
+            ("✅ " if ok else "❌ ") + msg,
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="🔙 К организациям", callback_data="orgs_main")]]
+            ),
+            parse_mode=None,
+        )
+
+
 @router.callback_query(F.data == "manage_members")
 async def manage_members(callback: CallbackQuery, state: FSMContext):
     """Прокси на рабочий экран сотрудников организации."""
@@ -863,6 +1006,155 @@ async def manage_members_for_org(callback: CallbackQuery, state: FSMContext):
     await state.update_data(managed_org_id=org_id)
     from feature_pack import feature_manage_members
     await feature_manage_members(callback, state)
+
+
+@router.callback_query(F.data.startswith("org_pay_start_"))
+async def org_pay_start(callback: CallbackQuery, state: FSMContext):
+    """Выбор игрока для выплаты из бюджета организации."""
+    await callback.answer()
+    tail = (callback.data or "").replace("org_pay_start_", "")
+    parts = tail.split("_")
+    if len(parts) < 1 or not parts[0].isdigit():
+        await callback.answer("❌ Некорректный формат запроса.", show_alert=True)
+        return
+    org_id = int(parts[0])
+    page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+
+    org = await db.get_organization_by_id(org_id)
+    if not org:
+        await callback.answer("❌ Организация не найдена.", show_alert=True)
+        return
+    if not await _can_manage_org(callback.from_user.id, org):
+        await callback.answer("❌ Нет прав на выплаты из бюджета.", show_alert=True)
+        return
+
+    await state.update_data(managed_org_id=org_id)
+    await _render_org_payout_player_picker(callback, org, page=page)
+
+
+@router.callback_query(F.data.startswith("org_pay_pick_"))
+async def org_pay_pick(callback: CallbackQuery, state: FSMContext):
+    """Выбор суммы выплаты для конкретного игрока."""
+    await callback.answer()
+    tail = (callback.data or "").replace("org_pay_pick_", "")
+    parts = tail.split("_")
+    if len(parts) < 3 or not all(part.isdigit() for part in parts[:3]):
+        await callback.answer("❌ Некорректные параметры выплаты.", show_alert=True)
+        return
+    org_id = int(parts[0])
+    target_user_id = int(parts[1])
+    page = int(parts[2])
+
+    org = await db.get_organization_by_id(org_id)
+    if not org:
+        await callback.answer("❌ Организация не найдена.", show_alert=True)
+        return
+    if not await _can_manage_org(callback.from_user.id, org):
+        await callback.answer("❌ Нет прав на выплаты из бюджета.", show_alert=True)
+        return
+
+    target = await db.get_user(target_user_id)
+    if not target:
+        await callback.answer("❌ Игрок не найден.", show_alert=True)
+        return
+
+    budget = round(float(org.get("budget") or 0), 2)
+    target_name = _display_name_from_row(target, fallback_id=target_user_id)
+    target_balance = round(float(target.get("balance") or 0), 2)
+    lines = [
+        f"💸 ВЫПЛАТА ИГРОКУ: {_safe_text(org.get('name'), 'Организация')}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Игрок: {target_name} (ID {target_user_id})",
+        f"Баланс игрока: {target_balance:,.2f} люмов",
+        f"Бюджет организации: {budget:,.2f} люмов",
+        "",
+        "Выберите сумму выплаты:",
+    ]
+
+    preset_amounts = [500, 1000, 2500, 5000, 10_000, 25_000, 50_000, 100_000]
+    dynamic = [int(max(1, round(budget * 0.01))), int(max(1, round(budget * 0.05)))]
+    candidates = sorted(set(preset_amounts + dynamic))
+    amounts = [amt for amt in candidates if 0 < amt <= max(0.0, budget)]
+    if not amounts and budget > 0:
+        amounts = [int(max(1, round(min(budget, 1000.0))))]
+
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+    if not amounts:
+        lines.append("❌ В бюджете недостаточно средств даже для минимальной выплаты.")
+    else:
+        row: list[InlineKeyboardButton] = []
+        for amount in amounts[:8]:
+            row.append(
+                InlineKeyboardButton(
+                    text=f"{amount:,.0f} лм",
+                    callback_data=f"org_pay_do_{org_id}_{target_user_id}_{int(amount)}_{page}",
+                )
+            )
+            if len(row) == 2:
+                keyboard_rows.append(row)
+                row = []
+        if row:
+            keyboard_rows.append(row)
+
+    keyboard_rows.append([InlineKeyboardButton(text="👥 Сменить игрока", callback_data=f"org_pay_start_{org_id}_{page}")])
+    keyboard_rows.append([InlineKeyboardButton(text="🔙 В панель", callback_data=f"manage_organization_{org_id}")])
+    if callback.message is not None:
+        await callback.message.edit_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+            parse_mode=None,
+        )
+
+
+@router.callback_query(F.data.startswith("org_pay_do_"))
+async def org_pay_do(callback: CallbackQuery, state: FSMContext):
+    """Подтвердить и провести выплату из бюджета организации."""
+    await callback.answer()
+    tail = (callback.data or "").replace("org_pay_do_", "")
+    parts = tail.split("_")
+    if len(parts) < 4 or not all(part.isdigit() for part in parts[:4]):
+        await callback.answer("❌ Некорректные параметры выплаты.", show_alert=True)
+        return
+    org_id = int(parts[0])
+    target_user_id = int(parts[1])
+    amount = float(parts[2])
+    page = int(parts[3])
+
+    org = await db.get_organization_by_id(org_id)
+    if not org:
+        await callback.answer("❌ Организация не найдена.", show_alert=True)
+        return
+    if not await _can_manage_org(callback.from_user.id, org):
+        await callback.answer("❌ Нет прав на выплаты из бюджета.", show_alert=True)
+        return
+
+    ok, msg, payload = await db.pay_organization_bonus(
+        actor_id=callback.from_user.id,
+        org_id=org_id,
+        target_user_id=target_user_id,
+        amount=amount,
+        reason=f"Распоряжение руководства ({_safe_text(org.get('name'), 'Организация')})",
+    )
+    if not ok:
+        await callback.answer(msg, show_alert=True)
+        await _render_org_payout_player_picker(
+            callback,
+            org,
+            page=page,
+            notice=f"❌ {msg}",
+        )
+        return
+
+    updated_org = await db.get_organization_by_id(org_id) or org
+    target = await db.get_user(target_user_id) or {}
+    target_name = _display_name_from_row(target, fallback_id=target_user_id)
+    notice = (
+        f"✅ {msg}\n"
+        f"Игрок: {target_name}\n"
+        f"Сумма: {float(payload.get('amount') or amount):,.2f} люмов\n"
+        f"Новый бюджет: {float(payload.get('budget_after') or updated_org.get('budget') or 0):,.2f} люмов"
+    )
+    await _render_org_payout_player_picker(callback, updated_org, page=page, notice=notice)
 
 
 @router.callback_query(F.data == "org_finances")
@@ -924,7 +1216,7 @@ async def org_activity_dashboard(callback: CallbackQuery, state: FSMContext):
         f"Бюджет: ${float(snapshot.get('budget') or 0):,.2f}",
         "",
         f"Сотрудников: {int(snapshot.get('members') or 0)}",
-        f"Фонд зарплат (день): ${float(snapshot.get('payroll_daily') or 0):,.2f}",
+        f"Фонд зарплат (час): ${float(snapshot.get('payroll_daily') or 0):,.2f}",
         f"Заявок в ожидании: {int(snapshot.get('pending_apps') or 0)}",
         "",
         f"Чат за {int(snapshot.get('hours') or 24)}ч: {int(snapshot.get('chat_messages') or 0)}",
@@ -1036,7 +1328,8 @@ async def org_news_submit(message: Message, state: FSMContext):
 
     sent_groups = 0
     failed_groups = 0
-    if ok and news_id > 0 and _org_kind(org) == "government":
+    can_group_broadcast = await _can_broadcast_org_news_to_groups(message.from_user.id, org)
+    if ok and news_id > 0 and _org_kind(org) == "government" and can_group_broadcast:
         sent_groups, failed_groups = await _broadcast_government_news_to_groups(
             bot=message.bot,
             org=org,
@@ -1051,7 +1344,10 @@ async def org_news_submit(message: Message, state: FSMContext):
     if ok and news_id > 0:
         text += f"\n\nID новости: {news_id}"
     if ok and _org_kind(org) == "government":
-        text += f"\n📡 Рассылка в группы: отправлено {sent_groups}, ошибок {failed_groups}."
+        if can_group_broadcast:
+            text += f"\n📡 Рассылка в группы: отправлено {sent_groups}, ошибок {failed_groups}."
+        else:
+            text += "\n📡 Рассылка в группы не выполнена: доступ есть только у лидера организации или президента."
 
     await message.answer(
         text,

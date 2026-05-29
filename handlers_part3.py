@@ -5,7 +5,6 @@ handlers_part3.py - расширенные панели силовых и сер
 from __future__ import annotations
 
 import logging
-import random
 from datetime import datetime, timedelta
 
 import aiosqlite
@@ -18,6 +17,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from database import db
 from keyboards import get_back_button
 from states import OrganizationStates
+from ui_media import send_section_screen
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -76,6 +76,18 @@ def _is_judge_like(user: dict | None) -> bool:
     return _has_any(info.get("role"), "суд", "judge", "court") or _has_any(info.get("organization"), "суд", "court")
 
 
+async def _can_access_bank_staff(user_id: int, user: dict | None = None) -> bool:
+    info = user or await db.get_user(user_id) or {}
+    authority = await db.get_government_authority(user_id)
+    if authority in {"president", "vice_president", "finance_minister", "minister"}:
+        return True
+    if _has_any(info.get("role"), "банк", "bank", "кредит", "credit"):
+        return True
+    if _has_any(info.get("organization"), "банк", "bank"):
+        return True
+    return await _belongs_to_org_type(user_id, "bank")
+
+
 # ============================================================================
 # ПОЛИЦИЯ
 # ============================================================================
@@ -130,7 +142,13 @@ async def police_menu(callback: CallbackQuery, state: FSMContext):
         ]
     )
     await state.set_state(OrganizationStates.org_menu)
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    await send_section_screen(
+        callback,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+        section_key="nbr",
+    )
     await callback.answer()
 
 @router.callback_query(F.data == "police_search_suspects")
@@ -172,10 +190,12 @@ async def fbi_menu(callback: CallbackQuery, state: FSMContext):
     user = await db.get_user(user_id) or {}
     if not await _can_access_fbi(user_id, user):
         await callback.answer("Доступ только для ФБР.", show_alert=True)
-        await callback.message.edit_text(
-            "❌ Доступ только для сотрудников ФБР и руководства государства.",
+        await send_section_screen(
+            callback,
+            text="❌ Доступ только для сотрудников ФБР и руководства государства.",
             reply_markup=get_back_button(),
             parse_mode=None,
+            section_key="nbr",
         )
         return
 
@@ -214,7 +234,13 @@ async def fbi_menu(callback: CallbackQuery, state: FSMContext):
         ]
     )
     await state.set_state(OrganizationStates.org_menu)
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    await send_section_screen(
+        callback,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+        section_key="nbr",
+    )
     await callback.answer()
 
 @router.callback_query(F.data == "fbi_intercept_messages")
@@ -259,7 +285,13 @@ async def fbi_statistics(callback: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="🔙 Назад", callback_data="fbi_menu")],
         ]
     )
-    await callback.message.edit_text("\n".join(lines), reply_markup=keyboard, parse_mode=None)
+    await send_section_screen(
+        callback,
+        text="\n".join(lines),
+        reply_markup=keyboard,
+        parse_mode=None,
+        section_key="nbr",
+    )
     await callback.answer()
 
 
@@ -284,7 +316,13 @@ async def fbi_operations(callback: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="🔙 Назад", callback_data="fbi_menu")],
         ]
     )
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode=None)
+    await send_section_screen(
+        callback,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode=None,
+        section_key="nbr",
+    )
     await callback.answer()
 
 
@@ -313,6 +351,9 @@ async def court_menu(callback: CallbackQuery, state: FSMContext):
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
+                    InlineKeyboardButton(text="📝 Подать иск", callback_data="fp_court_file_start"),
+                ],
+                [
                     InlineKeyboardButton(text="📂 Дела", callback_data="court_cases"),
                     InlineKeyboardButton(text="👤 Подсудимые", callback_data="court_defendants"),
                 ],
@@ -324,6 +365,7 @@ async def court_menu(callback: CallbackQuery, state: FSMContext):
     else:
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
+                [InlineKeyboardButton(text="📝 Подать иск", callback_data="fp_court_file_start")],
                 [InlineKeyboardButton(text="📂 Дела в суде", callback_data="court_cases")],
                 [InlineKeyboardButton(text="📋 Мой статус", callback_data="court_status")],
                 [InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_main")],
@@ -370,10 +412,7 @@ async def court_status(callback: CallbackQuery, state: FSMContext):
 @router.message(Command("loan"))
 @router.callback_query(F.data == "bank_menu")
 async def bank_menu(event, state: FSMContext):
-    if isinstance(event, Message):
-        message = event
-    else:
-        message = event.message
+    if not isinstance(event, Message):
         await event.answer()
 
     user = await db.get_user(event.from_user.id) or {}
@@ -383,7 +422,7 @@ async def bank_menu(event, state: FSMContext):
         f"Наличные: ${float(user.get('balance') or 0):,.2f}\n"
         f"На счете: ${float(user.get('bank') or 0):,.2f}\n"
         f"Налоговый долг: ${float(user.get('tax_debt') or 0):,.2f}\n\n"
-        "Выберите действие:"
+        "Банк не просто хранит деньги: он начисляет проценты, проводит переводы и выдает кредиты под риск."
     )
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -393,11 +432,15 @@ async def bank_menu(event, state: FSMContext):
             ],
             [
                 InlineKeyboardButton(text="📊 История банка", callback_data="bank_history"),
-                InlineKeyboardButton(text="� История переводов", callback_data="transfer_history_menu"),
+                InlineKeyboardButton(text="🔁 История переводов", callback_data="transfer_history_menu"),
             ],
             [
                 InlineKeyboardButton(text="📄 Мои кредиты", callback_data="loan_my_status"),
                 InlineKeyboardButton(text="💸 Перевод игроку", callback_data="bank_transfer_start"),
+            ],
+            [
+                InlineKeyboardButton(text="🧑‍💼 Кредитный отдел", callback_data="loan_staff_panel"),
+                InlineKeyboardButton(text="💵 Внести платеж", callback_data="loan_my_status"),
             ],
             [
                 InlineKeyboardButton(text="🏪 Бизнесы", callback_data="biz_menu"),
@@ -414,11 +457,14 @@ async def bank_menu(event, state: FSMContext):
             ],
         ]
     )
-    await state.set_state(OrganizationStates.org_menu)
-    if isinstance(event, CallbackQuery):
-        await message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
-    else:
-        await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
+    await state.clear()
+    await send_section_screen(
+        event,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+        section_key="bank",
+    )
 
 
 @router.callback_query(F.data == "loan_request")
@@ -431,7 +477,8 @@ async def loan_request_menu(callback: CallbackQuery, state: FSMContext):
         "• 10,000\n"
         "• 20,000\n"
         "• 35,000\n\n"
-        "Ставка зависит от вашего кредитного рейтинга."
+        "Ставка зависит от кредитного рейтинга: репутация и образование помогают, долги мешают.\n"
+        "Сильные заявки одобряются автоматически, рискованные уходят банкирам на ручную проверку."
     )
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -447,7 +494,13 @@ async def loan_request_menu(callback: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="🔙 Назад", callback_data="bank_menu")],
         ]
     )
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode=None)
+    await send_section_screen(
+        callback,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode=None,
+        section_key="credit",
+    )
     await callback.answer()
 
 
@@ -478,7 +531,7 @@ async def loan_apply(callback: CallbackQuery, state: FSMContext):
     approved = credit_score >= 560 and tax_debt <= 180_000
     status = "approved" if approved else "pending"
 
-    async with aiosqlite.connect(db.db_path) as conn:
+    async with db._connect() as conn:
         conn.row_factory = aiosqlite.Row
         await conn.execute("BEGIN IMMEDIATE")
         async with conn.execute(
@@ -559,7 +612,7 @@ async def loan_apply(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "loan_my_status")
 async def loan_my_status(callback: CallbackQuery, state: FSMContext):
     rows: list[dict] = []
-    async with aiosqlite.connect(db.db_path) as conn:
+    async with db._connect() as conn:
         conn.row_factory = aiosqlite.Row
         async with conn.execute(
             """
@@ -573,32 +626,158 @@ async def loan_my_status(callback: CallbackQuery, state: FSMContext):
         ) as cur:
             rows = [dict(r) for r in await cur.fetchall()]
 
-    lines = ["📄 МОИ КРЕДИТНЫЕ ЗАЯВКИ", "━━━━━━━━━━━━━━━━━━━━", ""]
+    lines = ["📄 МОИ КРЕДИТЫ И ЗАЯВКИ", "━━━━━━━━━━━━━━━━━━━━", ""]
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
     if not rows:
         lines.append("Заявок пока нет.")
     else:
         for row in rows:
+            loan_id = int(row.get("id") or 0)
             created = str(row.get("application_date") or "")[:16]
             status = str(row.get("status") or "pending")
             lines.append(
-                f"[{created}] {status.upper()} | "
+                f"#{loan_id} [{created}] {status.upper()} | "
                 f"${float(row.get('amount') or 0):,.0f} | "
                 f"скор {int(row.get('credit_score') or 0)}"
             )
-            lines.append(f"Остаток: ${float(row.get('remaining_balance') or 0):,.2f}")
+            lines.append(
+                f"Остаток: ${float(row.get('remaining_balance') or 0):,.2f} | "
+                f"ставка {float(row.get('interest_rate') or 0) * 100:.1f}%"
+            )
+            if status in {"approved", "active"} and float(row.get("remaining_balance") or 0) > 0:
+                keyboard_rows.append(
+                    [
+                        InlineKeyboardButton(text=f"💵 Платеж #{loan_id}", callback_data=f"loan_repay_scheduled_{loan_id}"),
+                        InlineKeyboardButton(text=f"✅ Закрыть #{loan_id}", callback_data=f"loan_repay_full_{loan_id}"),
+                    ]
+                )
             lines.append("")
+
+    keyboard_rows.extend(
+        [
+            [InlineKeyboardButton(text="➕ Новая заявка", callback_data="loan_request")],
+            [InlineKeyboardButton(text="🧑‍💼 Кредитный отдел", callback_data="loan_staff_panel")],
+            [InlineKeyboardButton(text="🔙 В банк", callback_data="bank_menu")],
+        ]
+    )
 
     await callback.message.edit_text(
         "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows[:24]),
+        parse_mode=None,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("loan_repay_"))
+async def loan_repay_action(callback: CallbackQuery, state: FSMContext):
+    parts = str(callback.data or "").split("_")
+    if len(parts) < 4 or not parts[3].isdigit():
+        await callback.answer("Некорректный кредит.", show_alert=True)
+        return
+    mode = parts[2]
+    loan_id = int(parts[3])
+    ok, msg, payload = await db.repay_loan(callback.from_user.id, loan_id, mode=mode)
+    payload = payload or {}
+    if not ok:
+        await callback.answer(msg, show_alert=True)
+        return
+    await callback.message.answer(
+        "✅ Платеж по кредиту\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"{msg}\n"
+        f"Платеж: ${float(payload.get('payment') or 0):,.2f}\n"
+        f"Остаток: ${float(payload.get('remaining_balance') or 0):,.2f}\n"
+        f"Баланс: ${float(payload.get('balance') or 0):,.2f}",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="➕ Новая заявка", callback_data="loan_request")],
+                [InlineKeyboardButton(text="📄 Мои кредиты", callback_data="loan_my_status")],
                 [InlineKeyboardButton(text="🔙 В банк", callback_data="bank_menu")],
             ]
         ),
         parse_mode=None,
     )
+    await loan_my_status(callback, state)
+
+
+@router.callback_query(F.data == "loan_staff_panel")
+async def loan_staff_panel(callback: CallbackQuery, state: FSMContext):
+    user = await db.get_user(callback.from_user.id) or {}
+    if not await _can_access_bank_staff(callback.from_user.id, user):
+        await callback.answer("Кредитный отдел доступен сотрудникам банка и правительству.", show_alert=True)
+        return
+    rows = await db.list_pending_loan_applications(limit=12)
+    lines = [
+        "🧑‍💼 КРЕДИТНЫЙ ОТДЕЛ БАНКА",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "Банкиры проверяют рискованные заявки: скоринг, долги, репутацию и пользу кредита.",
+        "",
+    ]
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+    if not rows:
+        lines.append("Очередь заявок пуста. Можно выдохнуть и проверить проценты по депозитам.")
+    else:
+        for row in rows:
+            loan_id = int(row.get("id") or 0)
+            lines.append(
+                f"#{loan_id} {row.get('applicant_name')} | ${float(row.get('amount') or 0):,.0f}\n"
+                f"  скор {int(row.get('credit_score') or 0)} | реп {float(row.get('applicant_reputation') or 0):.1f} | "
+                f"долг ${float(row.get('applicant_tax_debt') or 0):,.0f}\n"
+                f"  ставка {float(row.get('interest_rate') or 0) * 100:.1f}% | к возврату ${float(row.get('remaining_balance') or 0):,.0f}"
+            )
+            keyboard_rows.append(
+                [
+                    InlineKeyboardButton(text=f"✅ Одобрить #{loan_id}", callback_data=f"loan_staff_approve_{loan_id}"),
+                    InlineKeyboardButton(text=f"❌ Отклонить #{loan_id}", callback_data=f"loan_staff_reject_{loan_id}"),
+                ]
+            )
+    keyboard_rows.extend(
+        [
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data="loan_staff_panel")],
+            [InlineKeyboardButton(text="🔙 В банк", callback_data="bank_menu")],
+        ]
+    )
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows[:24]),
+        parse_mode=None,
+    )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("loan_staff_approve_"))
+@router.callback_query(F.data.startswith("loan_staff_reject_"))
+async def loan_staff_review(callback: CallbackQuery, state: FSMContext):
+    user = await db.get_user(callback.from_user.id) or {}
+    if not await _can_access_bank_staff(callback.from_user.id, user):
+        await callback.answer("Нет доступа к кредитному отделу.", show_alert=True)
+        return
+    approve = str(callback.data or "").startswith("loan_staff_approve_")
+    raw = str(callback.data or "").replace("loan_staff_approve_", "").replace("loan_staff_reject_", "")
+    if not raw.isdigit():
+        await callback.answer("Некорректная заявка.", show_alert=True)
+        return
+    ok, msg, payload = await db.review_loan_application(int(raw), callback.from_user.id, approve=approve)
+    payload = payload or {}
+    if not ok:
+        await callback.answer(msg, show_alert=True)
+        await loan_staff_panel(callback, state)
+        return
+    applicant_id = int(payload.get("applicant_id") or 0)
+    amount = float(payload.get("amount") or 0)
+    try:
+        await callback.bot.send_message(
+            applicant_id,
+            ("✅ Ваш кредит одобрен\n" if approve else "❌ Ваша кредитная заявка отклонена\n")
+            + "━━━━━━━━━━━━━━━━━━━━\n"
+            + (f"Сумма зачислена: ${amount:,.2f}\n" if approve else f"Заявка: ${amount:,.2f}\n")
+            + "Решение принято кредитным отделом банка.",
+            parse_mode=None,
+        )
+    except Exception:
+        pass
+    await callback.answer(msg, show_alert=True)
+    await loan_staff_panel(callback, state)
 
 
 @router.callback_query(F.data == "bank_deposit")
@@ -703,13 +882,6 @@ async def transfer_history_sent(callback: CallbackQuery, state: FSMContext):
             note = str(tx.get("note") or "")
             
             total_sent += amount
-            
-            # Извлекаем ID получателя из note если возможно
-            recipient_info = ""
-            if "Кому:" in note or "Кому:" in note:
-                parts = note.split("Кому:")
-                if len(parts) > 1:
-                    recipient_info = parts[1].split(".")[0].strip()
             
             lines.append(f"💸 [{created}] ${amount:,.2f}")
             if note:
@@ -942,8 +1114,7 @@ async def bank_transfer_amount_input(message: Message, state: FSMContext):
     total_debit = float(details.get("total_debit") or amount_value)
     new_balance = float(details.get("sender_balance") or 0)
     
-    # Расчет баланса после операции
-    final_balance = round(new_balance - total_debit, 2)
+    final_balance = round(new_balance, 2)
     
     confirmation_lines = [
         "✅ Перевод выполнен",
@@ -1099,7 +1270,7 @@ async def hospital_confirm_appointment(callback: CallbackQuery, state: FSMContex
 
 @router.callback_query(F.data == "hospital_history")
 async def hospital_history(callback: CallbackQuery, state: FSMContext):
-    async with aiosqlite.connect(db.db_path) as conn:
+    async with db._connect() as conn:
         conn.row_factory = aiosqlite.Row
         async with conn.execute(
             """
@@ -1136,4 +1307,5 @@ async def hospital_history(callback: CallbackQuery, state: FSMContext):
         parse_mode=None,
     )
     await callback.answer()
+
 

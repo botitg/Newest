@@ -13,6 +13,10 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dotenv import load_dotenv
 
+# Загружаем .env до импорта внутренних модулей, чтобы настройки были доступны в import-time.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(dotenv_path=os.path.join(BASE_DIR, ".env"))
+
 # Подавляем предупреждение pydantic об aiogram
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -36,7 +40,6 @@ from database import db
 from middlewares import (
     ActionBanMiddleware,
     EnsureUserMiddleware,
-    GlobalLockMiddleware,
     MandatoryNicknameMiddleware,
     RateLimitMiddleware,
 )
@@ -48,6 +51,7 @@ from presidential_admin import router as presidential_router
 from fbi_intercept import router as fbi_router
 from revolutions import router as revolution_router
 from economy import run_daily_economy_cycle, run_state_money_print_processor
+from ai_governance import run_ai_governance_cycle
 
 # Настройка логирования
 logging.basicConfig(
@@ -55,10 +59,140 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("aiogram.event").setLevel(logging.WARNING)
+logging.getLogger("aiogram.dispatcher").setLevel(logging.WARNING)
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(dotenv_path=os.path.join(BASE_DIR, ".env"))
 TOKEN = os.getenv("BOT_TOKEN")
+INSTANCE_LOCK_PATH = os.path.join(BASE_DIR, ".bot_instance.lock")
+
+
+class _AiogramDispatcherNoiseFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = str(record.getMessage() or "").lower()
+        if "telegramconflicterror" in msg:
+            return False
+        if "terminated by other getupdates request" in msg:
+            return False
+        if "failed to fetch updates" in msg and "conflict" in msg:
+            return False
+        if "sleep for" in msg and "try again" in msg and "bot id" in msg:
+            return False
+        return True
+
+
+logging.getLogger("aiogram.dispatcher").addFilter(_AiogramDispatcherNoiseFilter())
+
+
+class SingleInstanceLock:
+    def __init__(self, lock_path: str):
+        self.lock_path = lock_path
+        self._fh = None
+        self._locked = False
+
+    def acquire(self) -> bool:
+        os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
+        try:
+            self._fh = open(self.lock_path, "a+", encoding="utf-8")
+            self._fh.seek(0)
+            if not self._fh.read(1):
+                self._fh.seek(0)
+                self._fh.write("0")
+                self._fh.flush()
+            self._fh.seek(0)
+        except Exception:
+            try:
+                if self._fh is not None:
+                    self._fh.close()
+            except Exception:
+                pass
+            self._fh = None
+            self._locked = False
+            return False
+
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except Exception:
+            try:
+                self._fh.close()
+            except Exception:
+                pass
+            self._fh = None
+            self._locked = False
+            return False
+
+        self._fh.seek(0)
+        self._fh.truncate()
+        self._fh.write(str(os.getpid()))
+        self._fh.flush()
+        self._locked = True
+        return True
+
+    def release(self) -> None:
+        if not self._fh:
+            return
+        try:
+            if self._locked:
+                if os.name == "nt":
+                    import msvcrt
+
+                    self._fh.seek(0)
+                    msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+        self._fh = None
+        self._locked = False
+
+# Универсальная защита от edit_text на фото-сообщениях.
+if not getattr(Message, "_safe_edit_text_patched", False):
+    _ORIG_EDIT_TEXT = Message.edit_text
+
+    async def _safe_edit_text(self: Message, text: str, *args, **kwargs):
+        safe_text = str(text or "")
+        if len(safe_text) > 4000:
+            safe_text = safe_text[:3997] + "..."
+        if getattr(self, "photo", None):
+            if len(args) >= 1 and "reply_markup" not in kwargs:
+                kwargs["reply_markup"] = args[0]
+            if len(args) >= 2 and "parse_mode" not in kwargs:
+                kwargs["parse_mode"] = args[1]
+            # У подписи Telegram жесткий лимит 1024 символа; для длинных экранов
+            # отправляем обычное текстовое сообщение вместо падения.
+            if len(safe_text) > 1024:
+                return await self.answer(
+                    safe_text,
+                    reply_markup=kwargs.get("reply_markup"),
+                    parse_mode=kwargs.get("parse_mode"),
+                )
+            try:
+                return await self.edit_caption(caption=safe_text, **kwargs)
+            except TelegramBadRequest as exc:
+                err = str(exc).lower()
+                if "media_caption_too_long" in err or "caption is too long" in err:
+                    return await self.answer(
+                        safe_text,
+                        reply_markup=kwargs.get("reply_markup"),
+                        parse_mode=kwargs.get("parse_mode"),
+                    )
+                raise
+        return await _ORIG_EDIT_TEXT(self, safe_text, *args, **kwargs)
+
+    Message.edit_text = _safe_edit_text
+    Message._safe_edit_text_patched = True
 
 
 def _read_float_env(name: str, default: float) -> float:
@@ -135,6 +269,11 @@ SHUTDOWN_WARNING_TEXT = (
     "━━━━━━━━━━━━━━━━━━━━\n"
     "⏰ Бот выключится в 21:00 (Asia/Tashkent, UTC+5)."
 )
+MEDIA_NEWS_GROUP_BROADCAST_ENABLED = os.getenv("MEDIA_NEWS_GROUP_BROADCAST_ENABLED", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
 LOCAL_SERVER_ENABLED = os.getenv("LOCAL_SERVER_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
 LOCAL_SERVER_HOST = os.getenv("LOCAL_SERVER_HOST", "127.0.0.1")
 LOCAL_SERVER_PORT = _read_int_env("LOCAL_SERVER_PORT", 8787, min_value=1)
@@ -211,6 +350,12 @@ class TelegramRetryMiddleware(BaseRequestMiddleware):
             try:
                 return await make_request(bot, method)
             except TelegramRetryAfter as exc:
+                if type(method).__name__ == "AnswerCallbackQuery":
+                    logger.debug(
+                        "Flood control on callback answer; skip retry (retry_after=%.1f sec)",
+                        float(getattr(exc, "retry_after", 0) or 0),
+                    )
+                    return True
                 attempt += 1
                 if attempt > self.retries:
                     raise
@@ -335,7 +480,19 @@ class TransientTelegramErrorMiddleware(BaseMiddleware):
             logger.warning("Временная ошибка Telegram API во время обработки update: %s", exc)
             return None
         except TelegramBadRequest as exc:
-            if "message is not modified" in str(exc).lower():
+            err = str(exc).lower()
+            if "message is not modified" in err:
+                return None
+            if "media_caption_too_long" in err or "caption is too long" in err:
+                logger.debug("Пропущена длинная подпись media в update: %s", exc)
+                if isinstance(event, CallbackQuery):
+                    try:
+                        await event.answer("Экран слишком длинный, откройте меню заново через /start.", show_alert=True)
+                    except Exception:
+                        pass
+                return None
+            if "bot was blocked by the user" in err or "chat not found" in err or "user is deactivated" in err:
+                logger.debug("Сообщение не доставлено: %s", exc)
                 return None
             raise
         except Exception:
@@ -467,7 +624,11 @@ async def track_bot_membership(update: ChatMemberUpdated):
         logger.info("Чат %s помечен неактивным", chat.id)
 
 
-@service_router.message(F.chat.type.in_({"group", "supergroup"}))
+@service_router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    ~F.reply_to_message,
+    ~F.text.startswith("/"),
+)
 async def track_group_activity(message: Message):
     """
     Обновляем реестр групп при активности.
@@ -485,6 +646,9 @@ async def track_group_activity(message: Message):
             session_startup_announced_groups.add(message.chat.id)
         except Exception:
             logger.exception("Не удалось отправить стартовое сообщение в чат %s", message.chat.id)
+
+    # В этом сервисном хендлере только поддерживаем реестр групп.
+    # Игровые reply-команды и реакции обрабатываются профильными роутерами.
     return UNHANDLED
 
 
@@ -509,7 +673,7 @@ async def broadcast_to_active_groups(bot: Bot, text: str) -> set[int]:
             if any(token in error_text for token in ("forbidden", "kicked", "chat not found")):
                 await db.deactivate_bot_chat(chat_id)
 
-    logger.info("Групповая рассылка завершена: отправлено=%s, ошибок=%s", sent, failed)
+    logger.debug("Групповая рассылка завершена: отправлено=%s, ошибок=%s", sent, failed)
     return sent_chat_ids
 
 
@@ -603,7 +767,8 @@ async def run_media_news_digest(bot: Bot, state: dict[str, Any], period_minutes:
                         f"{news.get('body')}\n"
                         + (f"\nИсточник: {source}" if source else "")
                     )
-                    await broadcast_to_active_groups(bot, text)
+                    if MEDIA_NEWS_GROUP_BROADCAST_ENABLED:
+                        await broadcast_to_active_groups(bot, text)
                     state[state_key] = key
                     await db.set_system_state(persisted_state_key, key)
         except Exception:
@@ -669,6 +834,23 @@ async def init_default_data():
             normalized.get("updated_count"),
             normalized.get("minimum_budget"),
         )
+    gov_floor = await db.ensure_government_budget_floor(minimum_budget=25_000_000.0)
+    if gov_floor.get("updated"):
+        logger.warning(
+            "Госбюджет скорректирован до минимума: old=$%.2f new=$%.2f",
+            float(gov_floor.get("old_budget") or 0),
+            float(gov_floor.get("new_budget") or 0),
+        )
+    tax_reset_checkpoint = await db.get_system_state("tax_reset_2026_03_ai_reform_done")
+    if tax_reset_checkpoint != "1":
+        reset_summary = await db.reset_tax_system_state()
+        await db.set_system_state("tax_reset_2026_03_ai_reform_done", "1")
+        logger.warning(
+            "Налоги и долги обнулены: users=%s invoices_deleted=%s tax_logs_deleted=%s",
+            int(reset_summary.get("users_total", 0)),
+            int(reset_summary.get("invoices_deleted", 0)),
+            int(reset_summary.get("tax_logs_deleted", 0)),
+        )
     await db.bootstrap_world_data()
     rebalance = await db.apply_currency_rebalance_once()
     if rebalance.get("applied"):
@@ -679,15 +861,34 @@ async def init_default_data():
             rebalance.get("scaled_columns"),
             rebalance.get("users_reset"),
         )
-
-    gov_floor = await db.ensure_government_budget_floor(minimum_budget=10_000_000.0)
-    if gov_floor.get("updated"):
-        logger.warning(
-            "Госбюджет скорректирован до минимума: old=$%.2f new=$%.2f",
-            float(gov_floor.get("old_budget") or 0),
-            float(gov_floor.get("new_budget") or 0),
+    salary_rebalance = await db.apply_salary_rebalance_once(multiplier=2.5)
+    if salary_rebalance.get("applied"):
+        logger.info(
+            "Ребаланс зарплат применен: x%s, вакансии=%s (+floor=%s), орг-состав=%s, заявки=%s (+floor=%s)",
+            salary_rebalance.get("multiplier"),
+            salary_rebalance.get("citizens_updated"),
+            salary_rebalance.get("citizens_floor_fixed"),
+            salary_rebalance.get("org_members_updated"),
+            salary_rebalance.get("applications_updated"),
+            salary_rebalance.get("applications_floor_fixed"),
         )
-    
+    salary_floor = await db.ensure_citizen_salary_floor_once(minimum_salary=1500.0)
+    if salary_floor.get("applied"):
+        logger.info(
+            "Применен минимальный порог зарплаты: min=$%.2f users=%s pending_apps=%s catalog=%s",
+            float(salary_floor.get("minimum_salary") or 0),
+            int(salary_floor.get("users_updated") or 0),
+            int(salary_floor.get("applications_updated") or 0),
+            int(salary_floor.get("catalog_updated") or 0),
+        )
+    property_raise = await db.raise_property_prices_once(multiplier=1.65)
+    if property_raise.get("applied"):
+        logger.info(
+            "Недвижимость удорожена: x%s, обновлено объектов=%s",
+            property_raise.get("multiplier"),
+            property_raise.get("updated_rows"),
+        )
+
     election_id = await db.ensure_presidential_election(duration_hours=15)
     if election_id:
         logger.info(f"Активированы президентские выборы (ID {election_id})")
@@ -705,17 +906,32 @@ async def setup_bot_commands(bot: Bot):
         BotCommand(command="biz", description="🏢 Бизнес"),
         BotCommand(command="work", description="💼 Работа и подработки"),
         BotCommand(command="tax", description="🧾 Налоги за день"),
+        BotCommand(command="charity", description="🤝 Пожертвование в фонд"),
         BotCommand(command="edu", description="🎓 Образование"),
         BotCommand(command="prop", description="🏠 Недвижимость"),
+        BotCommand(command="sellprop", description="💸 Продажа недвижимости"),
         BotCommand(command="priv", description="🏢 Частные организации"),
         BotCommand(command="gang", description="🕶️ Банды"),
+        BotCommand(command="leavegang", description="🚪 Выйти из банды"),
+        BotCommand(command="marry", description="💍 Предложение брака (reply)"),
+        BotCommand(command="divorce", description="💔 Развод"),
+        BotCommand(command="family", description="👨‍👩‍👧 Семейная панель"),
+        BotCommand(command="pet", description="🐾 Питомец"),
+        BotCommand(command="petname", description="✏️ Имя питомца"),
         BotCommand(command="market", description="📣 Городская площадка"),
         BotCommand(command="ref", description="👥 Рефералы и маркетинг"),
         BotCommand(command="builder", description="🏗️ Панель застройщика"),
         BotCommand(command="stocks", description="📈 Акции и биржа"),
         BotCommand(command="fun", description="🎪 Сюжетное событие"),
         BotCommand(command="casino", description="🎰 Казино"),
+        BotCommand(command="donate", description="💎 Донат и поддержка"),
+        BotCommand(command="promo", description="🎟️ Промокоды"),
+        BotCommand(command="botadmin", description="🛠 Админ-панель бота"),
+        BotCommand(command="grantdonate", description="💎 Выдать донат-пакет"),
+        BotCommand(command="paysupport", description="🧾 Помощь по оплате"),
+        BotCommand(command="terms", description="📜 Условия доната"),
         BotCommand(command="duel", description="🎲 Дуэль в группе (reply)"),
+        BotCommand(command="plus", description="👍 +1 репутация (reply)"),
         BotCommand(command="news", description="📰 Новости СМИ"),
         BotCommand(command="id", description="🆔 Мой ID"),
     ]
@@ -726,160 +942,173 @@ debug_router = Router()
 @debug_router.callback_query()
 async def global_debug_callback(callback: CallbackQuery):
     """Если кнопка не сработала в основных роутерах, она попадет сюда"""
-    logger.warning(f"⚠️ Необработанный callback: {callback.data}")
+    logger.debug("Необработанный callback: %s", callback.data)
     await callback.answer("Кнопка устарела. Откройте меню заново через /start.", show_alert=True)
 
-async def main():
+async def main() -> int:
     if not TOKEN:
         raise RuntimeError("Переменная окружения BOT_TOKEN не задана.")
+    instance_lock = SingleInstanceLock(INSTANCE_LOCK_PATH)
+    if not instance_lock.acquire():
+        logger.warning("Обнаружен уже запущенный экземпляр бота. Этот процесс завершен.")
+        return 11
 
-    # 1. Инициализация БД
-    await init_default_data()
-    
-    # 2. Настройка бота
-    session = AiohttpSession(timeout=TELEGRAM_REQUEST_TIMEOUT)
-    session.middleware(TextSanitizerRequestMiddleware())
-    session.middleware(TelegramRetryMiddleware(retries=2, base_delay=1.0))
-    bot = Bot(
-        token=TOKEN,
-        session=session,
-        default=DefaultBotProperties(parse_mode="Markdown")
-    )
-    dp = Dispatcher(storage=MemoryStorage())
-
-    # Инициализация состояния рабочего времени при старте процесса
-    now_uz = datetime.now(UZBEKISTAN_TZ)
-    runtime_state["is_online"] = is_working_hours(now_uz)
-    runtime_state["force_online"] = False
-    runtime_state["last_warning_date"] = None
-    
-    # 3. Регистрация Middleware (Важен порядок!)
-    dp.message.middleware(TransientTelegramErrorMiddleware())
-    dp.callback_query.middleware(TransientTelegramErrorMiddleware())
-    # Сначала ограничиваем спам, чтобы не нагружать БД и обработчики лишними апдейтами.
-    dp.message.middleware(RateLimitMiddleware(calls=8, period=2.0, callback_calls=12, callback_period=2.0))
-    dp.callback_query.middleware(RateLimitMiddleware(calls=8, period=2.0, callback_calls=12, callback_period=2.0))
-    dp.message.middleware(EnsureUserMiddleware())
-    dp.callback_query.middleware(EnsureUserMiddleware())
-    dp.message.middleware(WorkingHoursMiddleware(runtime_state))
-    dp.callback_query.middleware(WorkingHoursMiddleware(runtime_state))
-    dp.message.middleware(MandatoryNicknameMiddleware())
-    dp.callback_query.middleware(MandatoryNicknameMiddleware())
-    # Middleware, блокирующий пользователей с active action_banned_until
-    dp.message.middleware(ActionBanMiddleware())
-    dp.callback_query.middleware(ActionBanMiddleware())
-    # Global lock for election mode
-    dp.message.middleware(GlobalLockMiddleware())
-    dp.callback_query.middleware(GlobalLockMiddleware())
-    
-    # 4. Регистрация Роутеров
-    # Сначала специфичные, потом общие
-    dp.include_router(service_router)
-    dp.include_router(feature_router)
-    dp.include_router(presidential_router)
-    dp.include_router(fbi_router)
-    dp.include_router(revolution_router)
-    dp.include_router(handlers_part3_router)
-    dp.include_router(handlers_part2_router)
-    dp.include_router(main_router) # Главный роутер обычно последний
-    
-    # Рекомендую добавить этот роутер ПОСЛЕДНИМ для отладки
-    dp.include_router(debug_router)
-    
-    # 5. Команды и фон
-    await setup_bot_commands(bot)
-    if runtime_state["is_online"]:
-        sent_ids = await broadcast_to_active_groups(bot, STARTUP_TEXT)
-        session_startup_announced_groups.update(sent_ids)
-    else:
-        sent_ids = await broadcast_to_active_groups(bot, PROCESS_STARTED_OFFLINE_TEXT)
-        session_offline_start_notified_groups.update(sent_ids)
-    asyncio.create_task(run_work_hours_controller(bot, runtime_state))
-    asyncio.create_task(run_daily_economy_cycle(bot))
-    asyncio.create_task(run_state_money_print_processor(bot))
-    asyncio.create_task(run_media_news_digest(bot, runtime_state, period_minutes=10))
-    if LOCAL_SERVER_ENABLED:
-        asyncio.create_task(run_local_health_server(runtime_state))
-    # Фоновое обслуживание выборов
-    async def run_election_maintenance(bot: Bot):
-        """Проверяет и поддерживает президентские выборы."""
-        while True:
-            try:
-                # Если президента нет — гарантируем существование активных выборов
-                await db.ensure_presidential_election(duration_hours=15)
-
-                # Автоматически синхронизируем этапы активных выборов по времени
-                stage_changes = await db.sync_active_election_stages()
-                for change in stage_changes:
-                    logger.info(
-                        "Выборы %s: этап %s -> %s",
-                        change.get("election_id"),
-                        change.get("old_stage"),
-                        change.get("new_stage"),
-                    )
-
-                # Завершаем просроченные выборы
-                results = await db.finalize_expired_elections()
-                for result in results:
-                    election_id = result.get('election_id')
-                    status = result.get('status')
-                    if status == 'extended_no_candidates':
-                        logger.info(
-                            f"Выборы {election_id} продлены: нет кандидатов до {result.get('new_end_date')}"
-                        )
-                        continue
-
-                    if status != 'finished':
-                        continue
-
-                    winner_id = result.get('winner_id')
-                    candidate_ids = result.get('candidate_ids', [])
-                    tie_note = "\nПобеда определена тай-брейком." if result.get('is_tie_break') else ""
-
-                    if winner_id:
-                        try:
-                            await bot.send_message(
-                                winner_id,
-                                f"🏆 Вы победили на выборах (ID {election_id}) и назначены президентом.{tie_note}",
-                                parse_mode=None,
-                            )
-                        except Exception:
-                            pass
-
-                    for candidate_id in candidate_ids:
-                        if candidate_id == winner_id:
-                            continue
-                        try:
-                            await bot.send_message(
-                                candidate_id,
-                                f"ℹ️ Выборы (ID {election_id}) завершены. Победитель: ID {winner_id}.",
-                                parse_mode=None,
-                            )
-                        except Exception:
-                            pass
-
-            except Exception:
-                logger.exception("Ошибка в фоновой задаче выборов")
-            await asyncio.sleep(60)
-
-    asyncio.create_task(run_election_maintenance(bot))
-    
-    # 6. Запуск
+    bot: Bot | None = None
     try:
+        # 1. Инициализация БД
+        await init_default_data()
+        
+        # 2. Настройка бота
+        session = AiohttpSession(timeout=TELEGRAM_REQUEST_TIMEOUT)
+        session.middleware(TextSanitizerRequestMiddleware())
+        session.middleware(TelegramRetryMiddleware(retries=2, base_delay=1.0))
+        bot = Bot(
+            token=TOKEN,
+            session=session,
+            default=DefaultBotProperties(parse_mode="Markdown")
+        )
+        dp = Dispatcher(storage=MemoryStorage())
+
+        # Инициализация состояния рабочего времени при старте процесса
+        now_uz = datetime.now(UZBEKISTAN_TZ)
+        runtime_state["is_online"] = is_working_hours(now_uz)
+        runtime_state["force_online"] = False
+        runtime_state["last_warning_date"] = None
+        
+        # 3. Регистрация Middleware (Важен порядок!)
+        dp.message.middleware(TransientTelegramErrorMiddleware())
+        dp.callback_query.middleware(TransientTelegramErrorMiddleware())
+        # Сначала ограничиваем спам, чтобы не нагружать БД и обработчики лишними апдейтами.
+        dp.message.middleware(RateLimitMiddleware(calls=8, period=2.0, callback_calls=12, callback_period=2.0))
+        dp.callback_query.middleware(RateLimitMiddleware(calls=8, period=2.0, callback_calls=12, callback_period=2.0))
+        dp.message.middleware(EnsureUserMiddleware())
+        dp.callback_query.middleware(EnsureUserMiddleware())
+        dp.message.middleware(WorkingHoursMiddleware(runtime_state))
+        dp.callback_query.middleware(WorkingHoursMiddleware(runtime_state))
+        dp.message.middleware(MandatoryNicknameMiddleware())
+        dp.callback_query.middleware(MandatoryNicknameMiddleware())
+        # Middleware, блокирующий пользователей с active action_banned_until
+        dp.message.middleware(ActionBanMiddleware())
+        dp.callback_query.middleware(ActionBanMiddleware())
+        # 4. Регистрация Роутеров
+        # Сначала специфичные, потом общие
+        dp.include_router(service_router)
+        dp.include_router(feature_router)
+        dp.include_router(presidential_router)
+        dp.include_router(fbi_router)
+        dp.include_router(revolution_router)
+        dp.include_router(handlers_part3_router)
+        dp.include_router(handlers_part2_router)
+        dp.include_router(main_router) # Главный роутер обычно последний
+        
+        # Рекомендую добавить этот роутер ПОСЛЕДНИМ для отладки
+        dp.include_router(debug_router)
+        
+        # 5. Команды и фон
+        await setup_bot_commands(bot)
+        if runtime_state["is_online"]:
+            sent_ids = await broadcast_to_active_groups(bot, STARTUP_TEXT)
+            session_startup_announced_groups.update(sent_ids)
+        else:
+            sent_ids = await broadcast_to_active_groups(bot, PROCESS_STARTED_OFFLINE_TEXT)
+            session_offline_start_notified_groups.update(sent_ids)
+        asyncio.create_task(run_work_hours_controller(bot, runtime_state))
+        asyncio.create_task(run_daily_economy_cycle(bot))
+        asyncio.create_task(run_state_money_print_processor(bot))
+        asyncio.create_task(run_ai_governance_cycle(bot))
+        asyncio.create_task(run_media_news_digest(bot, runtime_state, period_minutes=10))
+        if LOCAL_SERVER_ENABLED:
+            asyncio.create_task(run_local_health_server(runtime_state))
+        # Фоновое обслуживание выборов
+        async def run_election_maintenance(bot: Bot):
+            """Проверяет и поддерживает президентские выборы."""
+            while True:
+                try:
+                    # Если президента нет — гарантируем существование активных выборов
+                    await db.ensure_presidential_election(duration_hours=15)
+
+                    # Автоматически синхронизируем этапы активных выборов по времени
+                    stage_changes = await db.sync_active_election_stages()
+                    for change in stage_changes:
+                        logger.info(
+                            "Выборы %s: этап %s -> %s",
+                            change.get("election_id"),
+                            change.get("old_stage"),
+                            change.get("new_stage"),
+                        )
+
+                    # Завершаем просроченные выборы
+                    results = await db.finalize_expired_elections()
+                    for result in results:
+                        election_id = result.get('election_id')
+                        status = result.get('status')
+                        if status == 'extended_no_candidates':
+                            logger.info(
+                                f"Выборы {election_id} продлены: нет кандидатов до {result.get('new_end_date')}"
+                            )
+                            continue
+
+                        if status != 'finished':
+                            continue
+
+                        winner_id = result.get('winner_id')
+                        candidate_ids = result.get('candidate_ids', [])
+                        tie_note = "\nПобеда определена тай-брейком." if result.get('is_tie_break') else ""
+
+                        if winner_id:
+                            try:
+                                await bot.send_message(
+                                    winner_id,
+                                    f"🏆 Вы победили на выборах (ID {election_id}) и назначены президентом.{tie_note}",
+                                    parse_mode=None,
+                                )
+                            except Exception:
+                                pass
+
+                        for candidate_id in candidate_ids:
+                            if candidate_id == winner_id:
+                                continue
+                            try:
+                                await bot.send_message(
+                                    candidate_id,
+                                    f"ℹ️ Выборы (ID {election_id}) завершены. Победитель: ID {winner_id}.",
+                                    parse_mode=None,
+                                )
+                            except Exception:
+                                pass
+
+                except Exception:
+                    logger.exception("Ошибка в фоновой задаче выборов")
+                await asyncio.sleep(60)
+
+        asyncio.create_task(run_election_maintenance(bot))
+        
+        # 6. Запуск
         logger.info("🤖 Бот запущен и готов к работе!")
         # Удаляем вебхуки и запускаем чистый поллинг
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(
             bot,
             polling_timeout=25,
-            tasks_concurrency_limit=40,
+            tasks_concurrency_limit=12,
             allowed_updates=dp.resolve_used_update_types(),
         )
+        return 0
     finally:
-        await bot.session.close()
+        if bot is not None:
+            await bot.session.close()
+        instance_lock.release()
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
+        exit_code = int(asyncio.run(main()) or 0)
+        if exit_code != 0:
+            raise SystemExit(exit_code)
+    except KeyboardInterrupt:
         logger.info("Бот остановлен")
+    except SystemExit as exc:
+        if int(getattr(exc, "code", 0) or 0) == 11:
+            logger.info("Второй экземпляр завершен: основной бот уже запущен.")
+        else:
+            logger.info("Бот остановлен")
+        raise

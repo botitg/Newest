@@ -27,6 +27,7 @@ class PresidentStates(StatesGroup):
     org_fund_amount = State()
     org_fund_reason = State()
     money_print_amount = State()
+    money_destroy_amount = State()
 
 
 def _normalize_government(gov: dict | None) -> dict:
@@ -142,6 +143,101 @@ async def _get_authority(user_id: int) -> str | None:
     return await db.get_government_authority(user_id)
 
 
+def _org_role_templates(org: dict | None) -> list[tuple[str, str]]:
+    info = org or {}
+    org_type = str(info.get("type") or "").strip().lower()
+    name = str(info.get("name") or "").strip().lower()
+
+    templates: dict[str, list[tuple[str, str]]] = {
+        "government": [
+            ("👑 Президент", "president"),
+            ("🛡️ Вице-президент", "vicepresident"),
+            ("🧾 Министр", "minister"),
+            ("💰 Министр финансов", "financeminister"),
+            ("📢 Пресс-секретарь", "presssecretary"),
+            ("👤 Сотрудник", "member"),
+        ],
+        "police": [
+            ("👮 Начальник полиции", "policechief"),
+            ("🛡️ Зам. начальника", "deputy"),
+            ("🔎 Следователь", "investigator"),
+            ("🚔 Оперуполномоченный", "operative"),
+            ("👤 Сотрудник", "member"),
+        ],
+        "fbi": [
+            ("🕵️ Директор ФБР", "fbidirector"),
+            ("🛡️ Зам. директора", "deputy"),
+            ("📡 Аналитик", "analyst"),
+            ("💻 Киберагент", "cyberagent"),
+            ("🕵️ Агент", "agent"),
+        ],
+        "hospital": [
+            ("🏥 Главврач", "chiefdoctor"),
+            ("🩺 Зам. главврача", "deputy"),
+            ("🔬 Хирург", "surgeon"),
+            ("🧪 Терапевт", "therapist"),
+            ("👤 Медперсонал", "member"),
+        ],
+        "court": [
+            ("⚖️ Председатель суда", "chiefjudge"),
+            ("🧑‍⚖️ Зам. председателя", "deputy"),
+            ("⚖️ Судья", "judge"),
+            ("📚 Секретарь суда", "courtclerk"),
+            ("👤 Сотрудник", "member"),
+        ],
+        "bank": [
+            ("🏦 Председатель банка", "bankchairman"),
+            ("🧮 Зам. председателя", "deputy"),
+            ("📊 Риск-менеджер", "riskmanager"),
+            ("📑 Аудитор", "auditor"),
+            ("👤 Сотрудник", "member"),
+        ],
+        "education": [
+            ("🎓 Ректор", "rector"),
+            ("📘 Проректор", "deputy"),
+            ("👨‍🏫 Профессор", "professor"),
+            ("🧠 Преподаватель", "teacher"),
+            ("👤 Сотрудник", "member"),
+        ],
+        "tax": [
+            ("🧾 Глава налоговой", "taxchief"),
+            ("🧮 Зам. главы", "deputy"),
+            ("📑 Налоговый аудитор", "taxauditor"),
+            ("🔍 Инспектор", "taxinspector"),
+            ("👤 Сотрудник", "member"),
+        ],
+    }
+
+    if org_type in templates:
+        return templates[org_type]
+    if "правитель" in name:
+        return templates["government"]
+    if "полиц" in name:
+        return templates["police"]
+    if "фбр" in name:
+        return templates["fbi"]
+    if "больниц" in name:
+        return templates["hospital"]
+    if "суд" in name:
+        return templates["court"]
+    if "банк" in name:
+        return templates["bank"]
+    if "универс" in name or "образов" in name:
+        return templates["education"]
+    if "налог" in name:
+        return templates["tax"]
+    return [("👑 Лидер", "leader"), ("🛡️ Заместитель", "deputy"), ("👤 Сотрудник", "member")]
+
+
+def _org_role_name_by_code(org: dict | None, role_code: str) -> str:
+    code = str(role_code or "").strip().lower()
+    for title, candidate_code in _org_role_templates(org):
+        if candidate_code == code:
+            # удаляем emoji из названия роли
+            return " ".join(str(title).split()[1:]) if len(str(title).split()) > 1 else str(title)
+    return "Сотрудник"
+
+
 async def _render_admin_panel(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     authority = await _get_authority(user_id)
@@ -176,6 +272,7 @@ async def _render_admin_panel(callback: CallbackQuery, state: FSMContext):
             InlineKeyboardButton(text="📜 Законы", callback_data="pres_laws"),
             InlineKeyboardButton(text="🏳️ Флаг", callback_data="pres_flag_menu"),
         ])
+        keyboard.append([InlineKeyboardButton(text="🎟️ Промокоды", callback_data="pres_promo_menu")])
         keyboard.append([
             InlineKeyboardButton(text="🏢 Обзор организаций", callback_data="pres_org_overview"),
             InlineKeyboardButton(text="📣 Обращение к нации", callback_data="pres_broadcast_start"),
@@ -434,7 +531,7 @@ async def pres_broadcast_text_input(message: Message, state: FSMContext):
             failed += 1
             if len(failed_ids) < 8:
                 failed_ids.append(str(recipient_id))
-            logger.warning("Ошибка рассылки игроку %s: %s", recipient_id, exc)
+            logger.debug("Ошибка рассылки игроку %s: %s", recipient_id, exc)
         if idx % 20 == 0:
             await asyncio.sleep(0.05)
 
@@ -595,14 +692,7 @@ async def president_set_position(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Игрок или организация не найдены.", show_alert=True)
         return
 
-    role_buttons = [
-        ("👑 Лидер", "leader"),
-        ("🏆 Заместитель", "deputy"),
-        ("🧾 Министр", "minister"),
-        ("💰 Министр финансов", "finance"),
-        ("🛡️ Вице-президент", "vicepres"),
-        ("👤 Сотрудник", "member"),
-    ]
+    role_buttons = _org_role_templates(org)
 
     keyboard = [[
         InlineKeyboardButton(
@@ -645,15 +735,8 @@ async def president_confirm_position(callback: CallbackQuery, state: FSMContext)
         await callback.answer("❌ Некорректные параметры подтверждения.", show_alert=True)
         return
 
-    role_map = {
-        "leader": "Лидер",
-        "deputy": "Заместитель",
-        "minister": "Министр",
-        "finance": "Министр финансов",
-        "vicepres": "Вице-президент",
-        "member": "Сотрудник",
-    }
-    role_name = role_map.get(role_code, "Сотрудник")
+    org = await db.get_organization_by_id(org_id) or {}
+    role_name = _org_role_name_by_code(org, role_code)
 
     success, msg = await db.appoint_user_to_organization(
         target_user_id=player_id,
@@ -1444,28 +1527,35 @@ async def pres_money_print_amount_input(message: Message, state: FSMContext):
     )
 
 
-# Совместимость со старыми кнопками (переименование/создание должностей)
-@router.callback_query(F.data == "pres_rename_position")
-@router.callback_query(F.data.startswith("pres_rename_"))
-
-
 # ==================== ЭКОНОМИКА ====================
 
 @router.callback_query(F.data == "pres_economy_stats")
 async def president_economy_stats(callback: CallbackQuery, state: FSMContext):
     """Показать статистику экономики: ВВП, денежные потоки."""
-    await callback.answer()
-    
     authority = await _get_authority(callback.from_user.id)
     if authority != "president":
         await callback.answer("❌ Доступ только президенту.", show_alert=True)
         return
+    await callback.answer()
     
-    # Получить статистику
-    stats = await db.get_economy_statistics()
-    flow = await db.get_money_flow_report()
+    try:
+        # Получить статистику
+        stats = await db.get_economy_statistics()
+        flow = await db.get_money_flow_report()
+    except Exception:
+        logger.exception("Не удалось загрузить статистику экономики для президента")
+        await callback.message.edit_text(
+            "❌ Не удалось загрузить статистику экономики. Попробуйте позже.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Повторить", callback_data="pres_economy_stats")],
+                [InlineKeyboardButton(text="🔙 В панель", callback_data="president_admin_panel")],
+            ]),
+            parse_mode=None,
+        )
+        return
     
     gdp = float(stats.get("gdp", 0.0))
+    safe_gdp = gdp if gdp > 0 else 1.0
     player_wealth = float(stats.get("player_wealth", 0.0))
     gov_budget = float(stats.get("government_budget", 0.0))
     org_budgets = float(stats.get("organization_budgets", 0.0))
@@ -1487,9 +1577,9 @@ async def president_economy_stats(callback: CallbackQuery, state: FSMContext):
         "",
         "💰 ВАЛОВЫЙ ВНУТРЕННИЙ ПРОДУКТ (ВВП):",
         f"• Всего денег в экономике: ${gdp:,.2f}",
-        f"• В руках граждан: ${player_wealth:,.2f} ({player_wealth/gdp*100:.1f}%)",
-        f"• Гос. бюджет: ${gov_budget:,.2f} ({gov_budget/gdp*100:.1f}%)",
-        f"• Бюджеты организаций: ${org_budgets:,.2f} ({org_budgets/gdp*100:.1f}%)",
+        f"• В руках граждан: ${player_wealth:,.2f} ({player_wealth/safe_gdp*100:.1f}%)",
+        f"• Гос. бюджет: ${gov_budget:,.2f} ({gov_budget/safe_gdp*100:.1f}%)",
+        f"• Бюджеты организаций: ${org_budgets:,.2f} ({org_budgets/safe_gdp*100:.1f}%)",
         "",
         "👥 НАСЕЛЕНИЕ:",
         f"• Активных игроков: {active_players}/{total_players}",
@@ -1520,14 +1610,13 @@ async def president_economy_stats(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "pres_destroy_money_menu")
 async def president_destroy_money_menu(callback: CallbackQuery, state: FSMContext):
     """Меню для удаления денег из экономики."""
-    await callback.answer()
-    
     authority = await _get_authority(callback.from_user.id)
     if authority != "president":
         await callback.answer("❌ Доступ только президенту.", show_alert=True)
         return
+    await callback.answer()
     
-    gov = await db.get_organization("Правительство")
+    gov = await db.get_government_organization()
     gov_budget = float(gov.get("budget", 0) or 0) if gov else 0.0
     
     text = (
@@ -1539,7 +1628,7 @@ async def president_destroy_money_menu(callback: CallbackQuery, state: FSMContex
         "Введите сумму для удаления:"
     )
     
-    await state.set_state(PresidentStates.money_print_amount)
+    await state.set_state(PresidentStates.money_destroy_amount)
     await callback.message.edit_text(
         text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -1549,7 +1638,7 @@ async def president_destroy_money_menu(callback: CallbackQuery, state: FSMContex
     )
 
 
-@router.message(PresidentStates.money_print_amount)
+@router.message(PresidentStates.money_destroy_amount)
 async def president_destroy_money_input(message: Message, state: FSMContext):
     """Ввод суммы для удаления денег."""
     text = str(message.text or "").strip()
@@ -1643,6 +1732,7 @@ async def president_help(callback: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(F.data == "pres_rename_pos")
+@router.callback_query(F.data == "pres_rename_position")
 async def legacy_pres_rename_pos(callback: CallbackQuery, state: FSMContext):
     """Совместимость со старой кнопкой."""
     await president_legacy_position_tools(callback, state)
@@ -1660,4 +1750,3 @@ async def legacy_pres_appoint_president(callback: CallbackQuery, state: FSMConte
         ]),
         parse_mode=None,
     )
-

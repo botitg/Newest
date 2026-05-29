@@ -4,7 +4,12 @@ feature_pack.py - расширенный игровой контент и нов
 
 from __future__ import annotations
 
+import json
+import os
 import random
+import re
+import secrets
+import asyncio
 from datetime import datetime
 from typing import Optional, Any
 
@@ -13,11 +18,37 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, Message, PreCheckoutQuery
 
 from database import db
+from ui_media import send_section_screen
 
 router = Router()
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+DONATIONS_ENABLED = _env_flag("DONATIONS_ENABLED", True)
+DONATION_SUPPORT_CONTACT = (os.getenv("DONATION_SUPPORT_CONTACT") or "@mirnastan_support").strip()
+DONATION_TERMS_URL = (os.getenv("DONATION_TERMS_URL") or "").strip()
+
+
+def _read_bot_admin_ids() -> set[int]:
+    ids = {6000066043}
+    raw = (os.getenv("ADMIN_IDS") or "").replace(";", ",")
+    for chunk in raw.split(","):
+        value = chunk.strip()
+        if value.isdigit():
+            ids.add(int(value))
+    return ids
+
+
+BOT_ADMIN_IDS = _read_bot_admin_ids()
 
 INVISIBLE_NAME_CHARS = ("\u200b", "\u200c", "\u200d", "\ufeff", "\u2060", "\u00ad")
 
@@ -81,6 +112,62 @@ class FeatureStates(StatesGroup):
     contract_reward = State()
     bank_deposit_amount = State()
     bank_withdraw_amount = State()
+    court_case_text = State()
+    court_evidence_text = State()
+    court_appeal_reason = State()
+    developer_custom_amount = State()
+    promo_code_input = State()
+    pres_promo_create = State()
+    bot_admin_promo_create = State()
+    bot_admin_grant_donation = State()
+
+
+DONATION_PACKS: tuple[dict[str, Any], ...] = (
+    {
+        "key": "starter",
+        "title": "Starter Pack",
+        "label": "Старт",
+        "stars": 25,
+        "description": "Небольшой стартовый буст.",
+        "rewards": {"user_add": {"balance": 40000, "bank": 20000, "reputation": 1, "happiness": 1}},
+    },
+    {
+        "key": "citizen",
+        "title": "Citizen Pack",
+        "label": "Гражданин",
+        "stars": 50,
+        "description": "Укрепляет личный капитал.",
+        "rewards": {"user_add": {"balance": 100000, "bank": 60000, "reputation": 2, "happiness": 2}},
+    },
+    {
+        "key": "minister",
+        "title": "Minister Pack",
+        "label": "Министр",
+        "stars": 100,
+        "description": "Сильный денежный пакет для развития.",
+        "rewards": {"user_add": {"balance": 260000, "bank": 150000, "reputation": 4, "happiness": 4}},
+    },
+    {
+        "key": "tycoon",
+        "title": "Tycoon Pack",
+        "label": "Магнат",
+        "stars": 250,
+        "description": "Крупный капитал и заметный буст.",
+        "rewards": {"user_add": {"balance": 750000, "bank": 450000, "reputation": 8, "happiness": 7}},
+    },
+    {
+        "key": "patron",
+        "title": "Patron Pack",
+        "label": "Покровитель",
+        "stars": 500,
+        "description": "Максимальная поддержка проекта.",
+        "rewards": {"user_add": {"balance": 1800000, "bank": 1000000, "reputation": 15, "happiness": 10}},
+    },
+)
+
+
+def _donation_pack_map() -> dict[str, dict[str, Any]]:
+    return {str(pack.get("key") or ""): dict(pack) for pack in DONATION_PACKS}
 
 
 def _display_user(user: dict | None) -> str:
@@ -105,8 +192,24 @@ def _md(text: str) -> str:
     return escaped
 
 
+def _lum(amount: float) -> str:
+    return f"{float(amount or 0):,.2f} люмов"
+
+
 def _back(callback_data: str = "back_to_main", text: str = "🔙 Назад") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=text, callback_data=callback_data)]])
+
+
+async def _text_animation(message: Message, frames: list[str], delay: float = 0.28) -> None:
+    for frame in frames:
+        try:
+            await message.edit_text(frame, parse_mode=None)
+        except TelegramBadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                return
+        except Exception:
+            return
+        await asyncio.sleep(max(0.05, min(float(delay or 0.28), 0.8)))
 
 
 def _edit_or_answer(event: Message | CallbackQuery):
@@ -115,7 +218,15 @@ def _edit_or_answer(event: Message | CallbackQuery):
             try:
                 await event.message.edit_text(*args, **kwargs)
             except TelegramBadRequest as exc:
-                if "message is not modified" in str(exc).lower():
+                err = str(exc).lower()
+                if "message is not modified" in err:
+                    return
+                if "media_caption_too_long" in err or "caption is too long" in err:
+                    await event.message.answer(
+                        str(args[0] if args else ""),
+                        reply_markup=kwargs.get("reply_markup"),
+                        parse_mode=kwargs.get("parse_mode"),
+                    )
                     return
                 raise
         return _sender
@@ -688,7 +799,7 @@ def _resolve_fun_activity(user: dict, code: str) -> dict:
         payload["rep_delta"] = 1.35
         payload["xp_delta"] = random.randint(12, 20)
         payload["text"] = (
-            f"Вы пожертвовали $500 и получили рост репутации."
+            "Вы пожертвовали $500 и получили рост репутации."
             + (f" Спонсор компенсировал ${cashback:,.0f}." if cashback > 0 else "")
         )
         if sponsor_back:
@@ -1250,21 +1361,70 @@ async def _can_manage_hr(user_id: int) -> bool:
     return authority in {"president", "vice_president", "finance_minister", "minister"}
 
 
+async def _can_use_bank_staff_tools(user_id: int) -> bool:
+    authority = await db.get_government_authority(user_id)
+    if authority in {"president", "vice_president", "finance_minister", "minister"}:
+        return True
+    user = await db.get_user(user_id) or {}
+    role = str(user.get("role") or "").lower()
+    org_name = str(user.get("organization") or "").lower()
+    if "банк" in role or "bank" in role or "банк" in org_name or "bank" in org_name:
+        return True
+    return await db.is_user_in_org_type(user_id, "bank")
+
+
+async def _is_bot_admin_message(message: Message) -> bool:
+    return bool(message.from_user and int(message.from_user.id) in BOT_ADMIN_IDS and message.chat.type == "private")
+
+
+async def _is_bot_admin_callback(callback: CallbackQuery) -> bool:
+    chat_type = callback.message.chat.type if callback.message else ""
+    return bool(callback.from_user and int(callback.from_user.id) in BOT_ADMIN_IDS and chat_type == "private")
+
+
 async def _render_business_menu(event: Message | CallbackQuery):
     user_id = event.from_user.id
     user = await db.get_user(user_id) or {}
     businesses = await db.list_user_businesses(user_id)
+    total_income = sum(float(b.get("income_daily") or 0) for b in businesses)
+    total_expense = sum(float(b.get("expense_daily") or 0) for b in businesses)
+    total_budget = sum(float(b.get("budget") or 0) for b in businesses)
+    net_daily = round(total_income - total_expense, 2)
+    avg_equipment = (
+        round(sum(int(b.get("equipment_level") or 1) for b in businesses) / len(businesses), 2)
+        if businesses
+        else 0.0
+    )
+    top_business = None
+    if businesses:
+        top_business = max(
+            businesses,
+            key=lambda b: float(b.get("income_daily") or 0) - float(b.get("expense_daily") or 0),
+        )
     text_lines = [
         "🏢 **БИЗНЕС И КАПИТАЛ**",
         "━━━━━━━━━━━━━━━━━━━━",
         f"Баланс: ${float(user.get('balance') or 0):,.2f}",
         f"Ваших бизнесов: {len(businesses)}",
+        f"Суммарный бюджет: ${total_budget:,.2f}",
+        f"Чистый поток/день: ${net_daily:,.2f}",
+        f"Средний уровень оборудования: {avg_equipment:.2f}",
         "",
     ]
+    if top_business:
+        top_name = str(top_business.get("name") or "Бизнес")
+        top_net = float(top_business.get("income_daily") or 0) - float(top_business.get("expense_daily") or 0)
+        text_lines.append(
+            f"Флагман: **{_md(top_name)}** ({_md(str(top_business.get('type') or 'mixed'))}) — net ${top_net:,.0f}/день"
+        )
+        text_lines.append("")
     if businesses:
-        for idx, biz in enumerate(businesses[:5], start=1):
+        for idx, biz in enumerate(businesses[:6], start=1):
+            biz_net = float(biz.get("income_daily") or 0) - float(biz.get("expense_daily") or 0)
             text_lines.append(
-                f"{idx}. {biz.get('name')} ({biz.get('type')}) — доход ${float(biz.get('income_daily') or 0):,.0f}/день"
+                f"{idx}. {_md(str(biz.get('name') or 'Без названия'))} "
+                f"({_md(str(biz.get('type') or 'mixed'))})\n"
+                f"   Доход ${float(biz.get('income_daily') or 0):,.0f} | Расход ${float(biz.get('expense_daily') or 0):,.0f} | Net ${biz_net:,.0f}"
             )
     else:
         text_lines.append("У вас пока нет бизнеса. Купите недвижимость и оформите объект под предприятие.")
@@ -1274,13 +1434,20 @@ async def _render_business_menu(event: Message | CallbackQuery):
             [InlineKeyboardButton(text="🆕 Открыть из недвижимости", callback_data="fp_business_create_start")],
             [InlineKeyboardButton(text="📊 Мои бизнесы", callback_data="fp_business_my")],
             [InlineKeyboardButton(text="🧩 Панель активов", callback_data="fp_assets_panel")],
+            [InlineKeyboardButton(text="🌐 Рынок бизнесов", callback_data="fp_business_market")],
             [InlineKeyboardButton(text="🧾 Налоговые отчеты", callback_data="fp_business_tax_reports")],
             [InlineKeyboardButton(text="🎰 Казино", callback_data="casino_menu")],
             [InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_main")],
         ]
     )
-    sender = _edit_or_answer(event)
-    await sender("\n".join(text_lines), reply_markup=keyboard, parse_mode="Markdown")
+    await send_section_screen(
+        event,
+        text="\n".join(text_lines),
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+        section_key="biz",
+        add_back_to_menu=True,
+    )
 
 
 @router.message(Command("biz"))
@@ -1295,6 +1462,45 @@ async def feature_business_menu(event: Message | CallbackQuery, state: FSMContex
             pass
     await state.clear()
     await _render_business_menu(event)
+
+
+@router.callback_query(F.data == "fp_business_market")
+async def feature_business_market(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.clear()
+    all_businesses = await db.list_all_businesses(limit=28)
+    ranked = sorted(
+        all_businesses,
+        key=lambda item: float(item.get("income_daily") or 0) - float(item.get("expense_daily") or 0),
+        reverse=True,
+    )
+    lines = [
+        "🌐 **РЫНОК БИЗНЕСОВ**",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "Топ активных проектов по чистому потоку:",
+        "",
+    ]
+    if not ranked:
+        lines.append("Активных бизнесов пока нет.")
+    else:
+        for idx, biz in enumerate(ranked[:12], start=1):
+            net_daily = float(biz.get("income_daily") or 0) - float(biz.get("expense_daily") or 0)
+            lines.append(
+                f"{idx}. **{_md(str(biz.get('name') or 'Без названия'))}** "
+                f"({_md(str(biz.get('type') or 'mixed'))})\n"
+                f"   Владелец: {_md(str(biz.get('owner_name') or 'Неизвестно'))} | "
+                f"Net: ${net_daily:,.0f}/день | Бюджет: ${float(biz.get('budget') or 0):,.0f}"
+            )
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Обновить", callback_data="fp_business_market")],
+                [InlineKeyboardButton(text="🔙 К бизнесу", callback_data="biz_menu")],
+            ]
+        ),
+        parse_mode="Markdown",
+    )
 
 
 @router.message(Command("assets"))
@@ -1357,11 +1563,13 @@ async def feature_assets_panel(event: Message | CallbackQuery, state: FSMContext
             keyboard_rows.append([InlineKeyboardButton(text="👥 Моя организация", callback_data=f"fp_private_org_open_{member_org_id}")])
     keyboard_rows.append([InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_main")])
 
-    sender = _edit_or_answer(event)
-    await sender(
-        "\n".join(lines),
+    await send_section_screen(
+        event,
+        text="\n".join(lines),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
         parse_mode="Markdown",
+        section_key="biz",
+        add_back_to_menu=True,
     )
 
 
@@ -1413,16 +1621,41 @@ async def _render_business_panel(message: Message, owner_id: int, business_id: i
     if int(biz.get("owner_id") or 0) != int(owner_id):
         await message.edit_text("❌ Только владелец может управлять бизнесом.", reply_markup=_back("fp_business_my"), parse_mode=None)
         return
+    if str(biz.get("status") or "active").lower() != "active":
+        await message.edit_text(
+            "ℹ️ Этот бизнес уже закрыт/продан системе.",
+            reply_markup=_back("fp_business_my"),
+            parse_mode=None,
+        )
+        return
     res = await db.get_business_resources(business_id)
+    task = await db.get_business_daily_task_status(business_id)
+    required_actions = int(task.get("required_actions") or 2)
+    completed_actions = int(task.get("completed_actions") or 0)
+    efficiency_pct = float(task.get("efficiency_factor") or 0.35) * 100.0
+    budget = float(biz.get("budget") or 0)
+    income_daily = float(biz.get("income_daily") or 0)
+    expense_daily = float(biz.get("expense_daily") or 0)
+    net_daily = round(income_daily - expense_daily, 2)
+    raw_materials = float(res.get("raw_materials") or 0)
+    daily_consumption = float(res.get("daily_consumption") or 0)
+    runway_days = "∞" if expense_daily <= 0 else f"{max(0.0, budget / max(1.0, expense_daily)):.1f}"
+    raw_cover_days = "∞" if daily_consumption <= 0 else f"{max(0.0, raw_materials / max(1.0, daily_consumption)):.1f}"
+    health_label = "🟢 устойчиво" if net_daily >= 0 and efficiency_pct >= 70 else ("🟡 под давлением" if net_daily >= 0 else "🔴 риск убытка")
     text = (
         f"🏢 Панель бизнеса: {biz.get('name')}\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"Тип: {biz.get('type')}\n"
-        f"Бюджет: ${float(biz.get('budget') or 0):,.2f}\n"
-        f"Доход/день: ${float(biz.get('income_daily') or 0):,.2f}\n"
-        f"Расход/день: ${float(biz.get('expense_daily') or 0):,.2f}\n"
+        f"Бюджет: ${budget:,.2f}\n"
+        f"Доход/день: ${income_daily:,.2f}\n"
+        f"Расход/день: ${expense_daily:,.2f}\n"
+        f"Чистый поток/день: ${net_daily:,.2f}\n"
+        f"Запас прочности: {runway_days} дн.\n"
         f"Оборудование: ур. {int(biz.get('equipment_level') or 1)}\n"
-        f"Сырье: {float(res.get('raw_materials') or 0):,.1f} ед."
+        f"Сырье: {raw_materials:,.1f} ед. (покрытие: {raw_cover_days} дн.)\n"
+        f"Задачи дня: {completed_actions}/{required_actions}\n"
+        f"Эффективность дохода: {efficiency_pct:.1f}%\n"
+        f"Состояние: {health_label}"
     )
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1437,6 +1670,10 @@ async def _render_business_panel(message: Message, owner_id: int, business_id: i
                 InlineKeyboardButton(text="💸 Вложить в бизнес", callback_data=f"fp_business_fund_in_{business_id}"),
                 InlineKeyboardButton(text="💵 Вывести себе", callback_data=f"fp_business_fund_out_{business_id}"),
             ],
+            [InlineKeyboardButton(text="🧰 Улучшить оборудование", callback_data=f"fp_business_upgrade_{business_id}")],
+            [InlineKeyboardButton(text="📈 Фин-отчет бизнеса", callback_data=f"fp_business_report_{business_id}")],
+            [InlineKeyboardButton(text="💸 Продать системе (50%)", callback_data=f"fp_business_sell_{business_id}")],
+            [InlineKeyboardButton(text="🎯 Задачи дня", callback_data=f"fp_business_tasks_{business_id}")],
             [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"fp_business_open_{business_id}")],
             [InlineKeyboardButton(text="🔙 К списку", callback_data="fp_business_my")],
         ]
@@ -1495,6 +1732,115 @@ async def feature_business_operation(callback: CallbackQuery, state: FSMContext)
             parse_mode=None,
         )
     await _render_business_panel(callback.message, callback.from_user.id, business_id)
+
+
+@router.callback_query(F.data.startswith("fp_business_tasks_"))
+async def feature_business_tasks(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    raw_id = callback.data.replace("fp_business_tasks_", "")
+    if not raw_id.isdigit():
+        await callback.answer("Некорректный бизнес.", show_alert=True)
+        return
+    business_id = int(raw_id)
+    biz = await db.get_business_by_id(business_id)
+    if not biz:
+        await callback.answer("Бизнес не найден.", show_alert=True)
+        return
+    if int(biz.get("owner_id") or 0) != int(callback.from_user.id):
+        await callback.answer("Только владелец может смотреть задачи.", show_alert=True)
+        return
+
+    task = await db.get_business_daily_task_status(business_id)
+    req = int(task.get("required_actions") or 2)
+    done = int(task.get("completed_actions") or 0)
+    remain = max(0, req - done)
+    efficiency = float(task.get("efficiency_factor") or 0.35) * 100.0
+    text = (
+        f"🎯 ЗАДАЧИ БИЗНЕСА #{business_id}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"Прогресс: {done}/{req}\n"
+        f"Осталось: {remain}\n"
+        f"Текущая эффективность дохода: {efficiency:.1f}%\n\n"
+        "Чтобы держать доход на 100%, ежедневно выполняйте операции:\n"
+        "• Производство\n"
+        "• Маркетинг\n"
+        "• Контракт"
+    )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⚙️ Производство", callback_data=f"fp_business_op_{business_id}_production")],
+            [InlineKeyboardButton(text="📣 Маркетинг", callback_data=f"fp_business_op_{business_id}_marketing")],
+            [InlineKeyboardButton(text="📄 Контракт", callback_data=f"fp_business_op_{business_id}_contract")],
+            [InlineKeyboardButton(text="🔙 К панели", callback_data=f"fp_business_open_{business_id}")],
+        ]
+    )
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode=None)
+
+
+@router.callback_query(F.data.startswith("fp_business_report_"))
+async def feature_business_report(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    raw_id = callback.data.replace("fp_business_report_", "")
+    if not raw_id.isdigit():
+        await callback.answer("Некорректный бизнес.", show_alert=True)
+        return
+    business_id = int(raw_id)
+    biz = await db.get_business_by_id(business_id)
+    if not biz:
+        await callback.answer("Бизнес не найден.", show_alert=True)
+        return
+    if int(biz.get("owner_id") or 0) != int(callback.from_user.id):
+        await callback.answer("Отчет доступен только владельцу.", show_alert=True)
+        return
+    resources = await db.get_business_resources(business_id)
+    task = await db.get_business_daily_task_status(business_id)
+    budget = float(biz.get("budget") or 0)
+    income_daily = float(biz.get("income_daily") or 0)
+    expense_daily = float(biz.get("expense_daily") or 0)
+    net_daily = round(income_daily - expense_daily, 2)
+    efficiency = float(task.get("efficiency_factor") or 0.35) * 100.0
+    raw_materials = float(resources.get("raw_materials") or 0)
+    daily_consumption = float(resources.get("daily_consumption") or 0)
+    runway_days = 9999.0 if expense_daily <= 0 else max(0.0, budget / max(1.0, expense_daily))
+    raw_cover = 9999.0 if daily_consumption <= 0 else max(0.0, raw_materials / max(1.0, daily_consumption))
+    recommendations: list[str] = []
+    if efficiency < 95:
+        recommendations.append("• Закройте задачи дня: это мгновенно поднимет эффективность.")
+    if raw_materials < 120:
+        recommendations.append("• Пополните склад сырья минимум до 500+ ед.")
+    if net_daily < 0:
+        recommendations.append("• Запустите маркетинг или контракт для компенсации убытка.")
+    if float(biz.get("equipment_level") or 1) < 4:
+        recommendations.append("• Поднимайте оборудование: это бустит выпуск и доход.")
+    if not recommendations:
+        recommendations.append("• Состояние сильное: держите темп и копите бюджет под масштабирование.")
+
+    report_lines = [
+        f"📈 ФИН-ОТЧЕТ БИЗНЕСА #{business_id}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Название: {biz.get('name')}",
+        f"Профиль: {biz.get('type')}",
+        f"Бюджет: ${budget:,.2f}",
+        f"Доход/день: ${income_daily:,.2f}",
+        f"Расход/день: ${expense_daily:,.2f}",
+        f"Net/день: ${net_daily:,.2f}",
+        f"Эффективность: {efficiency:.1f}%",
+        f"Запас прочности: {'∞' if runway_days >= 9999 else f'{runway_days:.1f} дн.'}",
+        f"Покрытие сырья: {'∞' if raw_cover >= 9999 else f'{raw_cover:.1f} дн.'}",
+        "",
+        "Рекомендации:",
+        *recommendations[:4],
+    ]
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="⚙️ Производство", callback_data=f"fp_business_op_{business_id}_production"),
+                InlineKeyboardButton(text="📣 Маркетинг", callback_data=f"fp_business_op_{business_id}_marketing"),
+            ],
+            [InlineKeyboardButton(text="🔙 К панели бизнеса", callback_data=f"fp_business_open_{business_id}")],
+        ]
+    )
+    await callback.message.edit_text("\n".join(report_lines), reply_markup=keyboard, parse_mode=None)
 
 
 @router.callback_query(F.data.startswith("fp_business_fund_in_"))
@@ -1560,6 +1906,63 @@ async def feature_business_fund_amount_input(message: Message, state: FSMContext
         reply_markup=_back(f"fp_business_open_{business_id}"),
         parse_mode=None,
     )
+
+
+@router.callback_query(F.data.startswith("fp_business_upgrade_"))
+async def feature_business_upgrade(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    raw_id = callback.data.replace("fp_business_upgrade_", "")
+    if not raw_id.isdigit():
+        await callback.answer("Некорректный бизнес.", show_alert=True)
+        return
+    business_id = int(raw_id)
+    ok, msg, payload = await db.upgrade_business_equipment(
+        owner_id=callback.from_user.id,
+        business_id=business_id,
+    )
+    if not ok:
+        await callback.message.answer(f"❌ {msg}", parse_mode=None)
+        await _render_business_panel(callback.message, callback.from_user.id, business_id)
+        return
+    payload = payload or {}
+    await callback.message.answer(
+        "✅ Оборудование улучшено.\n"
+        f"Уровень: {int(payload.get('level_before') or 0)} → {int(payload.get('level_after') or 0)}\n"
+        f"Стоимость: {float(payload.get('upgrade_cost') or 0):,.2f} люмов\n"
+        f"Доход/день: {float(payload.get('income_before') or 0):,.2f} → {float(payload.get('income_after') or 0):,.2f}\n"
+        f"Расход/день: {float(payload.get('expense_before') or 0):,.2f} → {float(payload.get('expense_after') or 0):,.2f}\n"
+        f"Бюджет: {float(payload.get('budget_after') or 0):,.2f} люмов",
+        parse_mode=None,
+    )
+    await _render_business_panel(callback.message, callback.from_user.id, business_id)
+
+
+@router.callback_query(F.data.startswith("fp_business_sell_"))
+async def feature_business_sell_to_system(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    raw_id = callback.data.replace("fp_business_sell_", "")
+    if not raw_id.isdigit():
+        await callback.answer("Некорректный бизнес.", show_alert=True)
+        return
+    business_id = int(raw_id)
+    ok, msg, payload = await db.sell_business_to_system(
+        owner_id=callback.from_user.id,
+        business_id=business_id,
+    )
+    if not ok:
+        await callback.message.answer(f"❌ {msg}", parse_mode=None)
+        await _render_business_panel(callback.message, callback.from_user.id, business_id)
+        return
+    payload = payload or {}
+    await callback.message.answer(
+        "✅ Бизнес продан системе\n"
+        f"Бизнес: {payload.get('business_name')}\n"
+        f"Оценка: ${float(payload.get('valuation') or 0):,.2f}\n"
+        f"Выплата (50%): ${float(payload.get('sale_price') or 0):,.2f}\n"
+        f"Ваш баланс: ${float(payload.get('owner_balance_after') or 0):,.2f}",
+        parse_mode=None,
+    )
+    await feature_business_my(callback, state)
 
 
 @router.callback_query(F.data == "fp_business_create_start")
@@ -1694,6 +2097,7 @@ async def feature_business_tax_reports(callback: CallbackQuery, state: FSMContex
 
 
 async def _render_property_menu(event: Message | CallbackQuery):
+    await _auto_claim_ready_developer_projects(event.from_user.id, limit=12)
     props = await db.get_user_properties(event.from_user.id)
     sender = _edit_or_answer(event)
     text = (
@@ -1706,6 +2110,7 @@ async def _render_property_menu(event: Message | CallbackQuery):
         inline_keyboard=[
             [InlineKeyboardButton(text="🔎 Каталог объектов", callback_data="property_catalog")],
             [InlineKeyboardButton(text="🏠 Мое имущество", callback_data="my_property")],
+            [InlineKeyboardButton(text="💸 Продать недвижимость", callback_data="property_sell_menu")],
             [InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_main")],
         ]
     )
@@ -1722,6 +2127,49 @@ async def feature_property_menu(event: Message | CallbackQuery, state: FSMContex
             pass
     await state.clear()
     await _render_property_menu(event)
+
+
+@router.message(Command("sellprop"))
+@router.callback_query(F.data == "property_sell_menu")
+async def feature_property_sell_menu(event: Message | CallbackQuery, state: FSMContext):
+    if isinstance(event, CallbackQuery):
+        try:
+            await event.answer()
+        except Exception:
+            pass
+    await _auto_claim_ready_developer_projects(event.from_user.id, limit=12)
+    props = await db.get_user_properties(event.from_user.id)
+    sellable = [
+        p for p in props
+        if int(p.get("has_business") or 0) == 0 and int(p.get("has_private_org") or 0) == 0
+    ]
+    lines = ["💸 **ПРОДАЖА НЕДВИЖИМОСТИ**", "━━━━━━━━━━━━━━━━━━━━", ""]
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+    if not sellable:
+        lines.append("Нет доступных объектов для продажи.")
+        lines.append("Объект нельзя продать, если в нем активен бизнес или частная организация.")
+    else:
+        lines.append("Выберите объект для продажи (продажа за 50% стоимости):")
+        lines.append("")
+        for prop in sellable[:15]:
+            prop_id = int(prop.get("id") or 0)
+            if prop_id <= 0:
+                continue
+            lines.append(
+                f"• **{_md(str(prop.get('name') or f'Объект #{prop_id}'))}** — {_lum(float(prop.get('price') or 0))}"
+            )
+            keyboard_rows.append(
+                [InlineKeyboardButton(text=f"💸 Продать #{prop_id}", callback_data=f"fp_sell_property_{prop_id}")]
+            )
+    keyboard_rows.append([InlineKeyboardButton(text="🏠 К имуществу", callback_data="my_property")])
+    keyboard_rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="prop_menu")])
+
+    sender = _edit_or_answer(event)
+    await sender(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+        parse_mode="Markdown",
+    )
 
 
 @router.callback_query(F.data == "property_catalog")
@@ -1742,7 +2190,7 @@ async def feature_property_catalog(callback: CallbackQuery, state: FSMContext):
     keyboard_rows = []
     for prop in props:
         lines.append(
-            f"• **{_md(str(prop.get('name')))}** — ${float(prop.get('price') or 0):,.0f}\n"
+            f"• **{_md(str(prop.get('name')))}** — {_lum(float(prop.get('price') or 0))}\n"
             f"  Локация: {_md(str(prop.get('location') or 'Неизвестно'))}"
         )
         keyboard_rows.append([InlineKeyboardButton(text=f"Купить #{int(prop['id'])}", callback_data=f"fp_buy_property_{int(prop['id'])}")])
@@ -1769,26 +2217,49 @@ async def feature_buy_property(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "my_property")
 async def feature_my_property(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
+    restored = await db.sync_missing_developer_properties(callback.from_user.id, limit=80)
+    auto_claimed = await _auto_claim_ready_developer_projects(callback.from_user.id, limit=12)
     props = await db.get_user_properties(callback.from_user.id)
     if not props:
+        hint = ""
+        if int(restored.get("created") or 0) > 0:
+            hint += (
+                f"\n\nВосстановлено объектов застройщика: {int(restored.get('created') or 0)}."
+            )
+        if int(auto_claimed.get("claimed") or 0) > 0:
+            hint += (
+                f"\n\nАвтовыдача застройщика: завершено {int(auto_claimed.get('claimed') or 0)} проект(ов). "
+                "Если список пуст, откройте раздел еще раз."
+            )
         await callback.message.edit_text(
-            "🏠 **МОЕ ИМУЩЕСТВО**\n━━━━━━━━━━━━━━━━━━━━\n\nУ вас пока нет недвижимости.",
+            "🏠 **МОЕ ИМУЩЕСТВО**\n━━━━━━━━━━━━━━━━━━━━\n\nУ вас пока нет недвижимости." + hint,
             reply_markup=_back("prop_menu"),
             parse_mode="Markdown",
         )
         return
 
     lines = ["🏠 **МОЕ ИМУЩЕСТВО**", "━━━━━━━━━━━━━━━━━━━━", ""]
+    if int(restored.get("created") or 0) > 0:
+        lines.append(
+            f"🛠️ Восстановлено объектов из прошлых завершенных проектов: {int(restored.get('created') or 0)}."
+        )
+        lines.append("")
+    if int(auto_claimed.get("claimed") or 0) > 0:
+        lines.append(
+            f"✅ Автовыдача: {int(auto_claimed.get('claimed') or 0)} готовых стройпроектов переведены в имущество."
+        )
+        lines.append("")
     keyboard_rows = []
     for prop in props[:12]:
         lines.append(
-            f"• **{_md(str(prop.get('name')))}** — ${float(prop.get('price') or 0):,.0f}\n"
+            f"• **{_md(str(prop.get('name')))}** — {_lum(float(prop.get('price') or 0))}\n"
             f"  Статус: {'занят' if int(prop.get('has_business') or 0) or int(prop.get('has_private_org') or 0) else 'свободен'}"
         )
         if int(prop.get("has_business") or 0) == 0 and int(prop.get("has_private_org") or 0) == 0:
             prop_id = int(prop["id"])
             keyboard_rows.append([InlineKeyboardButton(text=f"🏢 В частную орг #{prop_id}", callback_data=f"fp_convert_private_{prop_id}")])
             keyboard_rows.append([InlineKeyboardButton(text=f"🏪 В бизнес #{prop_id}", callback_data=f"fp_convert_business_{prop_id}")])
+            keyboard_rows.append([InlineKeyboardButton(text=f"💸 Продать #{prop_id}", callback_data=f"fp_sell_property_{prop_id}")])
     keyboard_rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="prop_menu")])
     await callback.message.edit_text(
         "\n".join(lines),
@@ -1819,6 +2290,28 @@ async def feature_convert_business(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Выберите профиль бизнеса для объекта:", reply_markup=keyboard, parse_mode=None)
 
 
+@router.callback_query(F.data.startswith("fp_sell_property_"))
+async def feature_sell_property(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    prop_id_raw = callback.data.replace("fp_sell_property_", "")
+    if not prop_id_raw.isdigit():
+        await callback.answer("Некорректный объект.", show_alert=True)
+        return
+    ok, msg, payload = await db.sell_property(callback.from_user.id, int(prop_id_raw))
+    if ok:
+        payload = payload or {}
+        await callback.message.answer(
+            "✅ Продажа завершена\n"
+            f"Объект: {payload.get('property_name')}\n"
+            f"Получено: {_lum(float(payload.get('sale_price') or 0))}\n"
+            f"Новый баланс: {_lum(float(payload.get('new_balance') or 0))}",
+            parse_mode=None,
+        )
+    else:
+        await callback.message.answer(f"❌ {msg}", parse_mode=None)
+    await feature_my_property(callback, state)
+
+
 @router.message(Command("priv"))
 @router.callback_query(F.data == "private_org_list")
 async def feature_private_org_list(event: Message | CallbackQuery, state: FSMContext):
@@ -1829,7 +2322,13 @@ async def feature_private_org_list(event: Message | CallbackQuery, state: FSMCon
             pass
     orgs = await db.list_private_orgs(limit=12)
     my_org = await db.get_user_private_org_membership(event.from_user.id)
+    total_budget = sum(float(org.get("budget") or 0) for org in orgs)
+    avg_budget = (total_budget / len(orgs)) if orgs else 0.0
     lines = ["🏢 **ЧАСТНЫЕ ОРГАНИЗАЦИИ**", "━━━━━━━━━━━━━━━━━━━━", ""]
+    lines.append(f"Всего активных организаций: {len(orgs)}")
+    lines.append(f"Суммарный бюджет сектора: ${total_budget:,.0f}")
+    lines.append(f"Средний бюджет: ${avg_budget:,.0f}")
+    lines.append("")
     keyboard_rows: list[list[InlineKeyboardButton]] = []
     if my_org:
         lines.append(
@@ -1847,7 +2346,9 @@ async def feature_private_org_list(event: Message | CallbackQuery, state: FSMCon
         for org in orgs[:10]:
             lines.append(
                 f"• **{_md(str(org.get('name')))}** | Лидер: {_md(str(org.get('leader_name') or 'Неизвестно'))}\n"
-                f"  Бюджет: ${float(org.get('budget') or 0):,.0f}"
+                f"  Бюджет: ${float(org.get('budget') or 0):,.0f} | "
+                f"Оборудование: ур. {int(org.get('equipment_level') or 1)} | "
+                f"Объект: {_md(str(org.get('property_name') or 'не назначен'))}"
             )
             keyboard_rows.append(
                 [InlineKeyboardButton(text=f"Открыть #{int(org['id'])}", callback_data=f"fp_private_org_open_{int(org['id'])}")]
@@ -1861,8 +2362,14 @@ async def feature_private_org_list(event: Message | CallbackQuery, state: FSMCon
         ]
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
-    sender = _edit_or_answer(event)
-    await sender("\n".join(lines), reply_markup=keyboard, parse_mode="Markdown")
+    await send_section_screen(
+        event,
+        text="\n".join(lines),
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+        section_key="private",
+        add_back_to_menu=True,
+    )
 
 
 @router.callback_query(F.data == "fp_private_org_create_start")
@@ -1950,21 +2457,57 @@ async def _render_private_org_panel(message: Message, user_id: int, org_id: int)
     if not org:
         await message.edit_text("❌ Организация не найдена.", reply_markup=_back("private_org_list"), parse_mode=None)
         return
+    if str(org.get("status") or "active").lower() != "active":
+        await message.edit_text(
+            "ℹ️ Эта частная организация уже закрыта/продана системе.",
+            reply_markup=_back("private_org_list"),
+            parse_mode=None,
+        )
+        return
 
     membership = await db.get_user_private_org_membership(user_id)
     is_member = membership and int(membership.get("id") or 0) == org_id
     is_leader = int(org.get("leader_id") or 0) == int(user_id)
     members = await db.get_private_org_members(org_id, limit=200)
     resources = await db.get_private_org_resources(org_id)
+    task = await db.get_private_org_daily_task_status(org_id)
+    required_actions = int(task.get("required_actions") or 2)
+    completed_actions = int(task.get("completed_actions") or 0)
+    efficiency_pct = float(task.get("efficiency_factor") or 0.35) * 100.0
+    budget = float(org.get("budget") or 0)
+    eq_level = int(org.get("equipment_level") or 1)
+    raw_materials = float(resources.get("raw_materials") or 0)
+    daily_consumption = float(resources.get("daily_consumption") or 0)
+    raw_cover = "∞" if daily_consumption <= 0 else f"{max(0.0, raw_materials / max(1.0, daily_consumption)):.1f}"
+    influence_score = int(
+        min(
+            100,
+            max(
+                1,
+                round(
+                    min(40.0, budget / 20_000.0)
+                    + min(25.0, len(members) * 2.2)
+                    + min(20.0, eq_level * 4.0)
+                    + min(15.0, efficiency_pct / 7.0)
+                ),
+            ),
+        )
+    )
+    org_state = "🟢 сильная организация" if influence_score >= 70 else ("🟡 растущая" if influence_score >= 45 else "🔴 слабая")
 
     lines = [
         f"🏢 **{_md(str(org.get('name') or 'ЧАСТНАЯ ОРГАНИЗАЦИЯ'))}**",
         "━━━━━━━━━━━━━━━━━━━━",
         f"Лидер: {_md(str(org.get('leader_name') or 'Неизвестно'))}",
         f"Участников: {len(members)}",
-        f"Бюджет: ${float(org.get('budget') or 0):,.2f}",
+        f"Бюджет: ${budget:,.2f}",
+        f"Индекс влияния: {influence_score}/100",
         f"Объект: {_md(str(org.get('property_name') or 'не назначен'))}",
-        f"Сырье на складе: {float(resources.get('raw_materials') or 0):,.1f} ед.",
+        f"Сырье на складе: {raw_materials:,.1f} ед. (покрытие: {raw_cover} дн.)",
+        f"Оборудование: ур. {eq_level}",
+        f"Задачи дня: {completed_actions}/{required_actions}",
+        f"Эффективность дохода: {efficiency_pct:.1f}%",
+        f"Состояние: {org_state}",
     ]
     if is_member:
         lines.append(f"Ваша роль: {_md(str(membership.get('member_role') or 'Участник'))}")
@@ -1977,6 +2520,8 @@ async def _render_private_org_panel(message: Message, user_id: int, org_id: int)
     if is_leader:
         keyboard_rows.append([InlineKeyboardButton(text="📨 Заявки", callback_data=f"fp_private_org_apps_{org_id}")])
         keyboard_rows.append([InlineKeyboardButton(text="👥 Участники", callback_data=f"fp_private_org_members_{org_id}")])
+        keyboard_rows.append([InlineKeyboardButton(text="📈 Штаб-отчет", callback_data=f"fp_private_org_report_{org_id}")])
+        keyboard_rows.append([InlineKeyboardButton(text="🎯 Задачи дня", callback_data=f"fp_private_org_tasks_{org_id}")])
         keyboard_rows.append([InlineKeyboardButton(text="🏗 Заказать сырье", callback_data=f"fp_private_org_raw_menu_{org_id}")])
         keyboard_rows.append(
             [
@@ -1991,8 +2536,10 @@ async def _render_private_org_panel(message: Message, user_id: int, org_id: int)
                 InlineKeyboardButton(text="💵 Вывести себе", callback_data=f"fp_private_org_fund_out_{org_id}"),
             ]
         )
+        keyboard_rows.append([InlineKeyboardButton(text="💸 Продать системе (50%)", callback_data=f"fp_private_org_sell_{org_id}")])
     elif is_member:
         keyboard_rows.append([InlineKeyboardButton(text="👥 Участники", callback_data=f"fp_private_org_members_{org_id}")])
+        keyboard_rows.append([InlineKeyboardButton(text="📈 Штаб-отчет", callback_data=f"fp_private_org_report_{org_id}")])
     else:
         keyboard_rows.append([InlineKeyboardButton(text="📝 Подать заявление", callback_data=f"fp_private_org_apply_{org_id}")])
     keyboard_rows.append([InlineKeyboardButton(text="🔙 К списку", callback_data="private_org_list")])
@@ -2033,6 +2580,80 @@ async def feature_private_org_members(callback: CallbackQuery, state: FSMContext
         "\n".join(lines),
         reply_markup=_back(f"fp_private_org_open_{org_id}", "🔙 К организации"),
         parse_mode="Markdown",
+    )
+
+
+@router.callback_query(F.data.startswith("fp_private_org_report_"))
+async def feature_private_org_report(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    raw_id = callback.data.replace("fp_private_org_report_", "")
+    if not raw_id.isdigit():
+        await callback.answer("Некорректная организация.", show_alert=True)
+        return
+    org_id = int(raw_id)
+    org = await db.get_private_org_by_id(org_id)
+    if not org:
+        await callback.answer("Организация не найдена.", show_alert=True)
+        return
+    membership = await db.get_user_private_org_membership(callback.from_user.id)
+    is_leader = int(org.get("leader_id") or 0) == int(callback.from_user.id)
+    is_member = membership and int(membership.get("id") or 0) == org_id
+    if not is_leader and not is_member:
+        await callback.answer("Отчет доступен только участникам.", show_alert=True)
+        return
+
+    members = await db.get_private_org_members(org_id, limit=200)
+    resources = await db.get_private_org_resources(org_id)
+    task = await db.get_private_org_daily_task_status(org_id)
+    budget = float(org.get("budget") or 0)
+    eq_level = int(org.get("equipment_level") or 1)
+    raw_materials = float(resources.get("raw_materials") or 0)
+    daily_consumption = float(resources.get("daily_consumption") or 0)
+    efficiency = float(task.get("efficiency_factor") or 0.35) * 100.0
+    done = int(task.get("completed_actions") or 0)
+    req = int(task.get("required_actions") or 2)
+    raw_cover = 9999.0 if daily_consumption <= 0 else max(0.0, raw_materials / max(1.0, daily_consumption))
+    budget_per_member = budget / max(1, len(members))
+    recommendations: list[str] = []
+    if efficiency < 95:
+        recommendations.append("• Закройте дневные задачи (production/campaign/security).")
+    if raw_materials < 150:
+        recommendations.append("• Пополните склад сырья минимум до 500+ ед.")
+    if budget_per_member < 25_000:
+        recommendations.append("• Укрепите бюджет фондами лидера или операциями.")
+    if eq_level < 4:
+        recommendations.append("• Поднимайте оборудование для роста выработки.")
+    if not recommendations:
+        recommendations.append("• Организация в стабильной фазе, можно расширять команду.")
+
+    lines = [
+        f"📈 ШТАБ-ОТЧЕТ ОРГАНИЗАЦИИ #{org_id}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Название: {org.get('name')}",
+        f"Участников: {len(members)}",
+        f"Бюджет: ${budget:,.2f}",
+        f"Бюджет на участника: ${budget_per_member:,.2f}",
+        f"Оборудование: ур. {eq_level}",
+        f"Сырье: {raw_materials:,.1f} ед.",
+        f"Покрытие сырьем: {'∞' if raw_cover >= 9999 else f'{raw_cover:.1f} дн.'}",
+        f"Прогресс задач: {done}/{req}",
+        f"Эффективность: {efficiency:.1f}%",
+        "",
+        "Рекомендации:",
+        *recommendations[:4],
+    ]
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="⚙️ Производство", callback_data=f"fp_private_org_op_{org_id}_production"),
+                    InlineKeyboardButton(text="📣 Кампания", callback_data=f"fp_private_org_op_{org_id}_campaign"),
+                ],
+                [InlineKeyboardButton(text="🔙 К организации", callback_data=f"fp_private_org_open_{org_id}")],
+            ]
+        ),
+        parse_mode=None,
     )
 
 
@@ -2175,6 +2796,49 @@ async def feature_private_org_app_decision(callback: CallbackQuery, state: FSMCo
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
         parse_mode="Markdown",
     )
+
+
+@router.callback_query(F.data.startswith("fp_private_org_tasks_"))
+async def feature_private_org_tasks(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    raw_id = callback.data.replace("fp_private_org_tasks_", "")
+    if not raw_id.isdigit():
+        await callback.answer("Некорректная организация.", show_alert=True)
+        return
+    org_id = int(raw_id)
+    org = await db.get_private_org_by_id(org_id)
+    if not org:
+        await callback.answer("Организация не найдена.", show_alert=True)
+        return
+    if int(org.get("leader_id") or 0) != int(callback.from_user.id):
+        await callback.answer("Только лидер может управлять задачами.", show_alert=True)
+        return
+
+    task = await db.get_private_org_daily_task_status(org_id)
+    req = int(task.get("required_actions") or 2)
+    done = int(task.get("completed_actions") or 0)
+    remain = max(0, req - done)
+    efficiency = float(task.get("efficiency_factor") or 0.35) * 100.0
+    text = (
+        f"🎯 ЗАДАЧИ ОРГАНИЗАЦИИ #{org_id}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"Прогресс: {done}/{req}\n"
+        f"Осталось: {remain}\n"
+        f"Текущая эффективность дохода: {efficiency:.1f}%\n\n"
+        "Для полного дохода выполняйте ежедневные операции:\n"
+        "• Производство\n"
+        "• Кампания\n"
+        "• Аудит безопасности"
+    )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⚙️ Производство", callback_data=f"fp_private_org_op_{org_id}_production")],
+            [InlineKeyboardButton(text="📣 Кампания", callback_data=f"fp_private_org_op_{org_id}_campaign")],
+            [InlineKeyboardButton(text="🛡 Аудит", callback_data=f"fp_private_org_op_{org_id}_security")],
+            [InlineKeyboardButton(text="🔙 К организации", callback_data=f"fp_private_org_open_{org_id}")],
+        ]
+    )
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode=None)
 
 
 @router.callback_query(F.data.startswith("fp_private_org_raw_menu_"))
@@ -2345,6 +3009,34 @@ async def feature_private_org_fund_amount_input(message: Message, state: FSMCont
         reply_markup=_back(f"fp_private_org_open_{org_id}"),
         parse_mode=None,
     )
+
+
+@router.callback_query(F.data.startswith("fp_private_org_sell_"))
+async def feature_private_org_sell_to_system(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    raw_id = callback.data.replace("fp_private_org_sell_", "")
+    if not raw_id.isdigit():
+        await callback.answer("Некорректная организация.", show_alert=True)
+        return
+    org_id = int(raw_id)
+    ok, msg, payload = await db.sell_private_org_to_system(
+        leader_id=callback.from_user.id,
+        org_id=org_id,
+    )
+    if not ok:
+        await callback.message.answer(f"❌ {msg}", parse_mode=None)
+        await _render_private_org_panel(callback.message, callback.from_user.id, org_id)
+        return
+    payload = payload or {}
+    await callback.message.answer(
+        "✅ Частная организация продана системе\n"
+        f"Организация: {payload.get('org_name')}\n"
+        f"Оценка: ${float(payload.get('valuation') or 0):,.2f}\n"
+        f"Выплата (50%): ${float(payload.get('sale_price') or 0):,.2f}\n"
+        f"Ваш баланс: ${float(payload.get('leader_balance_after') or 0):,.2f}",
+        parse_mode=None,
+    )
+    await feature_private_org_list(callback, state)
 
 
 @router.message(Command("edu"))
@@ -2688,9 +3380,10 @@ async def feature_work_menu(event: Message | CallbackQuery, state: FSMContext):
         "💼 **РАБОТА И ПОДРАБОТКИ**",
         "━━━━━━━━━━━━━━━━━━━━",
         f"Текущая работа: {_md(str(user.get('citizen_job') or 'нет'))}",
-        f"Зарплата: ${float(user.get('citizen_salary') or 0):,.0f}/день",
+        f"Зарплата: {_lum(float(user.get('citizen_salary') or 0))}/час",
         "",
-        "Трудоустройство идет через HR-заявление.",
+        "Работа дает стабильный доход, репутацию и открывает роли в организациях.",
+        "Зарплата начисляется каждый час на банковский счет, а смены дают личные премии.",
     ]
     if pending:
         lines.append(
@@ -2701,19 +3394,21 @@ async def feature_work_menu(event: Message | CallbackQuery, state: FSMContext):
             f"🎯 Цель работы: {int(active_task.get('progress') or 0)}/{int(active_task.get('goal') or 1)} смен"
         )
     lines.append("")
-    lines.append("Подработки доступны отдельно и с личным кулдауном для каждого игрока.")
+    lines.append("Подработки — быстрые разовые задачи. Вакансии — долгий карьерный путь.")
 
     keyboard_rows = [
         [InlineKeyboardButton(text="📋 Вакансии", callback_data="view_citizen_jobs")],
+        [InlineKeyboardButton(text="🧭 Карьерная карта", callback_data="work_ladder")],
         [InlineKeyboardButton(text="🛠 Отработать смену", callback_data="work_shift")],
         [InlineKeyboardButton(text="💼 Мой статус", callback_data="citizen_work_status")],
         [InlineKeyboardButton(text="⚡ Микроподработки", callback_data="fp_microjob_menu")],
         [InlineKeyboardButton(text="🎯 Подработки", callback_data="side_hustle_menu")],
     ]
+    if user.get("citizen_job"):
+        keyboard_rows.append([InlineKeyboardButton(text="🚪 Уволиться с работы", callback_data="work_resign")])
     if pending:
         keyboard_rows.append(
             [
-                InlineKeyboardButton(text="⏱ Авто-решение HR", callback_data="fp_job_auto_review"),
                 InlineKeyboardButton(text="🗑 Отозвать заявку", callback_data="fp_job_cancel_pending"),
             ]
         )
@@ -2723,8 +3418,47 @@ async def feature_work_menu(event: Message | CallbackQuery, state: FSMContext):
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=keyboard_rows
     )
-    sender = _edit_or_answer(event)
-    await sender("\n".join(lines), reply_markup=keyboard, parse_mode="Markdown")
+    await send_section_screen(
+        event,
+        text="\n".join(lines),
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+        section_key="pod",
+        add_back_to_menu=True,
+    )
+
+
+@router.callback_query(F.data == "work_ladder")
+async def feature_work_ladder(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    lines = [
+        "🧭 КАРЬЕРНАЯ КАРТА",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "1) Старт: санитар, логист, водитель.",
+        "   Цель: набрать репутацию, понять экономику и накопить первый капитал.",
+        "",
+        "2) Система: клерк, диспетчер, техподдержка.",
+        "   Цель: научиться работать с заявками, организациями и игроками.",
+        "",
+        "3) Специализация: фельдшер, офицер, операционист, бухгалтер.",
+        "   Цель: выбрать ветку — медицина, закон, банк или финансы.",
+        "",
+        "4) Влияние: кредитный менеджер, налоговый инспектор, госаналитик, помощник суда.",
+        "   Цель: принимать решения, которые меняют деньги, закон и репутацию страны.",
+        "",
+        "Совет: образование открывает сложные вакансии, репутация ускоряет доверие HR.",
+    ]
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📋 Вакансии", callback_data="view_citizen_jobs")],
+                [InlineKeyboardButton(text="🔙 К работе", callback_data="work_menu")],
+            ]
+        ),
+        parse_mode=None,
+    )
 
 
 @router.callback_query(F.data == "view_citizen_jobs")
@@ -2737,11 +3471,15 @@ async def feature_view_citizen_jobs(callback: CallbackQuery, state: FSMContext):
     keyboard_rows: list[list[InlineKeyboardButton]] = []
     can_apply = (not user.get("citizen_job")) and (pending is None)
     for job in jobs:
+        department = str(job.get("department") or "Город").strip()
+        impact = str(job.get("impact") or "").strip()
         lines.append(
-            f"• **{_md(str(job['title']))}** — ${float(job['salary']):,.0f}/день\n"
-            f"  Требования: 🎓 {int(job['edu_required'])}+ | ⭐ {float(job['rep_required']):.1f}+"
+            f"• **{_md(str(job['title']))}** — {_lum(float(job['salary']))}/час\n"
+            f"  Отдел: {_md(department)} | Требования: 🎓 {int(job['edu_required'])}+ | ⭐ {float(job['rep_required']):.1f}+"
         )
         lines.append(f"  {_md(str(job['description']))}")
+        if impact:
+            lines.append(f"  Смысл: {_md(impact)}")
         lines.append("")
         if can_apply:
             keyboard_rows.append(
@@ -2754,7 +3492,6 @@ async def feature_view_citizen_jobs(callback: CallbackQuery, state: FSMContext):
         lines.append(f"📨 У вас уже есть активная заявка #{int(pending.get('id') or 0)}.")
         keyboard_rows.append(
             [
-                InlineKeyboardButton(text="⏱ Авто-решение HR", callback_data="fp_job_auto_review"),
                 InlineKeyboardButton(text="🗑 Отозвать", callback_data="fp_job_cancel_pending"),
             ]
         )
@@ -2786,7 +3523,9 @@ async def feature_job_apply_start(callback: CallbackQuery, state: FSMContext):
     await state.update_data(work_apply_job_code=job_code)
     await callback.message.answer(
         f"📝 HR-заявление на должность **{_md(str(job['title']))}**.\n"
-        "Опишите ваш опыт и почему вас стоит нанять:",
+        f"Отдел: **{_md(str(job.get('department') or 'Город'))}**\n"
+        f"Смысл роли: {_md(str(job.get('impact') or job.get('description') or 'работа на пользу города'))}\n\n"
+        "Опишите ваш опыт, мотивацию и чем вы будете полезны Мирнастану:",
         reply_markup=_back("view_citizen_jobs", "🔙 Отмена"),
         parse_mode="Markdown",
     )
@@ -2827,8 +3566,10 @@ async def feature_citizen_work_status(callback: CallbackQuery, state: FSMContext
         "💼 **МОЙ РАБОЧИЙ СТАТУС**",
         "━━━━━━━━━━━━━━━━━━━━",
         f"Должность: {_md(str(user.get('citizen_job') or 'нет'))}",
-        f"Оклад: ${float(user.get('citizen_salary') or 0):,.2f}/день",
+        f"Оклад: {_lum(float(user.get('citizen_salary') or 0))}/час",
+        f"Банк: {_lum(float(user.get('bank') or 0))}",
         f"Последняя смена: {str(user.get('last_job_shift') or '—')[:16]}",
+        "Почасовая зарплата начисляется автоматически на банковский счет.",
     ]
     if pending:
         lines.append(f"HR-заявка: #{int(pending.get('id') or 0)} ({pending.get('job_title')})")
@@ -2836,7 +3577,7 @@ async def feature_citizen_work_status(callback: CallbackQuery, state: FSMContext
         lines.append(
             f"🎯 Цель: {int(active_task.get('progress') or 0)}/{int(active_task.get('goal') or 1)} смен"
         )
-        lines.append(f"Премия цели: ${float(active_task.get('reward') or 0):,.0f}")
+        lines.append(f"Премия цели: {_lum(float(active_task.get('reward') or 0))}")
     keyboard_rows = [
         [InlineKeyboardButton(text="🛠 Отработать смену", callback_data="work_shift")],
         [InlineKeyboardButton(text="⚡ Микроподработки", callback_data="fp_microjob_menu")],
@@ -2844,10 +3585,11 @@ async def feature_citizen_work_status(callback: CallbackQuery, state: FSMContext
     if pending:
         keyboard_rows.append(
             [
-                InlineKeyboardButton(text="⏱ Авто-решение HR", callback_data="fp_job_auto_review"),
                 InlineKeyboardButton(text="🗑 Отозвать", callback_data="fp_job_cancel_pending"),
             ]
         )
+    if user.get("citizen_job"):
+        keyboard_rows.append([InlineKeyboardButton(text="🚪 Уволиться с работы", callback_data="work_resign")])
     keyboard_rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="work_menu")])
     await callback.message.edit_text(
         "\n".join(lines),
@@ -2867,19 +3609,20 @@ async def feature_job_cancel_pending(callback: CallbackQuery, state: FSMContext)
 @router.callback_query(F.data == "fp_job_auto_review")
 async def feature_job_auto_review(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    ok, msg, payload = await db.auto_review_user_job_application(
-        user_id=callback.from_user.id,
-        min_wait_minutes=0,
+    await callback.message.answer(
+        "❌ Авто-рассмотрение отключено. Все заявки обрабатываются вручную через отдел кадров.",
+        parse_mode=None,
     )
-    payload = payload or {}
+    await feature_work_menu(callback, state)
+
+
+@router.callback_query(F.data == "work_resign")
+async def feature_work_resign(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    ok, msg, payload = await db.resign_citizen_job(callback.from_user.id)
     if ok:
-        if payload.get("approved"):
-            await callback.message.answer(
-                f"✅ {msg}\nВас приняли на должность: {payload.get('job_title')}",
-                parse_mode=None,
-            )
-        else:
-            await callback.message.answer(("✅ " if msg else "") + msg, parse_mode=None)
+        old_job = str((payload or {}).get("old_job") or "должность")
+        await callback.message.answer(f"✅ {msg}\nПредыдущая должность: {old_job}", parse_mode=None)
     else:
         await callback.message.answer(f"❌ {msg}", parse_mode=None)
     await feature_work_menu(callback, state)
@@ -2888,6 +3631,16 @@ async def feature_job_auto_review(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "work_shift")
 async def feature_work_shift(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
+    if callback.message:
+        await _text_animation(
+            callback.message,
+            [
+                "🛠 Смена началась\n[░░░░░] Проверяем задачи...",
+                "🛠 Смена идет\n[██░░░] Решаем рабочий хаос...",
+                "🛠 Смена почти готова\n[████░] Считаем выплату...",
+            ],
+            delay=0.22,
+        )
     ok, msg, payload = await db.work_citizen_shift(callback.from_user.id)
     if not ok:
         await callback.message.edit_text(
@@ -2901,6 +3654,9 @@ async def feature_work_shift(callback: CallbackQuery, state: FSMContext):
         "✅ СМЕНА ЗАВЕРШЕНА",
         "━━━━━━━━━━━━━━━━━━━━",
         f"Должность: {payload.get('job_title')}",
+        f"Отдел: {payload.get('job_department') or 'городская служба'}",
+        f"Сцена: {payload.get('shift_event') or 'Смена прошла спокойно.'}",
+        "",
         f"Выплата за смену: ${float(payload.get('payout') or 0):,.2f}",
         f"Премия за цель: ${float(payload.get('bonus_reward') or 0):,.2f}",
         f"Текущий баланс: ${float(payload.get('new_balance') or 0):,.2f}",
@@ -3046,7 +3802,14 @@ async def feature_hustle_start(callback: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="🔙 Отмена", callback_data="side_hustle_menu")],
         ]
     )
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    await send_section_screen(
+        callback,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+        section_key="pod",
+        add_back_to_menu=True,
+    )
 
 
 @router.callback_query(F.data == "fp_microjob_menu")
@@ -3057,7 +3820,8 @@ async def feature_microjob_menu(callback: CallbackQuery, state: FSMContext):
         "⚡ **МИКРОПОДРАБОТКИ**\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         "Быстрые задания с отдельными кулдаунами на каждый тип.\n"
-        "Кулдауны персональные: один игрок не блокирует другого."
+        "Кулдауны персональные: один игрок не блокирует другого.\n"
+        "Доход умеренный, основной рост теперь через вакансии и организации."
     )
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -3070,19 +3834,21 @@ async def feature_microjob_menu(callback: CallbackQuery, state: FSMContext):
                 InlineKeyboardButton(text="💻 Фриланс", callback_data="fp_microjob_freelance"),
             ],
             [
-                InlineKeyboardButton(text="🛍 Уличная торговля", callback_data="fp_microjob_street_trade"),
-                InlineKeyboardButton(text="⚡ Экспресс-доставка", callback_data="fp_microjob_delivery_plus"),
-            ],
-            [
                 InlineKeyboardButton(text="📦 Склад", callback_data="fp_microjob_warehouse"),
-                InlineKeyboardButton(text="🎥 Стрим", callback_data="fp_microjob_stream"),
+                InlineKeyboardButton(text="🧑‍💼 Ассистент", callback_data="fp_microjob_assistant"),
             ],
-            [InlineKeyboardButton(text="🧑‍💼 Ассистент", callback_data="fp_microjob_assistant")],
             [InlineKeyboardButton(text="🎯 К большим подработкам", callback_data="side_hustle_menu")],
             [InlineKeyboardButton(text="🔙 К работе", callback_data="work_menu")],
         ]
     )
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    await send_section_screen(
+        callback,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+        section_key="pod",
+        add_back_to_menu=True,
+    )
 
 
 @router.callback_query(F.data.startswith("fp_microjob_"))
@@ -3184,28 +3950,320 @@ async def feature_casino_menu(event: Message | CallbackQuery, state: FSMContext)
         except Exception:
             pass
     casinos = await db.list_casinos(limit=12)
-    lines = ["🎰 **КАЗИНО**", "━━━━━━━━━━━━━━━━━━━━", ""]
+    lines = ["🎰 **КАЗИНО MIRNASTAN**", "━━━━━━━━━━━━━━━━━━━━", ""]
     if not casinos:
         lines.append("Казино пока не зарегистрированы.")
     else:
         for c in casinos:
+            balance = float(c.get("balance") or 0.0)
+            owner_name = str(c.get("owner_name") or "Система")
             lines.append(
-                f"• **{_md(str(c.get('name')))}** ({c.get('casino_type')})\n"
-                f"  Лимиты: ${float(c.get('min_bet') or 0):,.0f} - ${float(c.get('max_bet') or 0):,.0f}"
+                f"• **{_md(str(c.get('name')))}** ({_md(str(c.get('casino_type') or 'state'))})\n"
+                f"  Владелец: {_md(owner_name)} | Банкролл: ${balance:,.0f}\n"
+                f"  Лимиты: ${float(c.get('min_bet') or 0):,.0f} - ${float(c.get('max_bet') or 0):,.0f} | "
+                f"Маржа: {float(c.get('house_edge') or 0.03) * 100:.2f}%"
             )
     keyboard_rows = [
-        [InlineKeyboardButton(text=f"Открыть #{int(c['id'])}", callback_data=f"fp_casino_open_{int(c['id'])}")]
+        [InlineKeyboardButton(text=f"🏛️ Лобби #{int(c['id'])}", callback_data=f"fp_casino_open_{int(c['id'])}")]
         for c in casinos[:10]
     ]
     keyboard_rows.append([InlineKeyboardButton(text="🆕 Открыть частное казино", callback_data="fp_casino_create")])
     keyboard_rows.append([InlineKeyboardButton(text="📜 Моя история игр", callback_data="fp_casino_history")])
     keyboard_rows.append([InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_main")])
-    sender = _edit_or_answer(event)
-    await sender(
-        "\n".join(lines),
+    await send_section_screen(
+        event,
+        text="\n".join(lines),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
         parse_mode="Markdown",
+        section_key="cazino",
+        add_back_to_menu=True,
     )
+
+
+def _usd_short(amount: float) -> str:
+    value = float(amount or 0.0)
+    if value >= 1_000_000:
+        return f"${value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"${value / 1_000:.0f}k"
+    return f"${value:,.0f}"
+
+
+def _casino_bet_levels(min_bet: float, max_bet: float) -> list[int]:
+    low = max(100, int(round(float(min_bet or 100))))
+    high_cap = max(low, int(round(float(max_bet or low))))
+    candidates = [
+        low,
+        max(low, int(round(low * 4))),
+        max(low, int(round(low * 10))),
+        max(low, int(round(low * 25))),
+    ]
+    values: list[int] = []
+    for candidate in candidates:
+        safe = int(max(low, min(high_cap, candidate)))
+        if safe not in values:
+            values.append(safe)
+    while len(values) < 4:
+        values.append(values[-1] if values else low)
+    return values[:4]
+
+
+def _casino_risk_label(balance: float, max_bet: float) -> str:
+    bankroll = max(0.0, float(balance or 0.0))
+    reserve_need = max(100_000.0, float(max_bet or 0.0) * 25.0)
+    ratio = bankroll / reserve_need if reserve_need > 0 else 0.0
+    if ratio < 0.75:
+        return "Критический риск ликвидности"
+    if ratio < 1.2:
+        return "Повышенный риск ликвидности"
+    if ratio < 2.0:
+        return "Умеренный риск"
+    return "Стабильная ликвидность"
+
+
+def _casino_game_title(game_type: str) -> str:
+    mapping = {
+        "coin": "Монетка",
+        "dice": "Кубик",
+        "slots": "Автомат x3",
+        "roulette": "Red/Black",
+    }
+    return mapping.get(str(game_type or "").strip().lower(), game_type)
+
+
+async def _render_casino_hall(event: Message | CallbackQuery, casino_id: int, viewer_id: int):
+    sender = _edit_or_answer(event)
+    dashboard = await db.get_casino_dashboard(int(casino_id), hours=24)
+    if not dashboard:
+        await sender("❌ Казино не найдено.", reply_markup=_back("casino_menu"), parse_mode=None)
+        return
+    casino = dashboard.get("casino") or {}
+    games_24 = int(dashboard.get("games") or 0)
+    players_24 = int(dashboard.get("players") or 0)
+    turnover_24 = float(dashboard.get("turnover") or 0.0)
+    payouts_24 = float(dashboard.get("payouts") or 0.0)
+    profit_24 = float(dashboard.get("house_profit") or 0.0)
+    margin_24 = float(dashboard.get("margin_percent") or 0.0)
+    rtp_24 = float(dashboard.get("rtp_percent") or 0.0)
+    casino_balance = float(casino.get("balance") or 0.0)
+    max_bet = float(casino.get("max_bet") or 0.0)
+    is_owner = int(casino.get("owner_id") or 0) == int(viewer_id) and str(casino.get("casino_type") or "") == "private"
+
+    lines = [
+        "🏛️ ЗАЛ КАЗИНО",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Казино: {casino.get('name')}",
+        f"Тип: {casino.get('casino_type')} | Владелец: {casino.get('owner_name') or 'Система'}",
+        f"Банкролл: ${casino_balance:,.2f}",
+        (
+            f"Лимиты: ${float(casino.get('min_bet') or 0):,.0f} - "
+            f"${float(casino.get('max_bet') or 0):,.0f} | Маржа: {float(casino.get('house_edge') or 0.03) * 100:.2f}%"
+        ),
+        "",
+        "📊 Оборот за 24 часа",
+        (
+            f"Игры: {games_24} | Игроки: {players_24}\n"
+            f"Оборот: ${turnover_24:,.2f} | Выплаты: ${payouts_24:,.2f}\n"
+            f"GGR: ${profit_24:,.2f} | RTP: {rtp_24:.2f}% | Маржа: {margin_24:.2f}%"
+        ),
+        f"Риск: {_casino_risk_label(casino_balance, max_bet)}",
+    ]
+    keyboard_rows = [
+        [
+            InlineKeyboardButton(text="🎮 Игровые столы", callback_data=f"fp_casino_games_{int(casino_id)}"),
+            InlineKeyboardButton(text="📈 Статистика", callback_data=f"fp_casino_stats_{int(casino_id)}_24"),
+        ],
+        [InlineKeyboardButton(text="🕒 Последние игры в зале", callback_data=f"fp_casino_recent_{int(casino_id)}")],
+    ]
+    if is_owner:
+        keyboard_rows.append([InlineKeyboardButton(text="🛠️ Панель владельца", callback_data=f"fp_casino_manage_{int(casino_id)}")])
+    keyboard_rows.append(
+        [
+            InlineKeyboardButton(text="📜 Моя история", callback_data="fp_casino_history"),
+            InlineKeyboardButton(text="🔙 К списку", callback_data="casino_menu"),
+        ]
+    )
+    await sender("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows), parse_mode=None)
+
+
+async def _render_casino_games(event: Message | CallbackQuery, casino_id: int):
+    sender = _edit_or_answer(event)
+    casino = await db.get_casino(int(casino_id))
+    if not casino:
+        await sender("❌ Казино не найдено.", reply_markup=_back("casino_menu"), parse_mode=None)
+        return
+    levels = _casino_bet_levels(float(casino.get("min_bet") or 100.0), float(casino.get("max_bet") or 1000.0))
+    low, mid, high, vip = levels
+
+    lines = [
+        "🎮 ИГРОВЫЕ СТОЛЫ",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Казино: {casino.get('name')}",
+        f"Лимиты стола: ${float(casino.get('min_bet') or 0):,.0f} - ${float(casino.get('max_bet') or 0):,.0f}",
+        "",
+        "Режимы:",
+        f"• Low: {_usd_short(low)}",
+        f"• Mid: {_usd_short(mid)}",
+        f"• High: {_usd_short(high)}",
+        f"• VIP: {_usd_short(vip)}",
+    ]
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=f"🪙 Орел {_usd_short(mid)}", callback_data=f"fp_casino_play_{casino_id}_coin_heads_{mid}"),
+                InlineKeyboardButton(text=f"🪙 Решка {_usd_short(mid)}", callback_data=f"fp_casino_play_{casino_id}_coin_tails_{mid}"),
+            ],
+            [
+                InlineKeyboardButton(text=f"🎲 High {_usd_short(mid)}", callback_data=f"fp_casino_play_{casino_id}_dice_high_{mid}"),
+                InlineKeyboardButton(text=f"🎲 Low {_usd_short(mid)}", callback_data=f"fp_casino_play_{casino_id}_dice_low_{mid}"),
+            ],
+            [
+                InlineKeyboardButton(text=f"🎰 x3 {_usd_short(low)}", callback_data=f"fp_casino_play_{casino_id}_slots_none_{low}"),
+                InlineKeyboardButton(text=f"🎰 x3 {_usd_short(high)}", callback_data=f"fp_casino_play_{casino_id}_slots_none_{high}"),
+            ],
+            [
+                InlineKeyboardButton(text=f"🟥 Red {_usd_short(low)}", callback_data=f"fp_casino_play_{casino_id}_roulette_red_{low}"),
+                InlineKeyboardButton(text=f"⬛ Black {_usd_short(low)}", callback_data=f"fp_casino_play_{casino_id}_roulette_black_{low}"),
+            ],
+            [
+                InlineKeyboardButton(text=f"🟥 Red {_usd_short(vip)}", callback_data=f"fp_casino_play_{casino_id}_roulette_red_{vip}"),
+                InlineKeyboardButton(text=f"⬛ Black {_usd_short(vip)}", callback_data=f"fp_casino_play_{casino_id}_roulette_black_{vip}"),
+            ],
+            [InlineKeyboardButton(text="🔙 В зал", callback_data=f"fp_casino_open_{casino_id}")],
+        ]
+    )
+    await sender("\n".join(lines), reply_markup=keyboard, parse_mode=None)
+
+
+async def _render_casino_stats(event: Message | CallbackQuery, casino_id: int, hours: int):
+    sender = _edit_or_answer(event)
+    safe_hours = max(6, min(int(hours or 24), 24 * 7))
+    dashboard = await db.get_casino_dashboard(int(casino_id), hours=safe_hours)
+    if not dashboard:
+        await sender("❌ Казино не найдено.", reply_markup=_back("casino_menu"), parse_mode=None)
+        return
+
+    casino = dashboard.get("casino") or {}
+    lines = [
+        "📈 АНАЛИТИКА КАЗИНО",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Казино: {casino.get('name')}",
+        f"Период: {safe_hours}ч",
+        (
+            f"Игр: {int(dashboard.get('games') or 0)} | "
+            f"Игроков: {int(dashboard.get('players') or 0)} | "
+            f"Средняя ставка: ${float(dashboard.get('avg_bet') or 0):,.2f}"
+        ),
+        (
+            f"Оборот: ${float(dashboard.get('turnover') or 0):,.2f} | "
+            f"Выплаты: ${float(dashboard.get('payouts') or 0):,.2f}"
+        ),
+        (
+            f"GGR: ${float(dashboard.get('house_profit') or 0):,.2f} | "
+            f"RTP: {float(dashboard.get('rtp_percent') or 0):.2f}% | "
+            f"Маржа: {float(dashboard.get('margin_percent') or 0):.2f}%"
+        ),
+        "",
+        "По играм:",
+    ]
+    by_game = list(dashboard.get("by_game") or [])
+    if not by_game:
+        lines.append("• Нет игр в выбранном периоде.")
+    else:
+        for row in by_game[:6]:
+            lines.append(
+                f"• {_casino_game_title(str(row.get('game_type') or ''))}: "
+                f"{int(row.get('games') or 0)} игр | "
+                f"оборот ${float(row.get('turnover') or 0):,.0f} | "
+                f"RTP {float(row.get('rtp_percent') or 0):.1f}%"
+            )
+    lines.append("")
+    lines.append("Топ игроков:")
+    top_players = list(dashboard.get("top_players") or [])
+    if not top_players:
+        lines.append("• Нет данных.")
+    else:
+        for row in top_players[:4]:
+            lines.append(
+                f"• {row.get('player_name')}: "
+                f"{int(row.get('games') or 0)} игр | "
+                f"оборот ${float(row.get('turnover') or 0):,.0f} | "
+                f"net ${float(row.get('net') or 0):,.0f}"
+            )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="24ч", callback_data=f"fp_casino_stats_{casino_id}_24"),
+                InlineKeyboardButton(text="72ч", callback_data=f"fp_casino_stats_{casino_id}_72"),
+                InlineKeyboardButton(text="7д", callback_data=f"fp_casino_stats_{casino_id}_168"),
+            ],
+            [InlineKeyboardButton(text="🔙 В зал", callback_data=f"fp_casino_open_{casino_id}")],
+        ]
+    )
+    await sender("\n".join(lines), reply_markup=keyboard, parse_mode=None)
+
+
+async def _render_casino_owner_panel(event: Message | CallbackQuery, casino_id: int, owner_id: int):
+    sender = _edit_or_answer(event)
+    casino = await db.get_casino(int(casino_id))
+    if not casino:
+        await sender("❌ Казино не найдено.", reply_markup=_back("casino_menu"), parse_mode=None)
+        return
+    if int(casino.get("owner_id") or 0) != int(owner_id) or str(casino.get("casino_type") or "") != "private":
+        await sender("❌ Панель доступна только владельцу частного казино.", reply_markup=_back(f"fp_casino_open_{casino_id}", "🔙 В зал"), parse_mode=None)
+        return
+
+    min_bet = float(casino.get("min_bet") or 0.0)
+    max_bet = float(casino.get("max_bet") or 0.0)
+    house_edge = float(casino.get("house_edge") or 0.03)
+    balance = float(casino.get("balance") or 0.0)
+    reserve_floor = max(100_000.0, min_bet * 40.0)
+    withdrawable = max(0.0, balance - reserve_floor)
+    lines = [
+        "🛠️ ПАНЕЛЬ ВЛАДЕЛЬЦА КАЗИНО",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Казино: {casino.get('name')}",
+        f"Банкролл: ${balance:,.2f}",
+        f"Лимиты: ${min_bet:,.0f} - ${max_bet:,.0f}",
+        f"Маржа (house edge): {house_edge * 100:.2f}%",
+        f"Резерв ликвидности: ${reserve_floor:,.2f}",
+        f"Доступно к выводу: ${withdrawable:,.2f}",
+        "",
+        "Профили:",
+        "• SAFE: низкие лимиты, высокая маржа",
+        "• BALANCED: базовый режим",
+        "• VIP: высокие лимиты, низкая маржа",
+    ]
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="SAFE", callback_data=f"fp_casino_profile_{casino_id}_safe"),
+                InlineKeyboardButton(text="BAL", callback_data=f"fp_casino_profile_{casino_id}_balanced"),
+                InlineKeyboardButton(text="VIP", callback_data=f"fp_casino_profile_{casino_id}_vip"),
+            ],
+            [
+                InlineKeyboardButton(text="Лимиты S", callback_data=f"fp_casino_lm_{casino_id}_s"),
+                InlineKeyboardButton(text="Лимиты M", callback_data=f"fp_casino_lm_{casino_id}_m"),
+                InlineKeyboardButton(text="Лимиты L", callback_data=f"fp_casino_lm_{casino_id}_l"),
+            ],
+            [
+                InlineKeyboardButton(text="Маржа 2.2%", callback_data=f"fp_casino_he_{casino_id}_22"),
+                InlineKeyboardButton(text="Маржа 3.0%", callback_data=f"fp_casino_he_{casino_id}_30"),
+                InlineKeyboardButton(text="Маржа 4.5%", callback_data=f"fp_casino_he_{casino_id}_45"),
+            ],
+            [
+                InlineKeyboardButton(text="+100k в кассу", callback_data=f"fp_casino_fund_{casino_id}_100000"),
+                InlineKeyboardButton(text="+500k в кассу", callback_data=f"fp_casino_fund_{casino_id}_500000"),
+            ],
+            [
+                InlineKeyboardButton(text="-100k в баланс", callback_data=f"fp_casino_take_{casino_id}_100000"),
+                InlineKeyboardButton(text="-500k в баланс", callback_data=f"fp_casino_take_{casino_id}_500000"),
+            ],
+            [InlineKeyboardButton(text="🔙 В зал", callback_data=f"fp_casino_open_{casino_id}")],
+        ]
+    )
+    await sender("\n".join(lines), reply_markup=keyboard, parse_mode=None)
 
 
 @router.callback_query(F.data == "fp_casino_create")
@@ -3245,17 +4303,173 @@ async def feature_casino_open(callback: CallbackQuery, state: FSMContext):
     if not casino_raw.isdigit():
         await callback.answer("Некорректное казино.", show_alert=True)
         return
-    casino_id = int(casino_raw)
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🪙 Монетка", callback_data=f"fp_casino_coin_{casino_id}")],
-            [InlineKeyboardButton(text="🎲 Кубик", callback_data=f"fp_casino_dice_{casino_id}")],
-            [InlineKeyboardButton(text="🎰 Слоты $5k", callback_data=f"fp_casino_play_{casino_id}_slots_none_5000")],
-            [InlineKeyboardButton(text="🎰 Слоты $20k", callback_data=f"fp_casino_play_{casino_id}_slots_none_20000")],
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="casino_menu")],
-        ]
+    await _render_casino_hall(callback, int(casino_raw), callback.from_user.id)
+
+
+@router.callback_query(F.data.startswith("fp_casino_games_"))
+async def feature_casino_games(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    raw = callback.data.replace("fp_casino_games_", "")
+    if not raw.isdigit():
+        await callback.answer("Некорректное казино.", show_alert=True)
+        return
+    await _render_casino_games(callback, int(raw))
+
+
+@router.callback_query(F.data.startswith("fp_casino_stats_"))
+async def feature_casino_stats(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    parts = (callback.data or "").split("_")
+    if len(parts) < 4 or not parts[3].isdigit():
+        await callback.answer("Некорректный запрос.", show_alert=True)
+        return
+    casino_id = int(parts[3])
+    hours = int(parts[4]) if len(parts) >= 5 and parts[4].isdigit() else 24
+    await _render_casino_stats(callback, casino_id, hours)
+
+
+@router.callback_query(F.data.startswith("fp_casino_recent_"))
+async def feature_casino_recent(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    raw = callback.data.replace("fp_casino_recent_", "")
+    if not raw.isdigit():
+        await callback.answer("Некорректное казино.", show_alert=True)
+        return
+    casino_id = int(raw)
+    casino = await db.get_casino(casino_id)
+    if not casino:
+        await callback.message.edit_text("❌ Казино не найдено.", reply_markup=_back("casino_menu"), parse_mode=None)
+        return
+    rows = await db.get_casino_recent_games(casino_id, limit=18)
+    lines = [
+        "🕒 ПОСЛЕДНИЕ ИГРЫ В ЗАЛЕ",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Казино: {casino.get('name')}",
+        "",
+    ]
+    if not rows:
+        lines.append("История зала пока пустая.")
+    else:
+        for row in rows[:15]:
+            created = str(row.get("created_date") or "")[:16]
+            lines.append(
+                f"[{created}] {row.get('user_name')} | {_casino_game_title(str(row.get('game_type') or ''))} | "
+                f"ставка ${float(row.get('bet_amount') or 0):,.0f} | "
+                f"выплата ${float(row.get('payout') or 0):,.0f} | {row.get('result')}"
+            )
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=_back(f"fp_casino_open_{casino_id}", "🔙 В зал"),
+        parse_mode=None,
     )
-    await callback.message.edit_text("Выберите игру и ставку:", reply_markup=keyboard, parse_mode=None)
+
+
+@router.callback_query(F.data.startswith("fp_casino_manage_"))
+async def feature_casino_manage(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    raw = callback.data.replace("fp_casino_manage_", "")
+    if not raw.isdigit():
+        await callback.answer("Некорректное казино.", show_alert=True)
+        return
+    await _render_casino_owner_panel(callback, int(raw), callback.from_user.id)
+
+
+@router.callback_query(F.data.startswith("fp_casino_profile_"))
+async def feature_casino_apply_profile(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    parts = (callback.data or "").split("_")
+    if len(parts) < 5 or not parts[3].isdigit():
+        await callback.answer("Некорректный профиль.", show_alert=True)
+        return
+    casino_id = int(parts[3])
+    profile = str(parts[4] or "").strip().lower()
+    ok, msg, _ = await db.apply_private_casino_profile(callback.from_user.id, casino_id, profile)
+    await callback.answer(msg if ok else f"❌ {msg}", show_alert=not ok)
+    await _render_casino_owner_panel(callback, casino_id, callback.from_user.id)
+
+
+@router.callback_query(F.data.startswith("fp_casino_lm_"))
+async def feature_casino_apply_limits_preset(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    parts = (callback.data or "").split("_")
+    if len(parts) < 5 or not parts[3].isdigit():
+        await callback.answer("Некорректный шаблон лимитов.", show_alert=True)
+        return
+    casino_id = int(parts[3])
+    preset = str(parts[4] or "").strip().lower()
+    config = {
+        "s": (500.0, 90_000.0),
+        "m": (1_000.0, 350_000.0),
+        "l": (5_000.0, 1_500_000.0),
+    }.get(preset)
+    if not config:
+        await callback.answer("Неизвестный шаблон.", show_alert=True)
+        return
+    ok, msg, _ = await db.update_private_casino_limits(
+        callback.from_user.id,
+        casino_id,
+        min_bet=float(config[0]),
+        max_bet=float(config[1]),
+    )
+    await callback.answer(msg if ok else f"❌ {msg}", show_alert=not ok)
+    await _render_casino_owner_panel(callback, casino_id, callback.from_user.id)
+
+
+@router.callback_query(F.data.startswith("fp_casino_he_"))
+async def feature_casino_apply_house_edge(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    parts = (callback.data or "").split("_")
+    if len(parts) < 5 or not parts[3].isdigit() or not parts[4].isdigit():
+        await callback.answer("Некорректная маржа.", show_alert=True)
+        return
+    casino_id = int(parts[3])
+    edge_code = int(parts[4])
+    edge = float(edge_code) / 1000.0
+    ok, msg, _ = await db.update_private_casino_house_edge(
+        callback.from_user.id,
+        casino_id,
+        house_edge=edge,
+    )
+    await callback.answer(msg if ok else f"❌ {msg}", show_alert=not ok)
+    await _render_casino_owner_panel(callback, casino_id, callback.from_user.id)
+
+
+@router.callback_query(F.data.startswith("fp_casino_fund_"))
+async def feature_casino_fund_liquidity(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    parts = (callback.data or "").split("_")
+    if len(parts) < 5 or not parts[3].isdigit() or not parts[4].isdigit():
+        await callback.answer("Некорректный перевод.", show_alert=True)
+        return
+    casino_id = int(parts[3])
+    amount = float(parts[4])
+    ok, msg, _ = await db.transfer_private_casino_liquidity(
+        callback.from_user.id,
+        casino_id,
+        amount=amount,
+        direction="deposit",
+    )
+    await callback.answer(msg if ok else f"❌ {msg}", show_alert=not ok)
+    await _render_casino_owner_panel(callback, casino_id, callback.from_user.id)
+
+
+@router.callback_query(F.data.startswith("fp_casino_take_"))
+async def feature_casino_take_liquidity(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    parts = (callback.data or "").split("_")
+    if len(parts) < 5 or not parts[3].isdigit() or not parts[4].isdigit():
+        await callback.answer("Некорректный перевод.", show_alert=True)
+        return
+    casino_id = int(parts[3])
+    amount = float(parts[4])
+    ok, msg, _ = await db.transfer_private_casino_liquidity(
+        callback.from_user.id,
+        casino_id,
+        amount=amount,
+        direction="withdraw",
+    )
+    await callback.answer(msg if ok else f"❌ {msg}", show_alert=not ok)
+    await _render_casino_owner_panel(callback, casino_id, callback.from_user.id)
 
 
 @router.callback_query(F.data.startswith("fp_casino_coin_"))
@@ -3272,7 +4486,7 @@ async def feature_casino_coin_menu(callback: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="Решка $5k", callback_data=f"fp_casino_play_{cid}_coin_tails_5000")],
             [InlineKeyboardButton(text="Орел $20k", callback_data=f"fp_casino_play_{cid}_coin_heads_20000")],
             [InlineKeyboardButton(text="Решка $20k", callback_data=f"fp_casino_play_{cid}_coin_tails_20000")],
-            [InlineKeyboardButton(text="🔙 Назад", callback_data=f"fp_casino_open_{cid}")],
+            [InlineKeyboardButton(text="🔙 К столам", callback_data=f"fp_casino_games_{cid}")],
         ]
     )
     await callback.message.edit_text("Монетка: выберите исход и ставку.", reply_markup=keyboard, parse_mode=None)
@@ -3292,7 +4506,7 @@ async def feature_casino_dice_menu(callback: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="Low (1-3) $5k", callback_data=f"fp_casino_play_{cid}_dice_low_5000")],
             [InlineKeyboardButton(text="High (4-6) $20k", callback_data=f"fp_casino_play_{cid}_dice_high_20000")],
             [InlineKeyboardButton(text="Low (1-3) $20k", callback_data=f"fp_casino_play_{cid}_dice_low_20000")],
-            [InlineKeyboardButton(text="🔙 Назад", callback_data=f"fp_casino_open_{cid}")],
+            [InlineKeyboardButton(text="🔙 К столам", callback_data=f"fp_casino_games_{cid}")],
         ]
     )
     await callback.message.edit_text("Кубик: выберите исход и ставку.", reply_markup=keyboard, parse_mode=None)
@@ -3320,20 +4534,27 @@ async def feature_casino_play(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text(f"❌ {msg}", reply_markup=_back(f"fp_casino_open_{cid_raw}"), parse_mode=None)
         return
     payload = payload or {}
+    display_roll = str(payload.get("display_roll") or payload.get("roll_value") or "-")
+    slots_combo = str(payload.get("slots_combo") or "").strip()
+    roulette_color = str(payload.get("roulette_color") or "").strip()
+    combo_line = f"\nКомбинация: {slots_combo}" if slots_combo else ""
+    roulette_line = f"\nЦвет рулетки: {roulette_color}" if roulette_color else ""
     await callback.message.edit_text(
         "🎰 Игра завершена\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"Результат: {payload.get('result')}\n"
-        f"Бросок/ролл: {payload.get('roll_value')}\n"
+        f"Бросок/ролл: {display_roll}{combo_line}{roulette_line}\n"
         f"Ставка: ${float(payload.get('bet') or 0):,.2f}\n"
         f"Выплата: ${float(payload.get('payout') or 0):,.2f}\n"
         f"Профит: ${float(payload.get('profit') or 0):,.2f}\n"
+        f"Маржа стола: {float(payload.get('house_edge') or 0) * 100:.2f}%\n"
+        f"Системный оборотный сбор: ${float(payload.get('turnover_tax') or 0):,.2f}\n"
         f"Новый баланс: ${float(payload.get('new_balance') or 0):,.2f}",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="🎰 Еще сыграть", callback_data=f"fp_casino_open_{cid_raw}")],
-                [InlineKeyboardButton(text="📜 История", callback_data="fp_casino_history")],
-                [InlineKeyboardButton(text="🔙 В казино", callback_data="casino_menu")],
+                [InlineKeyboardButton(text="🎮 Еще сыграть", callback_data=f"fp_casino_games_{cid_raw}")],
+                [InlineKeyboardButton(text="🏛️ В зал", callback_data=f"fp_casino_open_{cid_raw}")],
+                [InlineKeyboardButton(text="📜 Моя история", callback_data="fp_casino_history")],
             ]
         ),
         parse_mode=None,
@@ -3351,11 +4572,976 @@ async def feature_casino_history(callback: CallbackQuery, state: FSMContext):
         for row in rows:
             created = str(row.get("created_date") or "")[:16]
             lines.append(
-                f"[{created}] {row.get('casino_name')} | {row.get('game_type')} | "
+                f"[{created}] {row.get('casino_name')} | {_casino_game_title(str(row.get('game_type') or ''))} | "
                 f"ставка ${float(row.get('bet_amount') or 0):,.0f} | "
                 f"выплата ${float(row.get('payout') or 0):,.0f} | {row.get('result')}"
             )
-    await callback.message.edit_text("\n".join(lines), reply_markup=_back("casino_menu"), parse_mode="Markdown")
+    await callback.message.edit_text("\n".join(lines), reply_markup=_back("casino_menu"), parse_mode=None)
+
+
+def _donation_payload_for_pack(pack_key: str, user_id: int) -> str:
+    stamp = int(datetime.now().timestamp())
+    return f"donate:{pack_key}:{int(user_id)}:{stamp}:{secrets.token_hex(4)}"
+
+
+def _parse_donation_payload(payload: str) -> tuple[bool, dict[str, Any]]:
+    raw = str(payload or "").strip()
+    parts = raw.split(":")
+    if len(parts) < 5 or parts[0] != "donate":
+        return False, {}
+    pack_key = parts[1].strip()
+    try:
+        user_id = int(parts[2])
+    except Exception:
+        user_id = 0
+    token = parts[4].strip()
+    if not pack_key or user_id <= 0 or not token:
+        return False, {}
+    return True, {"pack_key": pack_key, "user_id": user_id, "token": token}
+
+
+async def _render_donation_menu(event: Message | CallbackQuery, user_id: int):
+    sender = _edit_or_answer(event)
+    rows = await db.list_user_donation_purchases(user_id=user_id, limit=5)
+    lines = [
+        "💎 ДОНАТ И ПОДДЕРЖКА",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "Оплата идет через Telegram Stars.",
+        "После успешной оплаты награды выдаются автоматически.",
+        "",
+        "Доступные пакеты:",
+    ]
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+
+    if not DONATIONS_ENABLED:
+        lines.append("Система доната временно отключена администратором.")
+    else:
+        for pack in DONATION_PACKS:
+            rewards_lines = _render_promocode_rewards(pack.get("rewards") or {})
+            reward_preview = ", ".join(line.replace("• ", "", 1) for line in rewards_lines[:2]) if rewards_lines else "награды"
+            lines.append(
+                f"• {pack['label']} — {int(pack['stars'])} XTR | {pack['description']} | {reward_preview}"
+            )
+            keyboard_rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"⭐ Купить {pack['label']} за {int(pack['stars'])} XTR",
+                        callback_data=f"donate_buy_{pack['key']}",
+                    )
+                ]
+            )
+
+    if rows:
+        lines.extend(["", "Последние покупки:"])
+        for row in rows[:5]:
+            created_at = str(row.get("created_date") or "")[:16].replace("T", " ")
+            lines.append(
+                f"• {row.get('pack_title') or row.get('pack_key')} | {int(row.get('amount') or 0)} {row.get('currency') or 'XTR'} | {created_at}"
+            )
+
+    keyboard_rows.append([InlineKeyboardButton(text="🧾 Помощь по оплате", callback_data="donation_support")])
+    keyboard_rows.append([InlineKeyboardButton(text="📜 Условия", callback_data="donation_terms")])
+    keyboard_rows.append([InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_main")])
+    await send_section_screen(
+        event,
+        text="\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows[:20]),
+        parse_mode=None,
+        section_key="bnr",
+    )
+
+
+def _donation_support_text() -> str:
+    return (
+        "🧾 ПОМОЩЬ ПО ОПЛАТЕ\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Если платеж прошел, а награды не пришли, напишите в поддержку и отправьте:\n"
+        "• ваш Telegram ID\n"
+        "• примерное время оплаты\n"
+        "• название пакета\n"
+        f"Контакт: {DONATION_SUPPORT_CONTACT}"
+    )
+
+
+def _donation_terms_text() -> str:
+    extra = f"\nСсылка: {DONATION_TERMS_URL}" if DONATION_TERMS_URL else ""
+    return (
+        "📜 УСЛОВИЯ ДОНАТА\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "• Донат поддерживает развитие проекта.\n"
+        "• Награды выдаются автоматически после подтверждения Telegram.\n"
+        "• Повторно одна и та же оплата не применяется.\n"
+        "• Если платеж подтвержден, но награды нет, используйте /paysupport.\n"
+        "• Возвраты и спорные случаи рассматриваются вручную поддержкой."
+        f"{extra}"
+    )
+
+
+@router.message(Command("donate"))
+async def donate_command(message: Message, state: FSMContext):
+    await _render_donation_menu(message, message.from_user.id)
+
+
+@router.message(Command("paysupport"))
+async def donation_support_command(message: Message):
+    await message.answer(_donation_support_text(), reply_markup=_back("donation_menu", "💎 К донату"), parse_mode=None)
+
+
+@router.message(Command("terms"))
+async def donation_terms_command(message: Message):
+    await message.answer(_donation_terms_text(), reply_markup=_back("donation_menu", "💎 К донату"), parse_mode=None)
+
+
+@router.callback_query(F.data == "donation_menu")
+async def donation_menu(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await _render_donation_menu(callback, callback.from_user.id)
+
+
+@router.callback_query(F.data == "donation_support")
+async def donation_support(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.edit_text(
+        _donation_support_text(),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="💎 К донату", callback_data="donation_menu")]]
+        ),
+        parse_mode=None,
+    )
+
+
+@router.callback_query(F.data == "donation_terms")
+async def donation_terms(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.edit_text(
+        _donation_terms_text(),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="💎 К донату", callback_data="donation_menu")]]
+        ),
+        parse_mode=None,
+    )
+
+
+@router.callback_query(F.data.startswith("donate_buy_"))
+async def donation_buy(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if not DONATIONS_ENABLED:
+        await callback.answer("Донат временно отключен.", show_alert=True)
+        return
+
+    pack_key = str(callback.data or "").replace("donate_buy_", "", 1).strip()
+    pack = _donation_pack_map().get(pack_key)
+    if not pack:
+        await callback.answer("Пакет не найден.", show_alert=True)
+        return
+
+    invoice_payload = _donation_payload_for_pack(pack_key, callback.from_user.id)
+    prices = [LabeledPrice(label=str(pack.get("title") or pack_key), amount=int(pack.get("stars") or 0))]
+    try:
+        await callback.message.answer_invoice(
+            title=str(pack.get("title") or "Donation Pack")[:32],
+            description=str(pack.get("description") or "Поддержка проекта и игровые награды.")[:255],
+            payload=invoice_payload,
+            currency="XTR",
+            prices=prices,
+        )
+    except Exception as exc:
+        await callback.message.answer(
+            "❌ Не удалось открыть платежное окно.\n"
+            f"Причина: {str(exc)[:220]}",
+            reply_markup=_back("donation_menu", "💎 К донату"),
+            parse_mode=None,
+        )
+
+
+@router.pre_checkout_query()
+async def donation_pre_checkout(pre_checkout_query: PreCheckoutQuery):
+    ok, payload = _parse_donation_payload(pre_checkout_query.invoice_payload)
+    if not ok:
+        await pre_checkout_query.answer(ok=False, error_message="Некорректный payload оплаты.")
+        return
+    pack = _donation_pack_map().get(str(payload.get("pack_key") or ""))
+    if not pack:
+        await pre_checkout_query.answer(ok=False, error_message="Донат-пакет не найден.")
+        return
+    if int(payload.get("user_id") or 0) != int(pre_checkout_query.from_user.id):
+        await pre_checkout_query.answer(ok=False, error_message="Платеж принадлежит другому игроку.")
+        return
+    if str(pre_checkout_query.currency or "").upper() != "XTR":
+        await pre_checkout_query.answer(ok=False, error_message="Поддерживается только Telegram Stars.")
+        return
+    if int(pre_checkout_query.total_amount or 0) != int(pack.get("stars") or 0):
+        await pre_checkout_query.answer(ok=False, error_message="Сумма платежа не совпадает с пакетом.")
+        return
+    await pre_checkout_query.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def donation_successful_payment(message: Message, state: FSMContext):
+    payment = message.successful_payment
+    ok_payload, payload = _parse_donation_payload(str(payment.invoice_payload or ""))
+    if not ok_payload:
+        return
+
+    pack = _donation_pack_map().get(str(payload.get("pack_key") or ""))
+    if not pack:
+        await message.answer("❌ Оплата получена, но пакет не найден. Напишите в /paysupport.", parse_mode=None)
+        return
+
+    ok, msg, result = await db.apply_donation_purchase(
+        user_id=message.from_user.id,
+        pack_key=str(pack.get("key") or ""),
+        pack_title=str(pack.get("title") or ""),
+        amount=int(payment.total_amount or 0),
+        currency=str(payment.currency or "XTR"),
+        invoice_payload=str(payment.invoice_payload or ""),
+        telegram_payment_charge_id=str(payment.telegram_payment_charge_id or ""),
+        provider_payment_charge_id=str(payment.provider_payment_charge_id or ""),
+        rewards=dict(pack.get("rewards") or {}),
+    )
+    if not ok:
+        await message.answer(
+            f"❌ {msg}\nЕсли деньги уже списались, используйте /paysupport.",
+            reply_markup=_back("donation_menu", "💎 К донату"),
+            parse_mode=None,
+        )
+        return
+
+    # Короткая анимация обработки платежа
+    anim_msg = await message.answer("💎 Применяем донат и выдаем награды...", parse_mode=None)
+    await _text_animation(
+        anim_msg,
+        [
+            "💎 Применяем донат и выдаем награды...",
+            "🔧 Зачисляем бонусы на счёт...",
+            "✅ Готово! Письмо с деталями ниже.",
+        ],
+        delay=0.22,
+    )
+
+    result = result or {}
+    rewards_lines = _render_promocode_rewards(pack.get("rewards") or {})
+    final_text = (
+        "✅ Донат зачислен\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"Пакет: {result.get('pack_title') or pack.get('title')}\n"
+        f"Сумма: {int(result.get('amount') or payment.total_amount or 0)} {result.get('currency') or payment.currency or 'XTR'}\n"
+        + ("Награды:\n" + "\n".join(rewards_lines) if rewards_lines else "Награды выданы.")
+    )
+    try:
+        await anim_msg.edit_text(final_text, reply_markup=_back("donation_menu", "💎 К донату"), parse_mode=None)
+    except Exception:
+        await message.answer(final_text, reply_markup=_back("donation_menu", "💎 К донату"), parse_mode=None)
+
+
+def _promo_expiration_label(expires_at: str | None) -> str:
+    raw = str(expires_at or "").strip()
+    if not raw:
+        return "без срока"
+    try:
+        exp_dt = datetime.fromisoformat(raw)
+    except Exception:
+        return raw[:16]
+    remain = exp_dt - datetime.now()
+    if remain.total_seconds() <= 0:
+        return "истек"
+    total_minutes = int(remain.total_seconds() // 60)
+    if total_minutes < 60:
+        return f"{total_minutes} мин"
+    hours, minutes = divmod(total_minutes, 60)
+    if hours < 48:
+        return f"{hours} ч {minutes} мин"
+    days = hours // 24
+    return f"{days} дн"
+
+
+async def _render_promo_menu(event: Message | CallbackQuery, user_id: int):
+    sender = _edit_or_answer(event)
+    rows = await db.list_promocodes_for_user(user_id=user_id, limit=18, include_inactive=False)
+    authority = await db.get_government_authority(int(user_id))
+    lines = [
+        "🎟️ ПРОМОКОДЫ",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "Введите код и получите награду.",
+        "Каждый промокод можно активировать один раз.",
+        "",
+    ]
+    keyboard_rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="✍️ Ввести промокод", callback_data="promo_redeem_start")],
+    ]
+
+    if not rows:
+        lines.append("Сейчас нет активных промокодов.")
+    else:
+        lines.append("Доступные промокоды:")
+        for row in rows[:10]:
+            code = str(row.get("code") or "")
+            claimed = bool(int(row.get("claimed_by_user") or 0))
+            max_uses = int(row.get("max_uses") or 0)
+            uses_count = int(row.get("uses_count") or 0)
+            uses_left = max(0, max_uses - uses_count) if max_uses > 0 else -1
+            expires_label = _promo_expiration_label(str(row.get("expires_at") or ""))
+            status_label = "✅ уже активирован" if claimed else "🟢 доступен"
+            limit_label = f"{uses_left}" if uses_left >= 0 else "∞"
+            description = str(row.get("description") or "").strip()
+            lines.append(
+                f"• {code} | {status_label} | лимит: {limit_label} | срок: {expires_label}"
+            )
+            if description:
+                lines.append(f"  {description[:96]}")
+            if not claimed:
+                keyboard_rows.append([InlineKeyboardButton(text=f"🎁 Активировать {code}", callback_data=f"promo_claim_{code}")])
+
+    if authority == "president":
+        keyboard_rows.append([InlineKeyboardButton(text="👑 Управление промокодами", callback_data="pres_promo_menu")])
+    keyboard_rows.append([InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_main")])
+    await send_section_screen(
+        event,
+        text="\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows[:18]),
+        parse_mode=None,
+        section_key="bnr",
+    )
+
+
+async def _render_pres_promo_menu(callback: CallbackQuery):
+    rows = await db.list_promocodes_admin(limit=18, include_inactive=True)
+    lines = [
+        "👑 УПРАВЛЕНИЕ ПРОМОКОДАМИ",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "Вы можете создавать и включать/отключать промокоды.",
+        "",
+    ]
+    keyboard_rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="➕ Создать промокод", callback_data="pres_promo_create")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="pres_promo_menu")],
+    ]
+    if not rows:
+        lines.append("Промокоды еще не созданы.")
+    else:
+        for row in rows[:10]:
+            promo_id = int(row.get("id") or 0)
+            code = str(row.get("code") or "")
+            description = str(row.get("description") or "").strip()
+            is_active = bool(int(row.get("is_active") or 0))
+            max_uses = int(row.get("max_uses") or 0)
+            uses_count = int(row.get("uses_count") or 0)
+            expires_label = _promo_expiration_label(str(row.get("expires_at") or ""))
+            status = "активен" if is_active else "выключен"
+            limit_label = f"{uses_count}/{max_uses}" if max_uses > 0 else f"{uses_count}/∞"
+            lines.append(f"#{promo_id} {code} | {status} | активаций: {limit_label} | срок: {expires_label}")
+            if description:
+                lines.append(f"  {description[:92]}")
+            target = 0 if is_active else 1
+            toggle_label = "⏸ Выключить" if is_active else "▶️ Включить"
+            keyboard_rows.append([InlineKeyboardButton(text=f"{toggle_label} {code}", callback_data=f"pres_promo_toggle_{promo_id}_{target}")])
+    keyboard_rows.append([InlineKeyboardButton(text="🔙 В панель", callback_data="president_admin_panel")])
+    await send_section_screen(
+        callback,
+        text="\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows[:22]),
+        parse_mode=None,
+        section_key="bnr",
+    )
+
+
+@router.message(Command("promo"))
+async def promo_command(message: Message, state: FSMContext):
+    parts = str(message.text or "").strip().split(maxsplit=1)
+    if len(parts) > 1 and parts[1].strip():
+        code = parts[1].strip()
+        ok, msg, payload = await db.redeem_promocode(message.from_user.id, code)
+        if not ok:
+            await message.answer(f"❌ {msg}", reply_markup=_back("promo_menu", "🔙 К промокодам"), parse_mode=None)
+            return
+        # Показываем короткую анимацию обработки промокода
+        payload = payload or {}
+        anim_msg = await message.answer("🎟️ Активируем промокод...", parse_mode=None)
+        await _text_animation(
+            anim_msg,
+            [
+                "🎟️ Активируем промокод...",
+                "🎁 Применяю награды игроку...",
+                "✅ Завершено! Подробности ниже.",
+            ],
+            delay=0.22,
+        )
+        rewards_applied = payload.get("rewards_applied") or {}
+        details = _render_promocode_rewards(rewards_applied)
+        text = (
+            f"✅ {msg}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"Код: {payload.get('code')}\n"
+            f"Описание: {payload.get('description') or '—'}\n"
+            "Награды:\n"
+            + ("\n".join(details) if details else "• применено")
+        )
+        try:
+            await anim_msg.edit_text(text, reply_markup=_back("promo_menu", "🔙 К промокодам"), parse_mode=None)
+        except Exception:
+            await message.answer(text, reply_markup=_back("promo_menu", "🔙 К промокодам"), parse_mode=None)
+        return
+    await _render_promo_menu(message, message.from_user.id)
+
+
+@router.callback_query(F.data == "promo_menu")
+async def promo_menu(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await _render_promo_menu(callback, callback.from_user.id)
+
+
+@router.callback_query(F.data == "promo_redeem_start")
+async def promo_redeem_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(FeatureStates.promo_code_input)
+    await callback.message.answer(
+        "Введите код промокода одним сообщением.\n"
+        "Пример: START2026",
+        reply_markup=_back("promo_menu", "🔙 Отмена"),
+        parse_mode=None,
+    )
+
+
+@router.callback_query(F.data.startswith("promo_claim_"))
+async def promo_claim_quick(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    promo_code = str(callback.data or "").replace("promo_claim_", "").strip()
+    if not promo_code:
+        await callback.answer("Некорректный код.", show_alert=True)
+        return
+    # Короткая анимация обработки
+    anim_msg = None
+    try:
+        anim_msg = await callback.message.answer("🎟️ Активируем промокод...", parse_mode=None)
+    except Exception:
+        pass
+    if anim_msg:
+        await _text_animation(
+            anim_msg,
+            [
+                "🎟️ Активируем промокод...",
+                "🎁 Проверяем условия и выдаем награды...",
+                "✅ Готово! Смотрите детали ниже.",
+            ],
+            delay=0.22,
+        )
+
+    ok, msg, payload = await db.redeem_promocode(callback.from_user.id, promo_code)
+    if not ok:
+        try:
+            if anim_msg:
+                await anim_msg.edit_text(f"❌ {msg}", parse_mode=None)
+            else:
+                await callback.message.answer(f"❌ {msg}", parse_mode=None)
+        except Exception:
+            pass
+        await _render_promo_menu(callback, callback.from_user.id)
+        return
+    payload = payload or {}
+    details = _render_promocode_rewards(payload.get("rewards_applied") or {})
+    final_text = (
+        "✅ Промокод активирован\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"Код: {payload.get('code')}\n"
+        + ("Награды:\n" + "\n".join(details) if details else "Награды применены.")
+    )
+    try:
+        if anim_msg:
+            await anim_msg.edit_text(final_text, parse_mode=None)
+        else:
+            await callback.message.answer(final_text, parse_mode=None)
+    except Exception:
+        try:
+            await callback.message.answer(final_text, parse_mode=None)
+        except Exception:
+            pass
+    await _render_promo_menu(callback, callback.from_user.id)
+
+
+@router.message(FeatureStates.promo_code_input, F.text, ~F.text.startswith("/"))
+async def promo_redeem_input(message: Message, state: FSMContext):
+    code = str(message.text or "").strip()
+    if len(code) < 3:
+        await message.answer("❌ Слишком короткий код.", reply_markup=_back("promo_menu", "🔙 К промокодам"), parse_mode=None)
+        return
+    ok, msg, payload = await db.redeem_promocode(message.from_user.id, code)
+    await state.clear()
+    if not ok:
+        await message.answer(f"❌ {msg}", reply_markup=_back("promo_menu", "🔙 К промокодам"), parse_mode=None)
+        return
+    payload = payload or {}
+    details = _render_promocode_rewards(payload.get("rewards_applied") or {})
+    await message.answer(
+        "✅ Промокод активирован\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"Код: {payload.get('code')}\n"
+        + ("Награды:\n" + "\n".join(details) if details else "Награды применены."),
+        reply_markup=_back("promo_menu", "🔙 К промокодам"),
+        parse_mode=None,
+    )
+
+
+@router.callback_query(F.data == "pres_promo_menu")
+async def pres_promo_menu(callback: CallbackQuery, state: FSMContext):
+    if not await _ensure_president(callback):
+        return
+    await callback.answer()
+    await _render_pres_promo_menu(callback)
+
+
+@router.callback_query(F.data == "pres_promo_create")
+async def pres_promo_create_start(callback: CallbackQuery, state: FSMContext):
+    if not await _ensure_president(callback):
+        return
+    await callback.answer()
+    await state.set_state(FeatureStates.pres_promo_create)
+    await callback.message.answer(
+        "Введите промокод в формате 5 строк:\n"
+        "1) КОД\n"
+        "2) Описание\n"
+        "3) Лимит активаций (0 = без лимита)\n"
+        "4) Срок в часах (0 = без срока)\n"
+        "5) Награды\n\n"
+        "Пример наград:\n"
+        "balance=50000; reputation=5; education=1; bank=20000;\n"
+        "government_budget=1000000; org_budget[1]=300000;\n"
+        "property=12,13; business=7; private_org=4; gang_reputation=3",
+        reply_markup=_back("pres_promo_menu", "🔙 Отмена"),
+        parse_mode=None,
+    )
+
+
+@router.message(FeatureStates.pres_promo_create, F.text, ~F.text.startswith("/"))
+async def pres_promo_create_input(message: Message, state: FSMContext):
+    if not await _ensure_president_message(message, state, "pres_promo_menu"):
+        return
+    raw = str(message.text or "").strip()
+    lines = [x.strip() for x in raw.splitlines() if x.strip()]
+    if len(lines) >= 5:
+        code = lines[0]
+        description = lines[1]
+        max_uses_raw = lines[2]
+        expires_raw = lines[3]
+        rewards_raw = "\n".join(lines[4:])
+    else:
+        parts = [x.strip() for x in raw.split("|", 4)]
+        if len(parts) < 5:
+            await message.answer(
+                "❌ Нужен формат из 5 частей.\n"
+                "Либо 5 строк, либо: код | описание | лимит | часы | награды",
+                reply_markup=_back("pres_promo_menu", "🔙 К промокодам"),
+                parse_mode=None,
+            )
+            return
+        code, description, max_uses_raw, expires_raw, rewards_raw = parts[0], parts[1], parts[2], parts[3], parts[4]
+
+    try:
+        max_uses = int(max_uses_raw.replace(" ", ""))
+    except Exception:
+        max_uses = 0
+    try:
+        expires_hours = int(expires_raw.replace(" ", ""))
+    except Exception:
+        expires_hours = 0
+
+    parsed_ok, parsed_msg, rewards_payload = _parse_promocode_rewards_spec(rewards_raw)
+    if not parsed_ok:
+        await message.answer(f"❌ {parsed_msg}", reply_markup=_back("pres_promo_menu", "🔙 К промокодам"), parse_mode=None)
+        return
+
+    ok, msg, payload = await db.create_promocode(
+        actor_id=message.from_user.id,
+        code=code,
+        description=description,
+        rewards=rewards_payload or {},
+        max_uses=max_uses,
+        expires_hours=expires_hours,
+    )
+    await state.clear()
+    if not ok:
+        await message.answer(f"❌ {msg}", reply_markup=_back("pres_promo_menu", "🔙 К промокодам"), parse_mode=None)
+        return
+    payload = payload or {}
+    rewards_lines = _render_promocode_rewards(payload.get("rewards") or {})
+    await message.answer(
+        "✅ Промокод создан\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"ID: {int(payload.get('promo_id') or 0)}\n"
+        f"Код: {payload.get('code')}\n"
+        f"Лимит: {int(payload.get('max_uses') or 0) if int(payload.get('max_uses') or 0) > 0 else '∞'}\n"
+        f"Срок: {_promo_expiration_label(str(payload.get('expires_at') or ''))}\n"
+        + ("Награды:\n" + "\n".join(rewards_lines) if rewards_lines else "Награды: применяются по payload"),
+        reply_markup=_back("pres_promo_menu", "🔙 К промокодам"),
+        parse_mode=None,
+    )
+
+
+@router.callback_query(F.data.startswith("pres_promo_toggle_"))
+async def pres_promo_toggle(callback: CallbackQuery, state: FSMContext):
+    if not await _ensure_president(callback):
+        return
+    await callback.answer()
+    parts = str(callback.data or "").split("_")
+    if len(parts) < 5 or not parts[3].isdigit() or not parts[4].isdigit():
+        await callback.answer("Некорректный промокод.", show_alert=True)
+        return
+    promo_id = int(parts[3])
+    target_active = int(parts[4]) == 1
+    ok, msg, _ = await db.set_promocode_active(
+        actor_id=callback.from_user.id,
+        promo_id=promo_id,
+        is_active=target_active,
+    )
+    await callback.answer(msg if ok else f"❌ {msg}", show_alert=not ok)
+    await _render_pres_promo_menu(callback)
+
+
+@router.message(FeatureStates.promo_code_input)
+async def promo_redeem_invalid(message: Message):
+    await message.answer(
+        "❌ Отправьте промокод текстом.",
+        reply_markup=_back("promo_menu", "🔙 К промокодам"),
+        parse_mode=None,
+    )
+
+
+@router.message(FeatureStates.pres_promo_create)
+async def pres_promo_create_invalid(message: Message):
+    await message.answer(
+        "❌ Отправьте данные промокода текстом по шаблону.",
+        reply_markup=_back("pres_promo_menu", "🔙 К промокодам"),
+        parse_mode=None,
+    )
+
+
+async def _render_bot_admin_panel(event: Message | CallbackQuery, state: FSMContext):
+    overview = await db.get_bot_admin_overview()
+    lines = [
+        "🛠 АДМИН-ПАНЕЛЬ БОТА",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "Личная панель владельца: донат, промокоды и контроль живой экономики.",
+        "",
+        f"Игроков всего: {int(overview.get('users_total') or 0)}",
+        f"Активных сегодня: {int(overview.get('users_today') or 0)}",
+        f"Денег в игре: ${float(overview.get('money_in_game') or 0):,.2f}",
+        f"Активных промокодов: {int(overview.get('active_promos') or 0)}",
+        f"Активаций промокодов: {int(overview.get('promo_claims') or 0)}",
+        f"Донатов: {int(overview.get('donation_count') or 0)} покупок / {int(overview.get('donation_stars') or 0)} XTR",
+        f"Кредиты: {int(overview.get('pending_loans') or 0)} ожидают, {int(overview.get('active_loans') or 0)} активны",
+    ]
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎟️ Промокоды", callback_data="bot_admin_promos")],
+            [InlineKeyboardButton(text="⚡ Быстрый промокод", callback_data="bot_admin_promo_quick")],
+            [InlineKeyboardButton(text="➕ Создать промокод", callback_data="bot_admin_promo_create")],
+            [InlineKeyboardButton(text="💎 Выдать донат-пакет", callback_data="bot_admin_grant_donation")],
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data="bot_admin_panel")],
+            [InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_main")],
+        ]
+    )
+    sender = _edit_or_answer(event)
+    await state.clear()
+    await sender("\n".join(lines), reply_markup=keyboard, parse_mode=None)
+
+
+async def _render_bot_admin_promos(callback: CallbackQuery):
+    rows = await db.list_promocodes_admin(limit=20, include_inactive=True)
+    lines = [
+        "🎟️ ПРОМОКОДЫ: АДМИН",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "Здесь видны активные и выключенные коды.",
+        "",
+    ]
+    keyboard_rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="➕ Создать", callback_data="bot_admin_promo_create")],
+        [InlineKeyboardButton(text="⚡ Быстрый код", callback_data="bot_admin_promo_quick")],
+    ]
+    if not rows:
+        lines.append("Промокодов пока нет.")
+    else:
+        for row in rows[:12]:
+            promo_id = int(row.get("id") or 0)
+            code = str(row.get("code") or "")
+            active = bool(int(row.get("is_active") or 0))
+            max_uses = int(row.get("max_uses") or 0)
+            uses = int(row.get("uses_count") or 0)
+            status = "активен" if active else "выключен"
+            limit = f"{uses}/{max_uses}" if max_uses > 0 else f"{uses}/∞"
+            lines.append(f"#{promo_id} {code} | {status} | {limit} | {_promo_expiration_label(str(row.get('expires_at') or ''))}")
+            target = 0 if active else 1
+            label = "⏸ Выключить" if active else "▶️ Включить"
+            keyboard_rows.append([InlineKeyboardButton(text=f"{label} {code}", callback_data=f"bot_admin_promo_toggle_{promo_id}_{target}")])
+    keyboard_rows.append([InlineKeyboardButton(text="🔙 В админку", callback_data="bot_admin_panel")])
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows[:24]),
+        parse_mode=None,
+    )
+
+
+@router.message(Command("botadmin", "adminpanel"))
+async def bot_admin_command(message: Message, state: FSMContext):
+    if not await _is_bot_admin_message(message):
+        await message.answer("❌ Эта панель доступна только владельцу бота в личке.", parse_mode=None)
+        return
+    await _render_bot_admin_panel(message, state)
+
+
+@router.callback_query(F.data == "bot_admin_panel")
+async def bot_admin_panel_callback(callback: CallbackQuery, state: FSMContext):
+    if not await _is_bot_admin_callback(callback):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    await callback.answer()
+    await _render_bot_admin_panel(callback, state)
+
+
+@router.callback_query(F.data == "bot_admin_promos")
+async def bot_admin_promos(callback: CallbackQuery, state: FSMContext):
+    if not await _is_bot_admin_callback(callback):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    await callback.answer()
+    await _render_bot_admin_promos(callback)
+
+
+@router.callback_query(F.data == "bot_admin_promo_quick")
+async def bot_admin_promo_quick(callback: CallbackQuery, state: FSMContext):
+    if not await _is_bot_admin_callback(callback):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    await callback.answer()
+    code = f"MIRNA-{secrets.token_hex(3).upper()}"
+    rewards = {"user_add": {"balance": 125000, "bank": 25000, "reputation": 3, "happiness": 3}}
+    ok, msg, payload = await db.create_promocode(
+        actor_id=callback.from_user.id,
+        code=code,
+        description="Быстрый админский подарок для активных игроков.",
+        rewards=rewards,
+        max_uses=50,
+        expires_hours=168,
+        allow_system=True,
+    )
+    if not ok:
+        await callback.answer(msg, show_alert=True)
+        return
+    rewards_lines = _render_promocode_rewards((payload or {}).get("rewards") or rewards)
+    await callback.message.answer(
+        "✅ Быстрый промокод создан\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"Код: {code}\n"
+        "Лимит: 50 активаций\n"
+        "Срок: 7 дней\n"
+        "Награды:\n"
+        + "\n".join(rewards_lines),
+        reply_markup=_back("bot_admin_promos", "🎟️ К промокодам"),
+        parse_mode=None,
+    )
+    await _render_bot_admin_promos(callback)
+
+
+@router.callback_query(F.data == "bot_admin_promo_create")
+async def bot_admin_promo_create_start(callback: CallbackQuery, state: FSMContext):
+    if not await _is_bot_admin_callback(callback):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    await callback.answer()
+    await state.set_state(FeatureStates.bot_admin_promo_create)
+    await callback.message.answer(
+        "Введите промокод в формате 5 строк:\n"
+        "1) КОД\n"
+        "2) Описание\n"
+        "3) Лимит активаций (0 = без лимита)\n"
+        "4) Срок в часах (0 = без срока)\n"
+        "5) Награды\n\n"
+        "Пример:\n"
+        "MIRNASTART\n"
+        "Стартовый подарок\n"
+        "100\n"
+        "168\n"
+        "balance=50000; bank=25000; reputation=3; education=1",
+        reply_markup=_back("bot_admin_panel", "🔙 Отмена"),
+        parse_mode=None,
+    )
+
+
+@router.message(FeatureStates.bot_admin_promo_create, F.text, ~F.text.startswith("/"))
+async def bot_admin_promo_create_input(message: Message, state: FSMContext):
+    if not await _is_bot_admin_message(message):
+        await state.clear()
+        await message.answer("❌ Нет доступа.", parse_mode=None)
+        return
+    raw = str(message.text or "").strip()
+    lines = [x.strip() for x in raw.splitlines() if x.strip()]
+    if len(lines) >= 5:
+        code, description, max_uses_raw, expires_raw = lines[0], lines[1], lines[2], lines[3]
+        rewards_raw = "\n".join(lines[4:])
+    else:
+        parts = [x.strip() for x in raw.split("|", 4)]
+        if len(parts) < 5:
+            await message.answer("❌ Нужны 5 строк или формат: код | описание | лимит | часы | награды", reply_markup=_back("bot_admin_panel"))
+            return
+        code, description, max_uses_raw, expires_raw, rewards_raw = parts
+
+    try:
+        max_uses = int(max_uses_raw.replace(" ", ""))
+    except Exception:
+        max_uses = 0
+    try:
+        expires_hours = int(expires_raw.replace(" ", ""))
+    except Exception:
+        expires_hours = 0
+    parsed_ok, parsed_msg, rewards_payload = _parse_promocode_rewards_spec(rewards_raw)
+    if not parsed_ok:
+        await message.answer(f"❌ {parsed_msg}", reply_markup=_back("bot_admin_panel"), parse_mode=None)
+        return
+
+    ok, msg, payload = await db.create_promocode(
+        actor_id=message.from_user.id,
+        code=code,
+        description=description,
+        rewards=rewards_payload or {},
+        max_uses=max_uses,
+        expires_hours=expires_hours,
+        allow_system=True,
+    )
+    await state.clear()
+    if not ok:
+        await message.answer(f"❌ {msg}", reply_markup=_back("bot_admin_panel"), parse_mode=None)
+        return
+    rewards_lines = _render_promocode_rewards((payload or {}).get("rewards") or {})
+    await message.answer(
+        "✅ Промокод создан через админку\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"Код: {(payload or {}).get('code')}\n"
+        f"ID: {int((payload or {}).get('promo_id') or 0)}\n"
+        + ("Награды:\n" + "\n".join(rewards_lines) if rewards_lines else "Награды настроены."),
+        reply_markup=_back("bot_admin_panel", "🛠 В админку"),
+        parse_mode=None,
+    )
+
+
+@router.callback_query(F.data.startswith("bot_admin_promo_toggle_"))
+async def bot_admin_promo_toggle(callback: CallbackQuery, state: FSMContext):
+    if not await _is_bot_admin_callback(callback):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    parts = str(callback.data or "").split("_")
+    if len(parts) < 6 or not parts[4].isdigit() or not parts[5].isdigit():
+        await callback.answer("Некорректный промокод.", show_alert=True)
+        return
+    ok, msg, _ = await db.set_promocode_active(
+        actor_id=callback.from_user.id,
+        promo_id=int(parts[4]),
+        is_active=int(parts[5]) == 1,
+        allow_system=True,
+    )
+    await callback.answer(msg if ok else f"❌ {msg}", show_alert=not ok)
+    await _render_bot_admin_promos(callback)
+
+
+@router.callback_query(F.data == "bot_admin_grant_donation")
+async def bot_admin_grant_donation_start(callback: CallbackQuery, state: FSMContext):
+    if not await _is_bot_admin_callback(callback):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    await callback.answer()
+    packs = ", ".join(str(pack["key"]) for pack in DONATION_PACKS)
+    await state.set_state(FeatureStates.bot_admin_grant_donation)
+    await callback.message.answer(
+        "💎 Ручная выдача донат-пакета\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Введите: user_id pack_key\n"
+        f"Пакеты: {packs}\n\n"
+        "Пример: 123456789 citizen",
+        reply_markup=_back("bot_admin_panel", "🔙 Отмена"),
+        parse_mode=None,
+    )
+
+
+@router.message(Command("grantdonate"))
+async def bot_admin_grant_donation_command(message: Message, state: FSMContext):
+    if not await _is_bot_admin_message(message):
+        await message.answer("❌ Нет доступа.", parse_mode=None)
+        return
+    payload = str(message.text or "").split(maxsplit=2)
+    if len(payload) >= 3:
+        await state.set_state(FeatureStates.bot_admin_grant_donation)
+        await bot_admin_grant_donation_input(message, state)
+        return
+    await state.set_state(FeatureStates.bot_admin_grant_donation)
+    await message.answer("Введите: user_id pack_key", reply_markup=_back("bot_admin_panel"), parse_mode=None)
+
+
+@router.message(FeatureStates.bot_admin_grant_donation, F.text, ~F.text.startswith("/"))
+async def bot_admin_grant_donation_input(message: Message, state: FSMContext):
+    if not await _is_bot_admin_message(message):
+        await state.clear()
+        await message.answer("❌ Нет доступа.", parse_mode=None)
+        return
+    parts = str(message.text or "").strip().split()
+    if len(parts) >= 3 and parts[0].lower().startswith("/grantdonate"):
+        parts = parts[1:]
+    if len(parts) < 2 or not parts[0].isdigit():
+        await message.answer("❌ Формат: user_id pack_key", reply_markup=_back("bot_admin_panel"), parse_mode=None)
+        return
+    target_id = int(parts[0])
+    pack_key = parts[1].strip().lower()
+    pack = _donation_pack_map().get(pack_key)
+    if not pack:
+        await message.answer("❌ Пакет не найден.", reply_markup=_back("bot_admin_panel"), parse_mode=None)
+        return
+    stamp = int(datetime.now().timestamp())
+    manual_token = f"manual:{message.from_user.id}:{target_id}:{pack_key}:{stamp}:{secrets.token_hex(4)}"
+    ok, msg, result = await db.apply_donation_purchase(
+        user_id=target_id,
+        pack_key=str(pack.get("key") or ""),
+        pack_title=str(pack.get("title") or ""),
+        amount=int(pack.get("stars") or 0),
+        currency="XTR",
+        invoice_payload=manual_token[:128],
+        telegram_payment_charge_id=f"manual_tg_{stamp}_{secrets.token_hex(5)}",
+        provider_payment_charge_id=f"manual_admin_{message.from_user.id}",
+        rewards=dict(pack.get("rewards") or {}),
+    )
+    await state.clear()
+    if not ok:
+        await message.answer(f"❌ {msg}", reply_markup=_back("bot_admin_panel"), parse_mode=None)
+        return
+    rewards_lines = _render_promocode_rewards((result or {}).get("rewards_applied") or pack.get("rewards") or {})
+    await message.answer(
+        "✅ Донат-пакет выдан вручную\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"Игрок: {target_id}\n"
+        f"Пакет: {pack.get('title')}\n"
+        + ("Награды:\n" + "\n".join(rewards_lines) if rewards_lines else "Награды применены."),
+        reply_markup=_back("bot_admin_panel", "🛠 В админку"),
+        parse_mode=None,
+    )
+    try:
+        await message.bot.send_message(
+            target_id,
+            "✅ Вам выдан донат-пакет администратором\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"Пакет: {pack.get('title')}\n"
+            "Награды уже применены к профилю.",
+            parse_mode=None,
+        )
+    except Exception:
+        pass
+
+
+@router.message(FeatureStates.bot_admin_promo_create)
+async def bot_admin_promo_create_invalid(message: Message):
+    await message.answer("❌ Отправьте промокод текстом по шаблону.", reply_markup=_back("bot_admin_panel"), parse_mode=None)
+
+
+@router.message(FeatureStates.bot_admin_grant_donation)
+async def bot_admin_grant_donation_invalid(message: Message):
+    await message.answer("❌ Отправьте текст: user_id pack_key.", reply_markup=_back("bot_admin_panel"), parse_mode=None)
 
 
 def _news_filter_label(code: str) -> str:
@@ -3440,8 +5626,14 @@ async def _render_media_news_feed(
             [InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_main")],
         ]
     )
-    sender = _edit_or_answer(event)
-    await sender("\n".join(lines), reply_markup=keyboard, parse_mode="Markdown")
+    # Показываем новостную ленту с изображением раздела
+    await send_section_screen(
+        event,
+        text="\n".join(lines),
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+        section_key="bnr",
+    )
 
 
 @router.message(Command("news"))
@@ -3703,11 +5895,13 @@ async def _render_stock_exchange_menu(
         ]
     )
 
-    sender = _edit_or_answer(event)
-    await sender(
-        "\n".join(lines),
+    await send_section_screen(
+        event,
+        text="\n".join(lines),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
         parse_mode=None,
+        section_key="birja",
+        add_back_to_menu=True,
     )
 
 
@@ -4403,8 +6597,11 @@ async def feature_developer_menu(event: Message | CallbackQuery, state: FSMConte
             await event.answer()
         except Exception:
             pass
+    await state.clear()
 
     user_id = event.from_user.id
+    restored = await db.sync_missing_developer_properties(user_id, limit=80)
+    auto_claimed = await _auto_claim_ready_developer_projects(user_id, limit=12)
     user = await db.get_user(user_id) or {}
     projects = await db.get_developer_projects(user_id, limit=20)
     inflation = await db.get_inflation_snapshot()
@@ -4417,11 +6614,27 @@ async def feature_developer_menu(event: Message | CallbackQuery, state: FSMConte
         f"Индекс инфляции: {float(inflation.get('inflation_index') or 1):.4f}",
         "",
         "Тарифы:",
-        "• Малый ЖК: вложение $280, срок ~25 мин",
-        "• Квартал: вложение $950, срок ~90 мин",
-        "• Сити-проект: вложение $2600, срок ~240 мин",
+        "• Малый ЖК: вложение $2,000, срок ~25 мин (дом в недвижимости = x20 цены застройщика)",
+        "• Квартал: вложение $3,000, срок ~90 мин (дом в недвижимости = x20 цены застройщика)",
+        "• Сити-проект: вложение $4,000, срок ~240 мин (дом в недвижимости = x20 цены застройщика)",
+        "• Своя сумма: введите от $2,000, срок стройки и масштаб проекта рассчитываются по вложению",
         "",
     ]
+    if int(auto_claimed.get("claimed") or 0) > 0:
+        lines.append(
+            f"✅ Автозавершено готовых проектов: {int(auto_claimed.get('claimed') or 0)} "
+            f"(выплата: {_lum(float(auto_claimed.get('payout_total') or 0))})"
+        )
+        if auto_claimed.get("properties"):
+            lines.append("🏠 Добавлено в недвижимость:")
+            for name in list(auto_claimed.get("properties") or [])[:3]:
+                lines.append(f"• {_md(str(name))}")
+        lines.append("")
+    if int(restored.get("created") or 0) > 0:
+        lines.append(
+            f"🛠️ Восстановлено пропущенных домов по завершенным проектам: {int(restored.get('created') or 0)}"
+        )
+        lines.append("")
 
     if not projects:
         lines.append("У вас пока нет проектов.")
@@ -4429,7 +6642,8 @@ async def feature_developer_menu(event: Message | CallbackQuery, state: FSMConte
         lines.append("Ваши проекты:")
         for row in projects[:8]:
             status = str(row.get("status") or "building")
-            if status != "claimed" and _time_left_label(str(row.get("ready_date") or "")) == "готово":
+            is_ready = status == "ready" or _time_left_label(str(row.get("ready_date") or "")) == "готово"
+            if status != "claimed" and is_ready:
                 status_label = "ready"
             else:
                 status_label = status
@@ -4443,6 +6657,7 @@ async def feature_developer_menu(event: Message | CallbackQuery, state: FSMConte
         [InlineKeyboardButton(text="🧱 Старт: Малый ЖК", callback_data="dev_start_small")],
         [InlineKeyboardButton(text="🏘️ Старт: Квартал", callback_data="dev_start_district")],
         [InlineKeyboardButton(text="🏙️ Старт: Сити-проект", callback_data="dev_start_mega")],
+        [InlineKeyboardButton(text="✍️ Старт: своя сумма", callback_data="dev_start_custom")],
     ]
     ready_rows = []
     for row in projects:
@@ -4452,7 +6667,8 @@ async def feature_developer_menu(event: Message | CallbackQuery, state: FSMConte
         status = str(row.get("status") or "building")
         if status == "claimed":
             continue
-        if _time_left_label(str(row.get("ready_date") or "")) == "готово":
+        is_ready = status == "ready" or _time_left_label(str(row.get("ready_date") or "")) == "готово"
+        if is_ready:
             ready_rows.append([InlineKeyboardButton(text=f"💰 Забрать выплату #{pid}", callback_data=f"dev_claim_{pid}")])
     keyboard_rows.extend(ready_rows[:6])
     keyboard_rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="developer_menu")])
@@ -4466,12 +6682,100 @@ async def feature_developer_menu(event: Message | CallbackQuery, state: FSMConte
     )
 
 
+async def _auto_claim_ready_developer_projects(user_id: int, limit: int = 12) -> dict:
+    safe_user_id = int(user_id or 0)
+    safe_limit = max(1, min(int(limit or 12), 30))
+    projects = await db.get_developer_projects(safe_user_id, limit=50)
+    ready_ids: list[int] = []
+    for row in projects:
+        pid = int(row.get("id") or 0)
+        if pid <= 0:
+            continue
+        status = str(row.get("status") or "building").strip().lower()
+        if status == "claimed":
+            continue
+        if status == "ready" or _time_left_label(str(row.get("ready_date") or "")) == "готово":
+            ready_ids.append(pid)
+
+    claimed = 0
+    payout_total = 0.0
+    properties: list[str] = []
+    for pid in ready_ids[:safe_limit]:
+        ok, _, payload = await db.claim_developer_project(safe_user_id, pid)
+        if not ok:
+            continue
+        payload = payload or {}
+        claimed += 1
+        payout_total = round(payout_total + float(payload.get("payout") or 0), 2)
+        created = payload.get("created_property") or {}
+        prop_name = str(created.get("property_name") or "").strip()
+        if prop_name:
+            properties.append(prop_name)
+
+    return {"claimed": claimed, "payout_total": payout_total, "properties": properties}
+
+
 @router.callback_query(F.data.startswith("dev_start_"))
 async def feature_developer_start(callback: CallbackQuery, state: FSMContext):
     tier = callback.data.replace("dev_start_", "").strip().lower()
+    if tier == "custom":
+        await callback.answer()
+        await state.set_state(FeatureStates.developer_custom_amount)
+        if callback.message is not None:
+            await callback.message.answer(
+                "Введите сумму инвестиций для стройки (минимум 2000):",
+                reply_markup=_back("developer_menu", "🔙 Отмена"),
+                parse_mode=None,
+            )
+        return
     success, msg, _ = await db.start_developer_project(callback.from_user.id, tier)
     await callback.answer(("✅ " if success else "❌ ") + msg[:180], show_alert=not success)
     await feature_developer_menu(callback, state)
+
+
+@router.message(FeatureStates.developer_custom_amount, F.text, ~F.text.startswith("/"))
+async def feature_developer_custom_amount_input(message: Message, state: FSMContext):
+    amount = _parse_amount(message.text or "")
+    if amount is None:
+        await message.answer(
+            "❌ Некорректная сумма. Пример: 3500",
+            reply_markup=_back("developer_menu", "🔙 Отмена"),
+            parse_mode=None,
+        )
+        return
+    success, msg, payload = await db.start_developer_project(
+        message.from_user.id,
+        "custom",
+        custom_invest=amount,
+    )
+    if not success:
+        await message.answer(
+            "❌ " + msg,
+            reply_markup=_back("developer_menu", "🔙 К застройщику"),
+            parse_mode=None,
+        )
+        return
+    await state.clear()
+    payload = payload or {}
+    await message.answer(
+        "✅ Проект запущен по вашей сумме\n"
+        f"Вложение: {_lum(float(payload.get('invested') or 0))}\n"
+        f"Тип проекта: {str(payload.get('tier') or 'custom')}\n"
+        f"Срок строительства: ~{int(payload.get('build_minutes') or 0)} мин\n"
+        f"Ожидаемая выплата: {_lum(float(payload.get('expected_payout') or 0))}\n"
+        f"Новый баланс: {_lum(float(payload.get('new_balance') or 0))}",
+        reply_markup=_back("developer_menu", "🏗️ К застройщику"),
+        parse_mode=None,
+    )
+
+
+@router.message(FeatureStates.developer_custom_amount)
+async def feature_developer_custom_amount_invalid(message: Message):
+    await message.answer(
+        "❌ Введите сумму текстом (например: 5000).",
+        reply_markup=_back("developer_menu", "🔙 Отмена"),
+        parse_mode=None,
+    )
 
 
 @router.callback_query(F.data.startswith("dev_claim_"))
@@ -4480,8 +6784,34 @@ async def feature_developer_claim(callback: CallbackQuery, state: FSMContext):
     if not raw.isdigit():
         await callback.answer("Некорректный проект.", show_alert=True)
         return
-    success, msg, _ = await db.claim_developer_project(callback.from_user.id, int(raw))
+    success, msg, payload = await db.claim_developer_project(callback.from_user.id, int(raw))
     await callback.answer(("✅ " if success else "❌ ") + msg[:180], show_alert=not success)
+    if success and callback.message:
+        payload = payload or {}
+        created = payload.get("created_property") or {}
+        lines = [
+            "✅ Проект завершен",
+            f"Выплата: {_lum(float(payload.get('payout') or 0))}",
+            f"Новый баланс: {_lum(float(payload.get('new_balance') or 0))}",
+        ]
+        if created:
+            lines.extend(
+                [
+                    "",
+                    "🏠 Добавлен объект в вашу недвижимость:",
+                    f"• {created.get('property_name')} (ID: {created.get('property_id')})",
+                ]
+            )
+        await callback.message.answer(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🏠 Мое имущество", callback_data="my_property")],
+                    [InlineKeyboardButton(text="🏗️ К застройщику", callback_data="developer_menu")],
+                ]
+            ),
+            parse_mode=None,
+        )
     await feature_developer_menu(callback, state)
 
 
@@ -4520,6 +6850,19 @@ async def feature_gang_command(message: Message, state: FSMContext):
     )
 
 
+@router.message(Command("leavegang"))
+async def feature_gang_leave_command(message: Message, state: FSMContext):
+    await state.clear()
+    success, msg, _ = await db.leave_gang(message.from_user.id)
+    await message.answer(
+        ("✅ " if success else "❌ ") + msg,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🕶️ К бандам", callback_data="gang_list")]]
+        ),
+        parse_mode=None,
+    )
+
+
 @router.callback_query(F.data == "gang_list")
 async def feature_gang_menu(callback: CallbackQuery, state: FSMContext):
     try:
@@ -4551,17 +6894,23 @@ async def feature_gang_menu(callback: CallbackQuery, state: FSMContext):
         )
         return
 
-    cartel = await db.get_gang_cartel(int(user_gang["id"]))
+    gang_id = int(user_gang["id"])
+    is_leader = int(user_gang.get("leader_id") or 0) == callback.from_user.id
+    cartel = await db.get_gang_cartel(gang_id)
+    roof_status = await db.get_gang_roof_status(gang_id)
+    active_war = await db.get_gang_active_war(gang_id)
     lines = [
         f"🕶️ **БАНДА: {_md(str(user_gang.get('name') or ''))}**",
         "━━━━━━━━━━━━━━━━━━━━",
         f"Роль: {_md(str(user_gang.get('member_role') or 'Участник'))}",
         f"Территория: {_md(str(user_gang.get('territory') or 'не указана'))}",
         f"Репутация: {int(user_gang.get('reputation') or 0)}",
+        f"Крыша: активных {int(roof_status.get('active_count') or 0)} | к сбору {int(roof_status.get('due_count') or 0)}",
+        f"Собрано по крыше: ${float(roof_status.get('total_collected') or 0):,.2f}",
         "",
     ]
     keyboard_rows = []
-    if not cartel and int(user_gang.get("leader_id") or 0) == callback.from_user.id:
+    if not cartel and is_leader:
         lines.append("Наркокартель не создан.")
         keyboard_rows.append([InlineKeyboardButton(text="☠️ Создать картель", callback_data=f"fp_cartel_create_{int(user_gang['id'])}")])
     elif cartel:
@@ -4580,6 +6929,38 @@ async def feature_gang_menu(callback: CallbackQuery, state: FSMContext):
                 [InlineKeyboardButton(text="🧼 Отмывание", callback_data="fp_cartel_op_launder")],
             ]
         )
+    lines.append("")
+    if active_war:
+        attacker_id = int(active_war.get("attacker_gang_id") or 0)
+        own_score = int(active_war.get("attacker_score") or 0) if attacker_id == gang_id else int(active_war.get("defender_score") or 0)
+        enemy_score = int(active_war.get("defender_score") or 0) if attacker_id == gang_id else int(active_war.get("attacker_score") or 0)
+        enemy_name = str(active_war.get("defender_name") or "Противник") if attacker_id == gang_id else str(active_war.get("attacker_name") or "Противник")
+        lines.append(
+            f"⚔️ Война: против {_md(enemy_name)} | счет {own_score}:{enemy_score} | до {str(active_war.get('ends_at') or '')[:16]}"
+        )
+    else:
+        lines.append("⚔️ Война: не активна.")
+    lines.append("Операции банды: патруль, рекет, рейд, захват, выкуп, грабежи.")
+    keyboard_rows.extend(
+        [
+            [InlineKeyboardButton(text="🧾 Крыша: взять объект", callback_data="fp_gang_roof_start")],
+            [InlineKeyboardButton(text="💸 Крыша: собрать дань", callback_data="fp_gang_roof_collect")],
+            [InlineKeyboardButton(text="📋 Крыша: мои объекты", callback_data="fp_gang_roof_status")],
+            [InlineKeyboardButton(text="⚔️ Война банд", callback_data="fp_gang_war_menu")],
+            [InlineKeyboardButton(text="🛡️ Патруль", callback_data="fp_gang_op_patrol")],
+            [InlineKeyboardButton(text="💼 Рекет", callback_data="fp_gang_op_racket")],
+            [InlineKeyboardButton(text="⚔️ Рейд", callback_data="fp_gang_op_raid")],
+            [InlineKeyboardButton(text="🧍 Захватить человека", callback_data="fp_gang_op_kidnap")],
+            [InlineKeyboardButton(text="💰 Требовать выкуп", callback_data="fp_gang_op_ransom")],
+            [InlineKeyboardButton(text="👜 Грабить игрока", callback_data="fp_gang_op_mug")],
+            [InlineKeyboardButton(text="🏢 Грабить организацию", callback_data="fp_gang_op_heist_org")],
+            [InlineKeyboardButton(text="🏦 Грабить банк", callback_data="fp_gang_op_heist_bank")],
+        ]
+    )
+    if is_leader:
+        keyboard_rows.append([InlineKeyboardButton(text="🚪 Выйти из банды (передать лидерство)", callback_data="fp_gang_leave")])
+    else:
+        keyboard_rows.append([InlineKeyboardButton(text="🚪 Выйти из банды", callback_data="fp_gang_leave")])
     keyboard_rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="gang_list")])
     keyboard_rows.append([InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_main")])
     await callback.message.edit_text(
@@ -4622,6 +7003,14 @@ async def feature_gang_join(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Некорректная банда.", show_alert=True)
         return
     success, msg = await db.join_gang(callback.from_user.id, int(gang_raw))
+    await callback.message.answer(("✅ " if success else "❌ ") + msg, parse_mode=None)
+    await feature_gang_menu(callback, state)
+
+
+@router.callback_query(F.data == "fp_gang_leave")
+async def feature_gang_leave(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    success, msg, _ = await db.leave_gang(callback.from_user.id)
     await callback.message.answer(("✅ " if success else "❌ ") + msg, parse_mode=None)
     await feature_gang_menu(callback, state)
 
@@ -4675,6 +7064,349 @@ async def feature_cartel_operation(callback: CallbackQuery, state: FSMContext):
             parse_mode=None,
         )
     await feature_gang_menu(callback, state)
+
+
+@router.callback_query(F.data.startswith("fp_gang_op_"))
+async def feature_gang_operation(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    op = (callback.data or "").replace("fp_gang_op_", "").strip().lower()
+    ok, msg, payload = await db.run_gang_operation(callback.from_user.id, op)
+    if not ok:
+        if payload and "cooldown_minutes" in payload:
+            await callback.answer(msg, show_alert=True)
+        else:
+            await callback.message.answer(f"❌ {msg}", parse_mode=None)
+        await feature_gang_menu(callback, state)
+        return
+    payload = payload or {}
+    cartel_delta = payload.get("cartel_delta") or {}
+    cartel_line = ""
+    if cartel_delta:
+        cartel_line = (
+            "\nКартель: "
+            f"+{float(cartel_delta.get('stock_delta') or 0):,.1f} склад, "
+            f"+{float(cartel_delta.get('purity_delta') or 0):,.1f}% чистота"
+        )
+        if int(cartel_delta.get("laundering_delta") or 0) > 0:
+            cartel_line += ", +1 отмывание"
+    meta_lines = []
+    if payload.get("victim_name"):
+        meta_lines.append(f"Цель: {payload.get('victim_name')}")
+    if float(payload.get("demand_amount") or 0) > 0:
+        meta_lines.append(f"Требование выкупа: {float(payload.get('demand_amount') or 0):,.2f}")
+    if float(payload.get("collected_amount") or 0) > 0:
+        meta_lines.append(f"Получено по выкупу: {float(payload.get('collected_amount') or 0):,.2f}")
+    if payload.get("org_name"):
+        meta_lines.append(f"Организация/банк: {payload.get('org_name')}")
+    if float(payload.get("stolen_amount") or 0) > 0:
+        meta_lines.append(f"Украдено: {float(payload.get('stolen_amount') or 0):,.2f}")
+    if payload.get("expires_at"):
+        meta_lines.append(f"Дедлайн выкупа: {str(payload.get('expires_at'))[:16]}")
+    details_block = ("\n" + "\n".join(meta_lines)) if meta_lines else ""
+    await callback.message.answer(
+        "✅ Операция банды выполнена\n"
+        f"Тип: {op}\n"
+        f"Статус: {payload.get('result')}\n"
+        f"Валовый доход: {float(payload.get('payout_gross') or payload.get('payout') or 0):,.2f}\n"
+        f"Доход: {float(payload.get('payout') or 0):,.2f} люмов\n"
+        f"На баланс: {float(payload.get('payout_visible') or 0):,.2f}\n"
+        f"В теневой баланс: {float(payload.get('payout_shadow') or 0):,.2f}\n"
+        f"Оборотный сбор: {float(payload.get('circulation_tax') or 0):,.2f}\n"
+        f"Штраф: {float(payload.get('fine') or 0):,.2f}\n"
+        f"В госбюджет ушло: {float(payload.get('government_credit') or 0):,.2f}\n"
+        f"В налоговую ушло: {float(payload.get('tax_service_credit') or 0):,.2f}\n"
+        f"Репутация банды: {int(payload.get('rep_before') or 0)} → {int(payload.get('rep_after') or 0)}"
+        f"{details_block}"
+        f"{cartel_line}",
+        parse_mode=None,
+    )
+    await feature_gang_menu(callback, state)
+
+
+@router.callback_query(F.data == "fp_gang_roof_start")
+async def feature_gang_roof_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    ok, msg, payload = await db.start_gang_roof(callback.from_user.id)
+    if not ok:
+        await callback.message.answer(f"❌ {msg}", parse_mode=None)
+        await feature_gang_menu(callback, state)
+        return
+    payload = payload or {}
+    await callback.message.answer(
+        "✅ Крыша оформлена\n"
+        f"Объект: {payload.get('target_name')}\n"
+        f"Тип: {payload.get('target_type')}\n"
+        f"Ставка дани: {float(payload.get('fee_amount') or 0):,.2f}\n"
+        f"Собрано сразу: {float(payload.get('upfront_collected') or 0):,.2f}\n"
+        f"Следующий сбор: {_time_left_label(str(payload.get('next_collection_at') or ''))}\n"
+        f"Баланс: {float(payload.get('balance_after') or 0):,.2f}\n"
+        f"Тень: {float(payload.get('shadow_after') or 0):,.2f}",
+        parse_mode=None,
+    )
+    await feature_gang_menu(callback, state)
+
+
+@router.callback_query(F.data == "fp_gang_roof_collect")
+async def feature_gang_roof_collect(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    ok, msg, payload = await db.collect_gang_roof_income(callback.from_user.id)
+    if not ok:
+        await callback.message.answer(f"❌ {msg}", parse_mode=None)
+        await feature_gang_menu(callback, state)
+        return
+    payload = payload or {}
+    await callback.message.answer(
+        "✅ Сбор дани выполнен\n"
+        f"Объектов обработано: {int(payload.get('collected_count') or 0)}\n"
+        f"Закрыто контрактов: {int(payload.get('closed_count') or 0)}\n"
+        f"Валовый сбор: {float(payload.get('gross_collected') or 0):,.2f}\n"
+        f"На баланс: {float(payload.get('visible_gain') or 0):,.2f}\n"
+        f"В тень: {float(payload.get('shadow_gain') or 0):,.2f}\n"
+        f"Баланс после: {float(payload.get('balance_after') or 0):,.2f}",
+        parse_mode=None,
+    )
+    await feature_gang_menu(callback, state)
+
+
+@router.callback_query(F.data == "fp_gang_roof_status")
+async def feature_gang_roof_status(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    user_gang = await db.get_user_gang(callback.from_user.id)
+    if not user_gang:
+        await callback.answer("Вы не состоите в банде.", show_alert=True)
+        await feature_gang_menu(callback, state)
+        return
+    gang_id = int(user_gang.get("id") or 0)
+    roof = await db.get_gang_roof_status(gang_id)
+    contracts = await db.list_gang_roof_contracts(gang_id, status="active", limit=18)
+    now = datetime.now().isoformat()
+    lines = [
+        f"📋 КРЫША БАНДЫ: {str(user_gang.get('name') or '')}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Активных контрактов: {int(roof.get('active_count') or 0)}",
+        f"Готово к сбору: {int(roof.get('due_count') or 0)}",
+        f"Собрано всего: {float(roof.get('total_collected') or 0):,.2f}",
+        "",
+    ]
+    if not contracts:
+        lines.append("Активных контрактов нет.")
+    else:
+        for row in contracts[:10]:
+            next_at = str(row.get("next_collection_at") or "")
+            due_mark = "💸" if next_at and next_at <= now else "⏳"
+            lines.append(
+                f"{due_mark} #{int(row.get('id') or 0)} {str(row.get('target_name') or 'Объект')}\n"
+                f"   Ставка: {float(row.get('fee_amount') or 0):,.0f} | "
+                f"Собрано: {float(row.get('total_collected') or 0):,.0f} | "
+                f"Сбор через: {_time_left_label(next_at)}"
+            )
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="💸 Собрать дань", callback_data="fp_gang_roof_collect")],
+                [InlineKeyboardButton(text="🧾 Взять новый объект", callback_data="fp_gang_roof_start")],
+                [InlineKeyboardButton(text="🔄 Обновить", callback_data="fp_gang_roof_status")],
+                [InlineKeyboardButton(text="🔙 К банде", callback_data="gang_list")],
+            ]
+        ),
+        parse_mode=None,
+    )
+
+
+@router.callback_query(F.data == "fp_gang_war_menu")
+async def feature_gang_war_menu(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    user_gang = await db.get_user_gang(callback.from_user.id)
+    if not user_gang:
+        await callback.answer("Вы не состоите в банде.", show_alert=True)
+        await feature_gang_menu(callback, state)
+        return
+    gang_id = int(user_gang.get("id") or 0)
+    is_leader = int(user_gang.get("leader_id") or 0) == int(callback.from_user.id)
+    active_war = await db.get_gang_active_war(gang_id)
+    recent_wars = await db.list_recent_gang_wars(limit=6)
+    lines = [
+        f"⚔️ ВОЙНА БАНД: {str(user_gang.get('name') or '')}",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+    if active_war:
+        attacker_id = int(active_war.get("attacker_gang_id") or 0)
+        own_score = int(active_war.get("attacker_score") or 0) if gang_id == attacker_id else int(active_war.get("defender_score") or 0)
+        enemy_score = int(active_war.get("defender_score") or 0) if gang_id == attacker_id else int(active_war.get("attacker_score") or 0)
+        enemy_name = str(active_war.get("defender_name") or "Противник") if gang_id == attacker_id else str(active_war.get("attacker_name") or "Противник")
+        lines.extend(
+            [
+                f"Статус: активна против {enemy_name}",
+                f"Счет: {own_score}:{enemy_score}",
+                f"Боёв: {int(active_war.get('battle_count') or 0)}",
+                f"До окончания: {_time_left_label(str(active_war.get('ends_at') or ''))}",
+                "",
+                "Каждая атака дает очки войны и денежную награду.",
+            ]
+        )
+        keyboard_rows.append([InlineKeyboardButton(text="⚔️ Провести атаку", callback_data="fp_gang_war_attack")])
+        if is_leader:
+            keyboard_rows.append([InlineKeyboardButton(text="🏳️ Капитулировать", callback_data="fp_gang_war_surrender")])
+    else:
+        lines.append("Статус: активной войны нет.")
+        if is_leader:
+            gangs = await db.list_gangs(limit=14)
+            candidates = [g for g in gangs if int(g.get("id") or 0) != gang_id]
+            lines.append("Доступные цели для объявления войны:")
+            if not candidates:
+                lines.append("Нет доступных банд для войны.")
+            else:
+                for item in candidates[:6]:
+                    lines.append(
+                        f"• #{int(item.get('id') or 0)} {str(item.get('name') or '')} "
+                        f"(репутация {int(item.get('reputation') or 0)}, участники {int(item.get('members_count') or 0)})"
+                    )
+                    keyboard_rows.append(
+                        [
+                            InlineKeyboardButton(
+                                text=f"⚔️ Объявить войну #{int(item.get('id') or 0)}",
+                                callback_data=f"fp_gang_war_decl_{int(item.get('id') or 0)}",
+                            )
+                        ]
+                    )
+        else:
+            lines.append("Только лидер может объявлять войну.")
+    lines.append("")
+    lines.append("Последние войны:")
+    if not recent_wars:
+        lines.append("История пока пуста.")
+    else:
+        for war in recent_wars[:4]:
+            status = str(war.get("status") or "")
+            attacker_name = str(war.get("attacker_name") or f"#{int(war.get('attacker_gang_id') or 0)}")
+            defender_name = str(war.get("defender_name") or f"#{int(war.get('defender_gang_id') or 0)}")
+            winner_name = str(war.get("winner_name") or "-")
+            lines.append(
+                f"• #{int(war.get('id') or 0)} {attacker_name} vs {defender_name} | "
+                f"счет {int(war.get('attacker_score') or 0)}:{int(war.get('defender_score') or 0)} | "
+                f"{status} | победитель: {winner_name}"
+            )
+
+    keyboard_rows.extend(
+        [
+            [InlineKeyboardButton(text="🧾 История войн", callback_data="fp_gang_war_history")],
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data="fp_gang_war_menu")],
+            [InlineKeyboardButton(text="🔙 К банде", callback_data="gang_list")],
+        ]
+    )
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+        parse_mode=None,
+    )
+
+
+@router.callback_query(F.data.startswith("fp_gang_war_decl_"))
+async def feature_gang_war_declare(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    raw = callback.data.replace("fp_gang_war_decl_", "")
+    if not raw.isdigit():
+        await callback.answer("Некорректная цель войны.", show_alert=True)
+        return
+    target_gang_id = int(raw)
+    ok, msg, payload = await db.declare_gang_war(callback.from_user.id, target_gang_id)
+    if not ok:
+        await callback.message.answer(f"❌ {msg}", parse_mode=None)
+    else:
+        payload = payload or {}
+        await callback.message.answer(
+            "✅ Война объявлена\n"
+            f"Война: #{int(payload.get('war_id') or 0)}\n"
+            f"Вступительный взнос: {float(payload.get('war_fee') or 0):,.2f}\n"
+            f"Окончание: {_time_left_label(str(payload.get('ends_at') or ''))}",
+            parse_mode=None,
+        )
+    await feature_gang_war_menu(callback, state)
+
+
+@router.callback_query(F.data == "fp_gang_war_attack")
+async def feature_gang_war_attack(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    ok, msg, payload = await db.attack_gang_war(callback.from_user.id)
+    if not ok:
+        if payload and "cooldown_minutes" in payload:
+            await callback.answer(msg, show_alert=True)
+        else:
+            await callback.message.answer(f"❌ {msg}", parse_mode=None)
+        await feature_gang_war_menu(callback, state)
+        return
+    payload = payload or {}
+    lines = [
+        "✅ Атака проведена",
+        f"Очки за атаку: +{int(payload.get('points') or 0)}",
+        f"Критический удар: {'да' if bool(payload.get('critical')) else 'нет'}",
+        f"Награда: {float(payload.get('reward') or 0):,.2f}",
+        f"Счет войны: {int(payload.get('attacker_score') or 0)}:{int(payload.get('defender_score') or 0)}",
+        f"Боёв: {int(payload.get('battle_count') or 0)}",
+    ]
+    if payload.get("finalized") and payload.get("final_payload"):
+        final_payload = payload.get("final_payload") or {}
+        lines.extend(
+            [
+                "",
+                "🏁 Война завершена.",
+                f"Победитель: банда #{int(final_payload.get('winner_gang_id') or 0)}",
+                f"Приз победителя: {float(final_payload.get('winner_prize') or 0):,.2f}",
+            ]
+        )
+    await callback.message.answer("\n".join(lines), parse_mode=None)
+    await feature_gang_war_menu(callback, state)
+
+
+@router.callback_query(F.data == "fp_gang_war_surrender")
+async def feature_gang_war_surrender(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    ok, msg, payload = await db.surrender_gang_war(callback.from_user.id)
+    if not ok:
+        await callback.message.answer(f"❌ {msg}", parse_mode=None)
+        await feature_gang_war_menu(callback, state)
+        return
+    payload = payload or {}
+    await callback.message.answer(
+        "✅ Капитуляция оформлена\n"
+        f"Победитель: банда #{int(payload.get('winner_gang_id') or 0)}\n"
+        f"Приз победителя: {float(payload.get('winner_prize') or 0):,.2f}\n"
+        f"В бюджет и налоговую: {float(payload.get('public_share') or 0):,.2f}",
+        parse_mode=None,
+    )
+    await feature_gang_war_menu(callback, state)
+
+
+@router.callback_query(F.data == "fp_gang_war_history")
+async def feature_gang_war_history(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    rows = await db.list_recent_gang_wars(limit=14)
+    lines = ["🧾 ИСТОРИЯ ВОЙН БАНД", "━━━━━━━━━━━━━━━━━━━━", ""]
+    if not rows:
+        lines.append("История пуста.")
+    else:
+        for row in rows:
+            attacker_name = str(row.get("attacker_name") or f"#{int(row.get('attacker_gang_id') or 0)}")
+            defender_name = str(row.get("defender_name") or f"#{int(row.get('defender_gang_id') or 0)}")
+            winner_name = str(row.get("winner_name") or "-")
+            lines.append(
+                f"#{int(row.get('id') or 0)} | {attacker_name} vs {defender_name}\n"
+                f"Счет: {int(row.get('attacker_score') or 0)}:{int(row.get('defender_score') or 0)} | "
+                f"Статус: {str(row.get('status') or '')} | Победитель: {winner_name}"
+            )
+            lines.append("")
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Обновить", callback_data="fp_gang_war_history")],
+                [InlineKeyboardButton(text="🔙 К войне", callback_data="fp_gang_war_menu")],
+            ]
+        ),
+        parse_mode=None,
+    )
 
 
 async def _ensure_president(callback: CallbackQuery) -> bool:
@@ -4976,6 +7708,213 @@ def _parse_amount(raw_text: str) -> Optional[float]:
     return round(value, 2)
 
 
+def _parse_signed_amount(raw_text: str) -> Optional[float]:
+    raw = str(raw_text or "").strip().replace("$", "").replace(" ", "").replace(",", ".")
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    if abs(value) > 1_000_000_000_000:
+        return None
+    return round(value, 2)
+
+
+def _parse_id_list(raw_text: str) -> list[int]:
+    values: list[int] = []
+    for token in re.split(r"[,\s]+", str(raw_text or "").strip()):
+        token = token.strip()
+        if not token:
+            continue
+        if token.isdigit():
+            val = int(token)
+            if val > 0 and val not in values:
+                values.append(val)
+    return values[:40]
+
+
+def _parse_promocode_rewards_spec(raw_text: str) -> tuple[bool, str, Optional[dict[str, Any]]]:
+    raw = str(raw_text or "").strip()
+    if not raw:
+        return False, "Укажите награды промокода.", None
+
+    if raw.startswith("{"):
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return False, "Некорректный JSON наград.", None
+        if not isinstance(payload, dict):
+            return False, "JSON наград должен быть объектом.", None
+        return True, "ok", payload
+
+    payload: dict[str, Any] = {
+        "user_add": {},
+        "government_budget_add": 0.0,
+        "organizations_budget_add": {},
+        "businesses_budget_add": {},
+        "private_orgs_budget_add": {},
+        "grant_properties": [],
+        "grant_businesses": [],
+        "grant_private_orgs": [],
+        "gang_reputation_add": 0,
+    }
+
+    user_key_map = {
+        "balance": "balance",
+        "bank": "bank",
+        "cash": "cash",
+        "shadow": "shadow_balance",
+        "shadow_balance": "shadow_balance",
+        "reputation": "reputation",
+        "rep": "reputation",
+        "education": "education",
+        "edu": "education",
+        "experience": "experience",
+        "exp": "experience",
+        "level": "level",
+        "lvl": "level",
+        "health": "health",
+        "happiness": "happiness",
+        "hunger": "hunger",
+        "tax_debt": "tax_debt",
+        "citizen_salary": "citizen_salary",
+        "corruption": "corruption_score",
+        "corruption_score": "corruption_score",
+        "referral_earnings": "referral_earnings",
+        "marketing_level": "marketing_level",
+    }
+
+    tokens = [x.strip() for x in re.split(r"[;\n]+", raw) if x.strip()]
+    if not tokens:
+        return False, "Награды не распознаны.", None
+
+    for token in tokens:
+        if "=" not in token:
+            return False, f"Некорректный блок награды: {token}", None
+        key_raw, value_raw = token.split("=", 1)
+        key = key_raw.strip().lower()
+        value = value_raw.strip()
+
+        mapped = user_key_map.get(key)
+        if mapped:
+            amount = _parse_signed_amount(value)
+            if amount is None:
+                return False, f"Некорректное значение для {key_raw}.", None
+            payload["user_add"][mapped] = round(float(payload["user_add"].get(mapped) or 0.0) + amount, 2)
+            continue
+
+        if key in {"government_budget", "gov_budget"}:
+            amount = _parse_amount(value)
+            if amount is None:
+                return False, "Некорректная сумма для government_budget.", None
+            payload["government_budget_add"] = round(float(payload["government_budget_add"] or 0.0) + amount, 2)
+            continue
+
+        org_match = re.match(r"org_budget\[(\d+)\]$", key)
+        if org_match:
+            amount = _parse_amount(value)
+            if amount is None:
+                return False, f"Некорректная сумма для {key_raw}.", None
+            org_id = int(org_match.group(1))
+            payload["organizations_budget_add"][org_id] = round(
+                float(payload["organizations_budget_add"].get(org_id) or 0.0) + amount,
+                2,
+            )
+            continue
+
+        business_match = re.match(r"business_budget\[(\d+)\]$", key)
+        if business_match:
+            amount = _parse_amount(value)
+            if amount is None:
+                return False, f"Некорректная сумма для {key_raw}.", None
+            business_id = int(business_match.group(1))
+            payload["businesses_budget_add"][business_id] = round(
+                float(payload["businesses_budget_add"].get(business_id) or 0.0) + amount,
+                2,
+            )
+            continue
+
+        private_org_match = re.match(r"private_org_budget\[(\d+)\]$", key)
+        if private_org_match:
+            amount = _parse_amount(value)
+            if amount is None:
+                return False, f"Некорректная сумма для {key_raw}.", None
+            org_id = int(private_org_match.group(1))
+            payload["private_orgs_budget_add"][org_id] = round(
+                float(payload["private_orgs_budget_add"].get(org_id) or 0.0) + amount,
+                2,
+            )
+            continue
+
+        if key in {"property", "properties", "grant_properties"}:
+            for prop_id in _parse_id_list(value):
+                if prop_id not in payload["grant_properties"]:
+                    payload["grant_properties"].append(prop_id)
+            continue
+
+        if key in {"business", "businesses", "grant_businesses"}:
+            for business_id in _parse_id_list(value):
+                if business_id not in payload["grant_businesses"]:
+                    payload["grant_businesses"].append(business_id)
+            continue
+
+        if key in {"private_org", "private_orgs", "grant_private_orgs"}:
+            for org_id in _parse_id_list(value):
+                if org_id not in payload["grant_private_orgs"]:
+                    payload["grant_private_orgs"].append(org_id)
+            continue
+
+        if key in {"gang_reputation", "gang_rep"}:
+            amount = _parse_signed_amount(value)
+            if amount is None:
+                return False, "Некорректное значение для gang_reputation.", None
+            payload["gang_reputation_add"] = int(round(float(payload["gang_reputation_add"] or 0.0) + amount))
+            continue
+
+        return False, f"Неизвестный тип награды: {key_raw}", None
+
+    return True, "ok", payload
+
+
+def _render_promocode_rewards(payload: dict[str, Any] | None) -> list[str]:
+    info = payload if isinstance(payload, dict) else {}
+    lines: list[str] = []
+
+    user_add = dict(info.get("user_add") or {})
+    for field, amount in user_add.items():
+        lines.append(f"• {field}: {float(amount):+,.2f}")
+
+    gov_add = float(info.get("government_budget_add") or 0.0)
+    if gov_add > 0:
+        lines.append(f"• government_budget: +{gov_add:,.2f}")
+
+    for org_id, amount in dict(info.get("organizations_budget_add") or {}).items():
+        lines.append(f"• org_budget[{int(org_id)}]: +{float(amount):,.2f}")
+    for business_id, amount in dict(info.get("businesses_budget_add") or {}).items():
+        lines.append(f"• business_budget[{int(business_id)}]: +{float(amount):,.2f}")
+    for org_id, amount in dict(info.get("private_orgs_budget_add") or {}).items():
+        lines.append(f"• private_org_budget[{int(org_id)}]: +{float(amount):,.2f}")
+
+    props = [int(x) for x in list(info.get("grant_properties") or []) if int(x) > 0]
+    if props:
+        lines.append(f"• property: {', '.join(str(x) for x in props[:10])}")
+
+    businesses = [int(x) for x in list(info.get("grant_businesses") or []) if int(x) > 0]
+    if businesses:
+        lines.append(f"• business: {', '.join(str(x) for x in businesses[:10])}")
+
+    private_orgs = [int(x) for x in list(info.get("grant_private_orgs") or []) if int(x) > 0]
+    if private_orgs:
+        lines.append(f"• private_org: {', '.join(str(x) for x in private_orgs[:10])}")
+
+    gang_rep = int(info.get("gang_reputation_add") or 0)
+    if gang_rep != 0:
+        lines.append(f"• gang_reputation: {gang_rep:+d}")
+
+    return lines[:22]
+
+
 # ---------------------------------------------------------------------------
 # Contracts handlers
 # ---------------------------------------------------------------------------
@@ -5154,13 +8093,30 @@ async def _render_bank_ops(callback: CallbackQuery):
     user = await db.get_user(callback.from_user.id) or {}
     balance = float(user.get("balance") or 0)
     bank = float(user.get("bank") or 0)
+    education = int(user.get("education") or 1)
+    reputation = float(user.get("reputation") or 50.0)
+    base_rate = 0.00025
+    edu_bonus = max(0.0, min((education - 1) * 0.00001, 0.00012))
+    rep_bonus = max(0.0, min((reputation - 50.0) * 0.000002, 0.00012))
+    hourly_rate = max(0.0, base_rate + edu_bonus + rep_bonus)
+    projected_raw = max(0.0, bank * hourly_rate)
+    projected_visible = int(projected_raw * 100.0 + 1e-9) / 100.0
+    min_bank_for_visible = (0.01 / hourly_rate) if hourly_rate > 0 else 0.0
     text = (
         "💳 **БАНКОВЫЕ ОПЕРАЦИИ**\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Наличные: ${balance:,.2f}\n"
-        f"Счет в банке: ${bank:,.2f}\n\n"
+        f"Счет в банке: ${bank:,.2f}\n"
+        f"Банковский доход (проценты): ~${projected_visible:,.2f}/час\n"
+        f"Текущая ставка: {hourly_rate * 100:.4f}%/ч (база 0.0250%)\n"
+        "Проценты начисляются автоматически каждый час прямо на банковский счет.\n"
         "Быстрые действия:"
     )
+    if bank > 0 and projected_visible <= 0:
+        text += (
+            f"\n\nℹ️ При текущем банке начисление меньше $0.01 за час и округляется до 0.00."
+            f"\nДля видимого почасового начисления при этой ставке нужно примерно от ${min_bank_for_visible:,.2f}."
+        )
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -5287,9 +8243,19 @@ async def feature_bank_history(callback: CallbackQuery, state: FSMContext):
     if not rows:
         lines.append("Операций пока нет.")
     else:
+        tx_labels = {
+            "deposit": "Депозит",
+            "withdraw": "Вывод",
+            "transfer_in": "Перевод входящий",
+            "transfer_out": "Перевод исходящий",
+            "commission": "Комиссия",
+            "salary_hourly": "Почасовая зарплата",
+            "salary_daily": "Ежедневная зарплата",
+            "bank_interest": "Почасовые проценты",
+        }
         for row in rows:
             created = str(row.get("created_date") or "")[:16]
-            tx_type = "Депозит" if row.get("tx_type") == "deposit" else "Вывод"
+            tx_type = tx_labels.get(str(row.get("tx_type") or "").strip().lower(), str(row.get("tx_type") or "Операция"))
             lines.append(
                 f"[{created}] {tx_type} ${float(row.get('amount') or 0):,.2f}\n"
                 f"Наличные: ${float(row.get('balance_before') or 0):,.2f} → ${float(row.get('balance_after') or 0):,.2f}\n"
@@ -5299,7 +8265,7 @@ async def feature_bank_history(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
         "\n".join(lines),
         reply_markup=_back("bank_deposit"),
-        parse_mode="Markdown",
+        parse_mode=None,
     )
 
 
@@ -5316,6 +8282,86 @@ async def feature_bank_wd_invalid(message: Message):
 # ---------------------------------------------------------------------------
 # Police handlers
 # ---------------------------------------------------------------------------
+
+def _format_security_wait(seconds: int) -> str:
+    total = max(0, int(seconds or 0))
+    hours, rem = divmod(total, 3600)
+    minutes = rem // 60
+    if hours > 0:
+        return f"{hours}ч {minutes:02d}м"
+    return f"{minutes}м"
+
+
+def _parse_police_investigation_callback(data: str) -> tuple[int, int, str]:
+    tail = str(data or "").replace("fp_police_invest_start_", "").replace("fp_police_invest_check_", "")
+    parts = tail.split("_")
+    target_raw = parts[0] if parts else ""
+    page_raw = parts[1] if len(parts) > 1 else "0"
+    context = parts[2] if len(parts) > 2 else "arrest"
+    target_id = int(target_raw) if target_raw.isdigit() else 0
+    page = int(page_raw) if page_raw.lstrip("-").isdigit() else 0
+    context = context if context in {"arrest", "penalty"} else "arrest"
+    return target_id, page, context
+
+
+async def _render_police_context_page(callback: CallbackQuery, context: str, page: int) -> None:
+    if context == "penalty":
+        await _render_police_penalty_menu(callback, page=page)
+        return
+    await _render_police_arrest_picker(callback, page=page)
+
+
+@router.callback_query(F.data.startswith("fp_police_invest_start_"))
+async def feature_police_investigation_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    target_id, page, context = _parse_police_investigation_callback(callback.data or "")
+    if target_id <= 0:
+        await callback.answer("Некорректная цель расследования.", show_alert=True)
+        return
+    ok, msg, payload = await db.start_security_investigation(
+        actor_id=callback.from_user.id,
+        target_id=target_id,
+        agency="police",
+    )
+    info = payload or {}
+    if ok:
+        ready_at = str(info.get("ready_at") or "")[:16]
+        await callback.message.answer(
+            f"✅ {msg}\nГотово примерно в: {ready_at}",
+            parse_mode=None,
+        )
+    else:
+        if int(info.get("remaining_seconds") or 0) > 0:
+            wait = _format_security_wait(int(info.get("remaining_seconds") or 0))
+            await callback.message.answer(f"⏳ {msg}\nОсталось: {wait}", parse_mode=None)
+        else:
+            await callback.message.answer(f"❌ {msg}", parse_mode=None)
+    await _render_police_context_page(callback, context=context, page=page)
+
+
+@router.callback_query(F.data.startswith("fp_police_invest_check_"))
+async def feature_police_investigation_check(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    target_id, page, context = _parse_police_investigation_callback(callback.data or "")
+    if target_id <= 0:
+        await callback.answer("Некорректная цель расследования.", show_alert=True)
+        return
+    status = await db.get_security_investigation_status(
+        actor_id=callback.from_user.id,
+        target_id=target_id,
+        agency="police",
+    )
+    if bool(status.get("access_granted")):
+        await callback.message.answer("✅ Досье готово. Доступ к действиям открыт.", parse_mode=None)
+    else:
+        st = str(status.get("status") or "none")
+        if st == "pending":
+            wait = _format_security_wait(int(status.get("remaining_seconds") or 0))
+            await callback.message.answer(f"⏳ Расследование еще идет. Осталось: {wait}.", parse_mode=None)
+        else:
+            await callback.message.answer("ℹ️ Досье закрыто. Запустите новое расследование.", parse_mode=None)
+    await _render_police_context_page(callback, context=context, page=page)
+
 
 @router.callback_query(F.data == "police_search_suspects")
 async def feature_police_search_suspects(callback: CallbackQuery, state: FSMContext):
@@ -5343,6 +8389,7 @@ async def _render_police_arrest_picker(callback: CallbackQuery, page: int = 0):
 
     lines = ["🔍 **РОЗЫСК ПОДОЗРЕВАЕМЫХ**", "━━━━━━━━━━━━━━━━━━━━", ""]
     lines.append(f"Страница: {safe_page + 1}/{max_page + 1} | Всего игроков: {total}")
+    lines.append("Арест доступен только после дорогого и долгого расследования по цели.")
     lines.append("")
     keyboard_rows = []
     if not players:
@@ -5350,15 +8397,57 @@ async def _render_police_arrest_picker(callback: CallbackQuery, page: int = 0):
     else:
         for row in players:
             sid = int(row.get("user_id") or 0)
-            risk = float(row.get("crimes_committed") or 0) * 2 + float(row.get("tax_debt") or 0) / 1000
             name = _display_user(row)
-            lines.append(
-                f"#{sid} {_md(name)}\n"
-                f"Риск: {risk:.1f} | Преступления: {int(row.get('crimes_committed') or 0)} | "
-                f"Налоговый долг: ${float(row.get('tax_debt') or 0):,.0f}"
+            if sid <= 0:
+                continue
+            status = await db.get_security_investigation_status(
+                actor_id=callback.from_user.id,
+                target_id=sid,
+                agency="police",
             )
+            access = bool(status.get("access_granted"))
+            if access:
+                risk = float(row.get("crimes_committed") or 0) * 2 + float(row.get("tax_debt") or 0) / 1000
+                lines.append(
+                    f"#{sid} {_md(name)}\n"
+                    f"Риск: {risk:.1f} | Преступления: {int(row.get('crimes_committed') or 0)} | "
+                    f"Налоговый долг: ${float(row.get('tax_debt') or 0):,.0f}\n"
+                    "Досье: доступ открыт"
+                )
+                keyboard_rows.append(
+                    [InlineKeyboardButton(text=f"⛓️ Арест #{sid}", callback_data=f"fp_police_arrest_pick_{sid}_{safe_page}")]
+                )
+            else:
+                state_code = str(status.get("status") or "none")
+                if state_code == "pending":
+                    wait = _format_security_wait(int(status.get("remaining_seconds") or 0))
+                    lines.append(
+                        f"#{sid} {_md(name)}\n"
+                        f"Досье: расследование в работе ({wait})"
+                    )
+                    keyboard_rows.append(
+                        [
+                            InlineKeyboardButton(
+                                text=f"⏳ Проверить досье #{sid}",
+                                callback_data=f"fp_police_invest_check_{sid}_{safe_page}_arrest",
+                            )
+                        ]
+                    )
+                else:
+                    price = float(status.get("cost") or 0.0)
+                    lines.append(
+                        f"#{sid} {_md(name)}\n"
+                        f"Досье: закрыто (расследование от ${price:,.0f})"
+                    )
+                    keyboard_rows.append(
+                        [
+                            InlineKeyboardButton(
+                                text=f"🕵️ Расследовать #{sid}",
+                                callback_data=f"fp_police_invest_start_{sid}_{safe_page}_arrest",
+                            )
+                        ]
+                    )
             lines.append("")
-            keyboard_rows.append([InlineKeyboardButton(text=f"⛓️ Арест #{sid}", callback_data=f"fp_police_arrest_pick_{sid}_{safe_page}")])
 
     nav_row: list[InlineKeyboardButton] = []
     if safe_page > 0:
@@ -5399,6 +8488,39 @@ async def feature_police_arrest_pick(callback: CallbackQuery, state: FSMContext)
         return
     sid = int(sid_raw)
     page = int(page_raw) if page_raw.lstrip("-").isdigit() else 0
+    status = await db.get_security_investigation_status(
+        actor_id=callback.from_user.id,
+        target_id=sid,
+        agency="police",
+    )
+    if not bool(status.get("access_granted")):
+        st = str(status.get("status") or "none")
+        if st == "pending":
+            wait = _format_security_wait(int(status.get("remaining_seconds") or 0))
+            text = (
+                f"⏳ По игроку #{sid} расследование еще идет.\n"
+                f"Осталось: {wait}."
+            )
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🔄 Проверить", callback_data=f"fp_police_invest_check_{sid}_{page}_arrest")],
+                    [InlineKeyboardButton(text="🔙 Назад", callback_data=f"fp_police_arrest_page_{page}")],
+                ]
+            )
+        else:
+            price = float(status.get("cost") or 0.0)
+            text = (
+                f"🔒 Арест игрока #{sid} заблокирован.\n"
+                f"Сначала запустите расследование (стоимость от ${price:,.0f})."
+            )
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🕵️ Запустить расследование", callback_data=f"fp_police_invest_start_{sid}_{page}_arrest")],
+                    [InlineKeyboardButton(text="🔙 Назад", callback_data=f"fp_police_arrest_page_{page}")],
+                ]
+            )
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode=None)
+        return
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="💰 Уклонение от налогов", callback_data=f"fp_police_arrest_do_{sid}_tax_{page}")],
@@ -5426,6 +8548,18 @@ async def feature_police_arrest_do(callback: CallbackQuery, state: FSMContext):
     suspect_id = int(parts[0])
     code = parts[1]
     page = int(parts[2]) if len(parts) > 2 and parts[2].lstrip("-").isdigit() else 0
+    status = await db.get_security_investigation_status(
+        actor_id=callback.from_user.id,
+        target_id=suspect_id,
+        agency="police",
+    )
+    if not bool(status.get("access_granted")):
+        await callback.message.answer(
+            "❌ Арест недоступен: сначала завершите расследование по цели.",
+            parse_mode=None,
+        )
+        await _render_police_arrest_picker(callback, page=page)
+        return
     templates = {
         "tax": ("Уклонение от налогов", 4500, 180),
         "fraud": ("Финансовое мошенничество", 7000, 240),
@@ -5477,16 +8611,26 @@ async def feature_police_investigations(callback: CallbackQuery, state: FSMConte
     rows = await db.get_active_investigations(officer_id=callback.from_user.id, limit=20)
     lines = ["📋 **РАССЛЕДОВАНИЯ**", "━━━━━━━━━━━━━━━━━━━━", ""]
     if not rows:
-        lines.append("Активных расследований нет.")
+        lines.append("Расследований пока нет.")
     else:
         for row in rows:
             created = str(row.get("created_date") or "")[:16]
-            lines.append(
-                f"[{created}] Арест #{int(row.get('arrest_id') or 0)} | "
-                f"Подозреваемый: {row.get('suspect_name')}\n"
-                f"Дело #{int(row.get('case_id') or 0)} | статус: {row.get('case_status') or 'open'}\n"
-                f"Основание: {row.get('reason')}"
+            status = str(row.get("status") or "pending")
+            label = {
+                "pending": "⏳ в работе",
+                "completed": "✅ доступ открыт",
+                "expired": "♻️ истекло",
+            }.get(status, status)
+            line = (
+                f"[{created}] #{int(row.get('investigation_id') or 0)} | "
+                f"Цель: {row.get('suspect_name')}\n"
+                f"Статус: {label} | Стоимость: ${float(row.get('cost') or 0):,.0f}"
             )
+            if status == "pending":
+                line += f"\nДо готовности: {_format_security_wait(int(row.get('remaining_seconds') or 0))}"
+            if status == "completed":
+                line += f"\nДоступ до: {str(row.get('access_expires_at') or '')[:16]}"
+            lines.append(line)
             lines.append("")
     await callback.message.edit_text(
         "\n".join(lines),
@@ -5521,6 +8665,7 @@ async def _render_police_penalty_menu(callback: CallbackQuery, page: int = 0):
 
     lines = ["⚖️ **ПОЛИЦИЯ: НАКАЗАНИЯ**", "━━━━━━━━━━━━━━━━━━━━", ""]
     lines.append(f"Страница: {safe_page + 1}/{max_page + 1} | Всего игроков: {total}")
+    lines.append("Санкции доступны только после завершения расследования цели.")
     lines.append("")
     keyboard_rows = []
     if not players:
@@ -5530,14 +8675,52 @@ async def _render_police_penalty_menu(callback: CallbackQuery, page: int = 0):
             sid = int(row.get("user_id") or 0)
             if sid <= 0:
                 continue
-            lines.append(
-                f"#{sid} {_md(_display_user(row))} | "
-                f"Реп: {float(row.get('reputation') or 0):.1f} | "
-                f"Долг: ${float(row.get('tax_debt') or 0):,.0f}"
+            status = await db.get_security_investigation_status(
+                actor_id=callback.from_user.id,
+                target_id=sid,
+                agency="police",
             )
-            keyboard_rows.append(
-                [InlineKeyboardButton(text=f"⚖️ Наказать #{sid}", callback_data=f"fp_police_penalty_pick_{sid}_{safe_page}")]
-            )
+            access = bool(status.get("access_granted"))
+            if access:
+                lines.append(
+                    f"#{sid} {_md(_display_user(row))} | "
+                    f"Реп: {float(row.get('reputation') or 0):.1f} | "
+                    f"Долг: ${float(row.get('tax_debt') or 0):,.0f}\n"
+                    "Досье: доступ открыт"
+                )
+                keyboard_rows.append(
+                    [InlineKeyboardButton(text=f"⚖️ Наказать #{sid}", callback_data=f"fp_police_penalty_pick_{sid}_{safe_page}")]
+                )
+            else:
+                state_code = str(status.get("status") or "none")
+                if state_code == "pending":
+                    wait = _format_security_wait(int(status.get("remaining_seconds") or 0))
+                    lines.append(
+                        f"#{sid} {_md(_display_user(row))}\n"
+                        f"Досье: расследование в работе ({wait})"
+                    )
+                    keyboard_rows.append(
+                        [
+                            InlineKeyboardButton(
+                                text=f"⏳ Проверить досье #{sid}",
+                                callback_data=f"fp_police_invest_check_{sid}_{safe_page}_penalty",
+                            )
+                        ]
+                    )
+                else:
+                    price = float(status.get("cost") or 0.0)
+                    lines.append(
+                        f"#{sid} {_md(_display_user(row))}\n"
+                        f"Досье: закрыто (расследование от ${price:,.0f})"
+                    )
+                    keyboard_rows.append(
+                        [
+                            InlineKeyboardButton(
+                                text=f"🕵️ Расследовать #{sid}",
+                                callback_data=f"fp_police_invest_start_{sid}_{safe_page}_penalty",
+                            )
+                        ]
+                    )
 
     nav_row: list[InlineKeyboardButton] = []
     if safe_page > 0:
@@ -5578,6 +8761,39 @@ async def feature_police_penalty_pick(callback: CallbackQuery, state: FSMContext
         return
     sid = int(sid_raw)
     page = int(page_raw) if page_raw.lstrip("-").isdigit() else 0
+    status = await db.get_security_investigation_status(
+        actor_id=callback.from_user.id,
+        target_id=sid,
+        agency="police",
+    )
+    if not bool(status.get("access_granted")):
+        st = str(status.get("status") or "none")
+        if st == "pending":
+            wait = _format_security_wait(int(status.get("remaining_seconds") or 0))
+            text = (
+                f"⏳ По игроку #{sid} расследование еще идет.\n"
+                f"Осталось: {wait}."
+            )
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🔄 Проверить", callback_data=f"fp_police_invest_check_{sid}_{page}_penalty")],
+                    [InlineKeyboardButton(text="🔙 Назад", callback_data=f"fp_police_penalty_page_{page}")],
+                ]
+            )
+        else:
+            price = float(status.get("cost") or 0.0)
+            text = (
+                f"🔒 Наказания для игрока #{sid} заблокированы.\n"
+                f"Сначала запустите расследование (стоимость от ${price:,.0f})."
+            )
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🕵️ Запустить расследование", callback_data=f"fp_police_invest_start_{sid}_{page}_penalty")],
+                    [InlineKeyboardButton(text="🔙 Назад", callback_data=f"fp_police_penalty_page_{page}")],
+                ]
+            )
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode=None)
+        return
     text = (
         f"⚖️ Наказания полиции для игрока #{sid}\n"
         "Выберите формат санкции:"
@@ -5586,7 +8802,7 @@ async def feature_police_penalty_pick(callback: CallbackQuery, state: FSMContext
         inline_keyboard=[
             [InlineKeyboardButton(text="🟨 Предупреждение", callback_data=f"fp_police_penalty_do_{sid}_warn_{page}")],
             [InlineKeyboardButton(text="💸 Штраф", callback_data=f"fp_police_penalty_do_{sid}_fine_{page}")],
-            [InlineKeyboardButton(text="⛔ Ограничение 30м", callback_data=f"fp_police_penalty_do_{sid}_restrict_{page}")],
+            [InlineKeyboardButton(text="⛔ Ограничение 20м", callback_data=f"fp_police_penalty_do_{sid}_restrict_{page}")],
             [InlineKeyboardButton(text="📢 Публичное постановление", callback_data=f"fp_police_penalty_do_{sid}_public_{page}")],
             [InlineKeyboardButton(text="🔙 Назад", callback_data=f"fp_police_penalty_page_{page}")],
         ]
@@ -5605,13 +8821,25 @@ async def feature_police_penalty_do(callback: CallbackQuery, state: FSMContext):
     target_id = int(parts[0])
     code = parts[1].strip().lower()
     page = int(parts[2]) if len(parts) > 2 and parts[2].lstrip("-").isdigit() else 0
+    status = await db.get_security_investigation_status(
+        actor_id=callback.from_user.id,
+        target_id=target_id,
+        agency="police",
+    )
+    if not bool(status.get("access_granted")):
+        await callback.message.answer(
+            "❌ Наказание недоступно: сначала завершите расследование по цели.",
+            parse_mode=None,
+        )
+        await _render_police_penalty_menu(callback, page=page)
+        return
 
     templates = {
         "warn": {
             "reason": "Письменное предупреждение полиции",
             "fine": 0.0,
             "ban": 0,
-            "rep": -3.0,
+            "rep": -1.5,
             "tax": 0.0,
             "corr": 0,
             "seize": 0.0,
@@ -5619,9 +8847,9 @@ async def feature_police_penalty_do(callback: CallbackQuery, state: FSMContext):
         },
         "fine": {
             "reason": "Административный штраф полиции",
-            "fine": 140.0,
+            "fine": 90.0,
             "ban": 0,
-            "rep": -4.0,
+            "rep": -2.5,
             "tax": 0.0,
             "corr": 0,
             "seize": 0.0,
@@ -5629,20 +8857,20 @@ async def feature_police_penalty_do(callback: CallbackQuery, state: FSMContext):
         },
         "restrict": {
             "reason": "Ограничение действий по постановлению полиции",
-            "fine": 80.0,
-            "ban": 30,
-            "rep": -6.0,
-            "tax": 20.0,
+            "fine": 60.0,
+            "ban": 20,
+            "rep": -3.5,
+            "tax": 10.0,
             "corr": 1,
             "seize": 0.0,
             "public": False,
         },
         "public": {
             "reason": "Публичное постановление полиции",
-            "fine": 90.0,
-            "ban": 45,
-            "rep": -7.0,
-            "tax": 35.0,
+            "fine": 70.0,
+            "ban": 30,
+            "rep": -4.5,
+            "tax": 18.0,
             "corr": 1,
             "seize": 0.0,
             "public": True,
@@ -5680,6 +8908,67 @@ async def feature_police_penalty_do(callback: CallbackQuery, state: FSMContext):
     await _render_police_penalty_menu(callback, page=page)
 
 
+def _parse_fbi_investigation_callback(data: str) -> tuple[int, int, str]:
+    tail = str(data or "").replace("fp_fbi_invest_start_", "").replace("fp_fbi_invest_check_", "")
+    parts = tail.split("_")
+    target_raw = parts[0] if parts else ""
+    page_raw = parts[1] if len(parts) > 1 else "0"
+    context = parts[2] if len(parts) > 2 else "penalty"
+    target_id = int(target_raw) if target_raw.isdigit() else 0
+    page = int(page_raw) if page_raw.lstrip("-").isdigit() else 0
+    context = context if context in {"penalty"} else "penalty"
+    return target_id, page, context
+
+
+@router.callback_query(F.data.startswith("fp_fbi_invest_start_"))
+async def feature_fbi_investigation_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    target_id, page, _ = _parse_fbi_investigation_callback(callback.data or "")
+    if target_id <= 0:
+        await callback.answer("Некорректная цель расследования.", show_alert=True)
+        return
+    ok, msg, payload = await db.start_security_investigation(
+        actor_id=callback.from_user.id,
+        target_id=target_id,
+        agency="fbi",
+    )
+    info = payload or {}
+    if ok:
+        ready_at = str(info.get("ready_at") or "")[:16]
+        await callback.message.answer(f"✅ {msg}\nГотово примерно в: {ready_at}", parse_mode=None)
+    else:
+        if int(info.get("remaining_seconds") or 0) > 0:
+            wait = _format_security_wait(int(info.get("remaining_seconds") or 0))
+            await callback.message.answer(f"⏳ {msg}\nОсталось: {wait}", parse_mode=None)
+        else:
+            await callback.message.answer(f"❌ {msg}", parse_mode=None)
+    await _render_fbi_penalty_menu(callback, page=page)
+
+
+@router.callback_query(F.data.startswith("fp_fbi_invest_check_"))
+async def feature_fbi_investigation_check(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    target_id, page, _ = _parse_fbi_investigation_callback(callback.data or "")
+    if target_id <= 0:
+        await callback.answer("Некорректная цель расследования.", show_alert=True)
+        return
+    status = await db.get_security_investigation_status(
+        actor_id=callback.from_user.id,
+        target_id=target_id,
+        agency="fbi",
+    )
+    if bool(status.get("access_granted")):
+        await callback.message.answer("✅ Досье ФБР готово. Доступ открыт.", parse_mode=None)
+    else:
+        st = str(status.get("status") or "none")
+        if st == "pending":
+            wait = _format_security_wait(int(status.get("remaining_seconds") or 0))
+            await callback.message.answer(f"⏳ Расследование ФБР еще идет. Осталось: {wait}.", parse_mode=None)
+        else:
+            await callback.message.answer("ℹ️ Досье закрыто. Запустите новое расследование.", parse_mode=None)
+    await _render_fbi_penalty_menu(callback, page=page)
+
+
 @router.callback_query(F.data == "fbi_penalty_menu")
 async def feature_fbi_penalty_menu(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
@@ -5707,6 +8996,7 @@ async def _render_fbi_penalty_menu(callback: CallbackQuery, page: int = 0):
 
     lines = ["🛡 **ФБР: САНКЦИИ**", "━━━━━━━━━━━━━━━━━━━━", ""]
     lines.append(f"Страница: {safe_page + 1}/{max_page + 1} | Всего игроков: {total}")
+    lines.append("Санкции и финансовые данные доступны только после расследования ФБР.")
     lines.append("")
     keyboard_rows = []
     if not players:
@@ -5716,14 +9006,46 @@ async def _render_fbi_penalty_menu(callback: CallbackQuery, page: int = 0):
             pid = int(row.get("user_id") or 0)
             if pid <= 0:
                 continue
-            lines.append(
-                f"#{pid} {_md(_display_user(row))} | "
-                f"Баланс: ${float(row.get('balance') or 0):,.0f} | "
-                f"Тень: ${float(row.get('shadow_balance') or 0):,.0f}"
+            status = await db.get_security_investigation_status(
+                actor_id=callback.from_user.id,
+                target_id=pid,
+                agency="fbi",
             )
-            keyboard_rows.append(
-                [InlineKeyboardButton(text=f"🛡 Санкции #{pid}", callback_data=f"fp_fbi_penalty_pick_{pid}_{safe_page}")]
-            )
+            access = bool(status.get("access_granted"))
+            if access:
+                lines.append(
+                    f"#{pid} {_md(_display_user(row))} | "
+                    f"Баланс: ${float(row.get('balance') or 0):,.0f} | "
+                    f"Тень: ${float(row.get('shadow_balance') or 0):,.0f}\n"
+                    "Досье: доступ открыт"
+                )
+                keyboard_rows.append(
+                    [InlineKeyboardButton(text=f"🛡 Санкции #{pid}", callback_data=f"fp_fbi_penalty_pick_{pid}_{safe_page}")]
+                )
+            else:
+                state_code = str(status.get("status") or "none")
+                if state_code == "pending":
+                    wait = _format_security_wait(int(status.get("remaining_seconds") or 0))
+                    lines.append(f"#{pid} {_md(_display_user(row))}\nДосье: расследование в работе ({wait})")
+                    keyboard_rows.append(
+                        [
+                            InlineKeyboardButton(
+                                text=f"⏳ Проверить досье #{pid}",
+                                callback_data=f"fp_fbi_invest_check_{pid}_{safe_page}_penalty",
+                            )
+                        ]
+                    )
+                else:
+                    price = float(status.get("cost") or 0.0)
+                    lines.append(f"#{pid} {_md(_display_user(row))}\nДосье: закрыто (расследование от ${price:,.0f})")
+                    keyboard_rows.append(
+                        [
+                            InlineKeyboardButton(
+                                text=f"🕵️ Расследовать #{pid}",
+                                callback_data=f"fp_fbi_invest_start_{pid}_{safe_page}_penalty",
+                            )
+                        ]
+                    )
 
     nav_row: list[InlineKeyboardButton] = []
     if safe_page > 0:
@@ -5764,6 +9086,39 @@ async def feature_fbi_penalty_pick(callback: CallbackQuery, state: FSMContext):
         return
     sid = int(sid_raw)
     page = int(page_raw) if page_raw.lstrip("-").isdigit() else 0
+    status = await db.get_security_investigation_status(
+        actor_id=callback.from_user.id,
+        target_id=sid,
+        agency="fbi",
+    )
+    if not bool(status.get("access_granted")):
+        st = str(status.get("status") or "none")
+        if st == "pending":
+            wait = _format_security_wait(int(status.get("remaining_seconds") or 0))
+            text = (
+                f"⏳ По игроку #{sid} расследование ФБР еще идет.\n"
+                f"Осталось: {wait}."
+            )
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🔄 Проверить", callback_data=f"fp_fbi_invest_check_{sid}_{page}_penalty")],
+                    [InlineKeyboardButton(text="🔙 Назад", callback_data=f"fp_fbi_penalty_page_{page}")],
+                ]
+            )
+        else:
+            price = float(status.get("cost") or 0.0)
+            text = (
+                f"🔒 Санкции ФБР для игрока #{sid} заблокированы.\n"
+                f"Сначала запустите расследование (стоимость от ${price:,.0f})."
+            )
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🕵️ Запустить расследование", callback_data=f"fp_fbi_invest_start_{sid}_{page}_penalty")],
+                    [InlineKeyboardButton(text="🔙 Назад", callback_data=f"fp_fbi_penalty_page_{page}")],
+                ]
+            )
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode=None)
+        return
     text = (
         f"🛡 Санкции ФБР для игрока #{sid}\n"
         "Выберите формат санкции:"
@@ -5791,46 +9146,58 @@ async def feature_fbi_penalty_do(callback: CallbackQuery, state: FSMContext):
     target_id = int(parts[0])
     code = parts[1].strip().lower()
     page = int(parts[2]) if len(parts) > 2 and parts[2].lstrip("-").isdigit() else 0
+    status = await db.get_security_investigation_status(
+        actor_id=callback.from_user.id,
+        target_id=target_id,
+        agency="fbi",
+    )
+    if not bool(status.get("access_granted")):
+        await callback.message.answer(
+            "❌ Санкция недоступна: сначала завершите расследование ФБР по цели.",
+            parse_mode=None,
+        )
+        await _render_fbi_penalty_menu(callback, page=page)
+        return
 
     templates = {
         "freeze": {
             "reason": "Временная заморозка активов по линии ФБР",
-            "fine": 70.0,
-            "ban": 60,
-            "rep": -8.0,
-            "tax": 40.0,
+            "fine": 50.0,
+            "ban": 35,
+            "rep": -5.0,
+            "tax": 20.0,
             "corr": 2,
-            "seize": 0.18,
+            "seize": 0.1,
             "public": False,
         },
         "sanction": {
             "reason": "Финансовые санкции ФБР",
-            "fine": 180.0,
-            "ban": 120,
-            "rep": -12.0,
-            "tax": 80.0,
+            "fine": 110.0,
+            "ban": 45,
+            "rep": -7.0,
+            "tax": 35.0,
             "corr": 3,
             "seize": 0.0,
             "public": False,
         },
         "blackmail": {
             "reason": "Оперативное давление и шантаж ФБР",
-            "fine": 220.0,
-            "ban": 180,
-            "rep": -14.0,
-            "tax": 100.0,
+            "fine": 140.0,
+            "ban": 60,
+            "rep": -8.0,
+            "tax": 45.0,
             "corr": 4,
-            "seize": 0.12,
+            "seize": 0.07,
             "public": False,
         },
         "public": {
             "reason": "Публичное разоблачение ФБР",
-            "fine": 120.0,
-            "ban": 90,
-            "rep": -16.0,
-            "tax": 120.0,
+            "fine": 90.0,
+            "ban": 50,
+            "rep": -9.0,
+            "tax": 55.0,
             "corr": 3,
-            "seize": 0.05,
+            "seize": 0.03,
             "public": True,
         },
     }
@@ -5870,12 +9237,171 @@ async def feature_fbi_penalty_do(callback: CallbackQuery, state: FSMContext):
 # Court handlers
 # ---------------------------------------------------------------------------
 
+COURT_PICK_PAGE_SIZE = 12
+
+
+async def _render_court_defendant_picker(callback: CallbackQuery, page: int = 0) -> None:
+    safe_page = max(0, int(page or 0))
+    offset = safe_page * COURT_PICK_PAGE_SIZE
+    total = await db.count_players(exclude_user_id=callback.from_user.id)
+    pages = max(1, (total + COURT_PICK_PAGE_SIZE - 1) // COURT_PICK_PAGE_SIZE)
+    safe_page = min(safe_page, pages - 1)
+    offset = safe_page * COURT_PICK_PAGE_SIZE
+    players = await db.get_players_page(
+        limit=COURT_PICK_PAGE_SIZE,
+        offset=offset,
+        exclude_user_id=callback.from_user.id,
+    )
+
+    lines = [
+        "📝 ПОДАЧА ИСКА",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "Выберите ответчика:",
+        f"Страница {safe_page + 1}/{pages}",
+        "",
+    ]
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+    if not players:
+        lines.append("Нет доступных игроков.")
+    else:
+        for player in players:
+            target_id = int(player.get("user_id") or 0)
+            if target_id <= 0:
+                continue
+            keyboard_rows.append(
+                [InlineKeyboardButton(text=f"👤 {_display_user(player)}", callback_data=f"fp_court_file_def_{target_id}_{safe_page}")]
+            )
+
+    nav: list[InlineKeyboardButton] = []
+    if safe_page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"fp_court_file_page_{safe_page - 1}"))
+    if safe_page + 1 < pages:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"fp_court_file_page_{safe_page + 1}"))
+    if nav:
+        keyboard_rows.append(nav)
+    keyboard_rows.append([InlineKeyboardButton(text="🔙 В суд", callback_data="court_menu")])
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+        parse_mode=None,
+    )
+
+
+@router.callback_query(F.data == "fp_court_file_start")
+@router.callback_query(F.data.startswith("fp_court_file_page_"))
+async def feature_court_file_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    page = 0
+    if (callback.data or "").startswith("fp_court_file_page_"):
+        raw = (callback.data or "").replace("fp_court_file_page_", "")
+        if raw.isdigit():
+            page = int(raw)
+    await state.clear()
+    await _render_court_defendant_picker(callback, page=page)
+
+
+@router.callback_query(F.data.startswith("fp_court_file_def_"))
+async def feature_court_file_pick_defendant(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    parts = (callback.data or "").split("_")
+    if len(parts) < 6 or not parts[4].isdigit():
+        await callback.answer("Некорректный ответчик.", show_alert=True)
+        return
+    defendant_id = int(parts[4])
+    if defendant_id == callback.from_user.id:
+        await callback.answer("Нельзя подать иск на самого себя.", show_alert=True)
+        return
+    defendant = await db.get_user(defendant_id)
+    if not defendant:
+        await callback.answer("Игрок не найден.", show_alert=True)
+        return
+
+    await state.set_state(FeatureStates.court_case_text)
+    await state.update_data(court_defendant_id=defendant_id)
+    text = (
+        "📝 ПОДАЧА ИСКА\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"Ответчик: {_display_user(defendant)}\n\n"
+        "Отправьте иск в формате:\n"
+        "Название | Описание | Штраф\n\n"
+        "Пример:\n"
+        "Нарушение договора | Не вернул долг в срок | 12000"
+    )
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="👥 Сменить ответчика", callback_data="fp_court_file_start")],
+                [InlineKeyboardButton(text="🔙 В суд", callback_data="court_menu")],
+            ]
+        ),
+        parse_mode=None,
+    )
+
+
+@router.message(FeatureStates.court_case_text, F.text, ~F.text.startswith("/"))
+async def feature_court_file_submit(message: Message, state: FSMContext):
+    data = await state.get_data()
+    defendant_id = int(data.get("court_defendant_id") or 0)
+    if defendant_id <= 0:
+        await state.clear()
+        await message.answer("❌ Сессия подачи иска устарела.", reply_markup=_back("court_menu"), parse_mode=None)
+        return
+
+    raw_text = " ".join((message.text or "").strip().split())
+    parts = [p.strip() for p in raw_text.split("|")]
+    title = parts[0] if parts else ""
+    description = parts[1] if len(parts) > 1 else raw_text
+    requested_penalty = 0.0
+    if len(parts) > 2:
+        parsed_penalty = _parse_amount(parts[2])
+        if parsed_penalty is not None:
+            requested_penalty = max(0.0, min(float(parsed_penalty), 10_000_000.0))
+    if not title:
+        title = "Гражданский иск"
+    if len(description) < 6:
+        await message.answer("❌ Добавьте более подробное описание иска (минимум 6 символов).", parse_mode=None)
+        return
+
+    ok, msg, payload = await db.create_court_case(
+        filed_by_id=message.from_user.id,
+        defendant_id=defendant_id,
+        title=title,
+        description=description,
+        requested_penalty=requested_penalty,
+    )
+    await state.clear()
+    if not ok:
+        await message.answer(f"❌ {msg}", reply_markup=_back("court_menu"), parse_mode=None)
+        return
+    case_id = int((payload or {}).get("case_id") or 0)
+    await message.answer(
+        f"✅ {msg}\nНомер дела: #{case_id}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=f"ℹ️ Открыть дело #{case_id}", callback_data=f"fp_court_view_{case_id}")],
+                [InlineKeyboardButton(text="🔙 В суд", callback_data="court_menu")],
+            ]
+        ),
+        parse_mode=None,
+    )
+
 @router.callback_query(F.data == "court_cases")
 async def feature_court_cases(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     user = await db.get_user(callback.from_user.id) or {}
     is_judge = await _is_judge_actor(callback.from_user.id, user)
-    rows = await db.get_court_cases(limit=25) if is_judge else await db.get_court_cases(defendant_id=callback.from_user.id, limit=25)
+    if is_judge:
+        rows = await db.get_court_cases(limit=25)
+    else:
+        defendant_rows = await db.get_court_cases(defendant_id=callback.from_user.id, limit=25)
+        filed_rows = await db.get_court_cases(filed_by_id=callback.from_user.id, limit=25)
+        merged: dict[int, dict] = {}
+        for row in defendant_rows + filed_rows:
+            case_id = int(row.get("id") or 0)
+            if case_id > 0:
+                merged[case_id] = row
+        rows = sorted(merged.values(), key=lambda x: str(x.get("updated_date") or ""), reverse=True)[:25]
 
     lines = ["⚖️ **ДЕЛА В СУДЕ**", "━━━━━━━━━━━━━━━━━━━━", ""]
     keyboard_rows = []
@@ -5892,10 +9418,13 @@ async def feature_court_cases(callback: CallbackQuery, state: FSMContext):
                 f"{_md(str(row.get('title') or 'Без названия'))}"
             )
             lines.append("")
+            if len(keyboard_rows) < 12:
+                keyboard_rows.append([InlineKeyboardButton(text=f"ℹ️ Дело #{case_id}", callback_data=f"fp_court_view_{case_id}")])
             if is_judge and str(row.get("status") or "") in {"open", "hearing"} and len(keyboard_rows) < 10:
                 keyboard_rows.append([InlineKeyboardButton(text=f"🕒 Слушание #{case_id}", callback_data=f"fp_court_hearing_{case_id}")])
                 keyboard_rows.append([InlineKeyboardButton(text=f"✅ Закрыть #{case_id}", callback_data=f"fp_court_close_{case_id}")])
                 keyboard_rows.append([InlineKeyboardButton(text=f"🛑 Отклонить #{case_id}", callback_data=f"fp_court_dismiss_{case_id}")])
+    keyboard_rows.insert(0, [InlineKeyboardButton(text="📝 Подать иск", callback_data="fp_court_file_start")])
     keyboard_rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="court_cases")])
     keyboard_rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="court_menu")])
     await callback.message.edit_text(
@@ -6052,6 +9581,178 @@ async def feature_court_status(callback: CallbackQuery, state: FSMContext):
     )
 
 
+@router.callback_query(F.data.startswith("fp_court_view_"))
+async def feature_court_case_view(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    raw = (callback.data or "").replace("fp_court_view_", "")
+    if not raw.isdigit():
+        await callback.answer("Некорректный номер дела.", show_alert=True)
+        return
+    case_id = int(raw)
+    case_row = await db.get_court_case_by_id(case_id)
+    if not case_row:
+        await callback.answer("Дело не найдено.", show_alert=True)
+        return
+
+    user = await db.get_user(callback.from_user.id) or {}
+    is_judge = await _is_judge_actor(callback.from_user.id, user)
+    is_party = callback.from_user.id in {
+        int(case_row.get("filed_by_id") or 0),
+        int(case_row.get("defendant_id") or 0),
+    }
+    authority = await db.get_government_authority(callback.from_user.id)
+    if not (is_judge or is_party or authority == "president"):
+        await callback.answer("Нет доступа к делу.", show_alert=True)
+        return
+
+    evidence = await db.get_court_case_evidence(case_id, viewer_id=callback.from_user.id, limit=8)
+    events = await db.get_court_case_events(case_id, limit=8)
+    lines = [
+        f"⚖️ ДЕЛО #{case_id}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Статус: {str(case_row.get('status') or '').upper()}",
+        f"Истец: {case_row.get('filed_by_name')}",
+        f"Ответчик: {case_row.get('defendant_name')}",
+        f"Судья: {case_row.get('judge_name') or 'не назначен'}",
+        f"Иск: ${float(case_row.get('requested_penalty') or 0):,.2f}",
+        f"Назначенный штраф: ${float(case_row.get('imposed_penalty') or 0):,.2f}",
+        "",
+        f"Тема: {case_row.get('title')}",
+        f"Описание: {str(case_row.get('description') or '')[:420]}",
+        "",
+        f"Доказательств: {len(evidence)}",
+        f"Событий: {len(events)}",
+    ]
+    if evidence:
+        lines.append("")
+        lines.append("Последние доказательства:")
+        for ev in evidence[:3]:
+            lines.append(f"• {ev.get('author_name')}: {str(ev.get('content') or '')[:70]}")
+    if events:
+        lines.append("")
+        lines.append("Последние события:")
+        for ev in events[:3]:
+            created = str(ev.get("created_date") or "")[11:16]
+            lines.append(f"• [{created}] {ev.get('event_text')}")
+
+    keyboard_rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="📎 Добавить доказательство", callback_data=f"fp_court_add_evidence_{case_id}")]
+    ]
+    status_lc = str(case_row.get("status") or "").lower()
+    if status_lc in {"closed", "dismissed"} and is_party:
+        keyboard_rows.append([InlineKeyboardButton(text="📤 Подать апелляцию", callback_data=f"fp_court_appeal_{case_id}")])
+    if is_judge and status_lc in {"open", "hearing"}:
+        keyboard_rows.append([InlineKeyboardButton(text="🕒 Назначить слушание", callback_data=f"fp_court_hearing_{case_id}")])
+        keyboard_rows.append([InlineKeyboardButton(text="✅ Закрыть дело", callback_data=f"fp_court_close_{case_id}")])
+        keyboard_rows.append([InlineKeyboardButton(text="🛑 Отклонить дело", callback_data=f"fp_court_dismiss_{case_id}")])
+    keyboard_rows.append([InlineKeyboardButton(text="🔙 К делам", callback_data="court_cases")])
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+        parse_mode=None,
+    )
+
+
+@router.callback_query(F.data.startswith("fp_court_add_evidence_"))
+async def feature_court_add_evidence_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    raw = (callback.data or "").replace("fp_court_add_evidence_", "")
+    if not raw.isdigit():
+        await callback.answer("Некорректное дело.", show_alert=True)
+        return
+    case_id = int(raw)
+    case_row = await db.get_court_case_by_id(case_id)
+    if not case_row:
+        await callback.answer("Дело не найдено.", show_alert=True)
+        return
+    await state.set_state(FeatureStates.court_evidence_text)
+    await state.update_data(court_evidence_case_id=case_id)
+    await callback.message.edit_text(
+        f"📎 Добавление доказательства в дело #{case_id}\n\nОтправьте текст доказательства одним сообщением.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 К делу", callback_data=f"fp_court_view_{case_id}")],
+                [InlineKeyboardButton(text="🔙 В суд", callback_data="court_menu")],
+            ]
+        ),
+        parse_mode=None,
+    )
+
+
+@router.message(FeatureStates.court_evidence_text, F.text, ~F.text.startswith("/"))
+async def feature_court_add_evidence_submit(message: Message, state: FSMContext):
+    data = await state.get_data()
+    case_id = int(data.get("court_evidence_case_id") or 0)
+    if case_id <= 0:
+        await state.clear()
+        await message.answer("❌ Сессия добавления доказательства устарела.", reply_markup=_back("court_menu"), parse_mode=None)
+        return
+    ok, msg, _ = await db.add_court_case_evidence(
+        actor_id=message.from_user.id,
+        case_id=case_id,
+        evidence_text=message.text or "",
+        evidence_type="statement",
+    )
+    await state.clear()
+    await message.answer(
+        ("✅ " if ok else "❌ ") + msg,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=f"ℹ️ Открыть дело #{case_id}", callback_data=f"fp_court_view_{case_id}")],
+                [InlineKeyboardButton(text="🔙 В суд", callback_data="court_menu")],
+            ]
+        ),
+        parse_mode=None,
+    )
+
+
+@router.callback_query(F.data.startswith("fp_court_appeal_"))
+async def feature_court_appeal_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    raw = (callback.data or "").replace("fp_court_appeal_", "")
+    if not raw.isdigit():
+        await callback.answer("Некорректное дело.", show_alert=True)
+        return
+    case_id = int(raw)
+    await state.set_state(FeatureStates.court_appeal_reason)
+    await state.update_data(court_appeal_case_id=case_id)
+    await callback.message.edit_text(
+        f"📤 Апелляция по делу #{case_id}\n\nОпишите причину апелляции (минимум 12 символов).",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=f"🔙 К делу #{case_id}", callback_data=f"fp_court_view_{case_id}")],
+                [InlineKeyboardButton(text="🔙 В суд", callback_data="court_menu")],
+            ]
+        ),
+        parse_mode=None,
+    )
+
+
+@router.message(FeatureStates.court_appeal_reason, F.text, ~F.text.startswith("/"))
+async def feature_court_appeal_submit(message: Message, state: FSMContext):
+    data = await state.get_data()
+    case_id = int(data.get("court_appeal_case_id") or 0)
+    if case_id <= 0:
+        await state.clear()
+        await message.answer("❌ Сессия апелляции устарела.", reply_markup=_back("court_menu"), parse_mode=None)
+        return
+    ok, msg, payload = await db.file_court_appeal(
+        actor_id=message.from_user.id,
+        case_id=case_id,
+        reason=message.text or "",
+    )
+    await state.clear()
+    appeal_case_id = int((payload or {}).get("appeal_case_id") or 0)
+    keyboard_rows = [[InlineKeyboardButton(text="🔙 В суд", callback_data="court_menu")]]
+    if appeal_case_id > 0:
+        keyboard_rows.insert(0, [InlineKeyboardButton(text=f"ℹ️ Апелляция #{appeal_case_id}", callback_data=f"fp_court_view_{appeal_case_id}")])
+    await message.answer(
+        ("✅ " if ok else "❌ ") + msg,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+        parse_mode=None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Organization management handlers
 # ---------------------------------------------------------------------------
@@ -6156,29 +9857,317 @@ async def feature_manage_members(callback: CallbackQuery, state: FSMContext):
     if not org:
         await callback.answer("Доступно только руководству организации.", show_alert=True)
         return
-    members = await db.get_organization_members(int(org["id"]), limit=60)
+    await _render_manage_members_panel(callback, org, page=0)
+
+
+def _org_member_role_presets(org: dict | None) -> list[str]:
+    info = org or {}
+    org_type = str(info.get("type") or "").strip().lower()
+    by_type: dict[str, list[str]] = {
+        "government": ["Советник", "Координатор", "Референт", "Инспектор", "Сотрудник"],
+        "fbi": ["Старший агент", "Опер-аналитик", "Кибер-агент", "Полевой агент", "Сотрудник"],
+        "police": ["Старший офицер", "Следователь", "Оперуполномоченный", "Патрульный", "Сотрудник"],
+        "court": ["Секретарь суда", "Помощник судьи", "Судебный аналитик", "Консультант", "Сотрудник"],
+        "bank": ["Финансовый аналитик", "Кредитный менеджер", "Риск-менеджер", "Операционист", "Сотрудник"],
+        "hospital": ["Старший врач", "Врач", "Фельдшер", "Медбрат/медсестра", "Сотрудник"],
+        "education": ["Преподаватель", "Ассистент", "Методист", "Куратор", "Сотрудник"],
+        "tax": ["Налоговый инспектор", "Аудитор", "Специалист взыскания", "Аналитик", "Сотрудник"],
+    }
+    if org_type in by_type:
+        return by_type[org_type]
+    return ["Старший специалист", "Специалист", "Координатор", "Оператор", "Сотрудник"]
+
+
+async def _render_manage_members_panel(
+    callback: CallbackQuery,
+    org: dict,
+    page: int = 0,
+    notice: str = "",
+) -> None:
+    if callback.message is None:
+        return
+    org_id = int(org.get("id") or 0)
+    members = await db.get_organization_members(org_id, limit=300)
+    page_size = 8
+    total = len(members)
+    max_page = max(0, (total - 1) // page_size) if total > 0 else 0
+    safe_page = max(0, min(int(page or 0), max_page))
+    chunk = members[safe_page * page_size : safe_page * page_size + page_size]
+
     lines = [
-        f"👥 **СОТРУДНИКИ { _md(str(org.get('name') or 'ОРГАНИЗАЦИИ')) }**",
+        f"👥 КАДРЫ: {str(org.get('name') or 'Организация')}",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"Всего: {len(members)}",
+        f"Сотрудников: {total}",
+        f"Страница: {safe_page + 1}/{max_page + 1}",
         "",
     ]
-    if not members:
+    if notice:
+        lines.append(str(notice))
+        lines.append("")
+    if not chunk:
         lines.append("Сотрудников пока нет.")
     else:
-        for row in members[:25]:
-            member_name = _display_user(row)
-            lines.append(
-                f"• {_md(member_name)}\n"
-                f"  Роль: {_md(str(row.get('role') or 'Сотрудник'))} | "
-                f"Зарплата: ${float(row.get('salary') or 0):,.0f}"
-            )
-    active_org_id = int(org.get("id") or 0)
-    back_cb = f"manage_organization_{active_org_id}" if active_org_id > 0 else "manage_organization"
+        lines.append("Выберите сотрудника для управления:")
+
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+    for row in chunk:
+        uid = int(row.get("user_id") or 0)
+        if uid <= 0:
+            continue
+        name = _display_user(row)
+        role = str(row.get("role") or "Сотрудник")
+        salary = float(row.get("salary") or 0)
+        lines.append(f"• {name} | {role} | {salary:,.0f} люмов")
+        short = name if len(name) <= 26 else name[:23] + "..."
+        keyboard_rows.append(
+            [InlineKeyboardButton(text=f"👤 {short}", callback_data=f"fp_org_member_open_{uid}_{safe_page}")]
+        )
+
+    nav_row: list[InlineKeyboardButton] = []
+    if safe_page > 0:
+        nav_row.append(InlineKeyboardButton(text="⬅️", callback_data=f"fp_org_members_page_{safe_page - 1}"))
+    if safe_page < max_page:
+        nav_row.append(InlineKeyboardButton(text="➡️", callback_data=f"fp_org_members_page_{safe_page + 1}"))
+    if nav_row:
+        keyboard_rows.append(nav_row)
+
+    keyboard_rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"fp_org_members_page_{safe_page}")])
+    keyboard_rows.append([InlineKeyboardButton(text="📋 Заявки", callback_data="review_applications")])
+    keyboard_rows.append([InlineKeyboardButton(text="🔙 В панель", callback_data=f"manage_organization_{org_id}")])
     await callback.message.edit_text(
         "\n".join(lines),
-        reply_markup=_back(back_cb),
-        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+        parse_mode=None,
+    )
+
+
+async def _render_member_actions(
+    callback: CallbackQuery,
+    org: dict,
+    member: dict,
+    page: int = 0,
+    notice: str = "",
+) -> None:
+    if callback.message is None:
+        return
+    uid = int(member.get("user_id") or 0)
+    name = _display_user(member)
+    role = str(member.get("role") or "Сотрудник")
+    salary = round(float(member.get("salary") or 0), 2)
+    role_presets = _org_member_role_presets(org)
+    salary_presets = sorted(
+        {
+            0,
+            500,
+            1000,
+            2000,
+            4000,
+            8000,
+            int(max(0.0, salary)),
+            int(max(500.0, salary * 1.2)),
+        }
+    )
+
+    lines = [
+        f"🧩 КАДРОВАЯ КАРТА: {name}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"ID: {uid}",
+        f"Организация: {str(org.get('name') or 'Организация')}",
+        f"Должность: {role}",
+        f"Зарплата: {salary:,.2f} люмов",
+        "",
+    ]
+    if notice:
+        lines.append(str(notice))
+        lines.append("")
+    lines.append("Выберите действие:")
+
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+    role_row: list[InlineKeyboardButton] = []
+    for idx, role_name in enumerate(role_presets[:5]):
+        role_row.append(
+            InlineKeyboardButton(
+                text=role_name,
+                callback_data=f"fp_org_member_role_{uid}_{idx}_{page}",
+            )
+        )
+        if len(role_row) == 2:
+            keyboard_rows.append(role_row)
+            role_row = []
+    if role_row:
+        keyboard_rows.append(role_row)
+
+    pay_row: list[InlineKeyboardButton] = []
+    for amount in salary_presets[:6]:
+        pay_row.append(
+            InlineKeyboardButton(
+                text=f"💰 {int(amount):,} лм",
+                callback_data=f"fp_org_member_salary_{uid}_{int(amount)}_{page}",
+            )
+        )
+        if len(pay_row) == 2:
+            keyboard_rows.append(pay_row)
+            pay_row = []
+    if pay_row:
+        keyboard_rows.append(pay_row)
+
+    keyboard_rows.append([InlineKeyboardButton(text="🗑 Снять с должности", callback_data=f"fp_org_member_remove_{uid}_{page}")])
+    keyboard_rows.append([InlineKeyboardButton(text="🔙 К сотрудникам", callback_data=f"fp_org_members_page_{page}")])
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+        parse_mode=None,
+    )
+
+
+@router.callback_query(F.data.startswith("fp_org_members_page_"))
+async def feature_manage_members_page(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    raw = (callback.data or "").replace("fp_org_members_page_", "", 1)
+    if not raw.isdigit():
+        await callback.answer("Некорректная страница.", show_alert=True)
+        return
+    page = int(raw)
+    data = await state.get_data()
+    preferred_org_id = int(data.get("managed_org_id") or 0)
+    org = await _get_managed_org_for_user(callback.from_user.id, preferred_org_id if preferred_org_id > 0 else None)
+    if not org:
+        await callback.answer("Доступно только руководству организации.", show_alert=True)
+        return
+    await _render_manage_members_panel(callback, org, page=page)
+
+
+@router.callback_query(F.data.startswith("fp_org_member_open_"))
+async def feature_manage_member_open(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    tail = (callback.data or "").replace("fp_org_member_open_", "", 1)
+    parts = tail.split("_")
+    if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        await callback.answer("Некорректные данные сотрудника.", show_alert=True)
+        return
+    target_user_id = int(parts[0])
+    page = int(parts[1])
+    data = await state.get_data()
+    preferred_org_id = int(data.get("managed_org_id") or 0)
+    org = await _get_managed_org_for_user(callback.from_user.id, preferred_org_id if preferred_org_id > 0 else None)
+    if not org:
+        await callback.answer("Доступно только руководству организации.", show_alert=True)
+        return
+    members = await db.get_organization_members(int(org["id"]), limit=300)
+    member = next((row for row in members if int(row.get("user_id") or 0) == target_user_id), None)
+    if not member:
+        await _render_manage_members_panel(callback, org, page=page, notice="❌ Сотрудник не найден в текущем составе.")
+        return
+    await _render_member_actions(callback, org, member, page=page)
+
+
+@router.callback_query(F.data.startswith("fp_org_member_role_"))
+async def feature_manage_member_role(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    tail = (callback.data or "").replace("fp_org_member_role_", "", 1)
+    parts = tail.split("_")
+    if len(parts) < 3 or not all(part.isdigit() for part in parts[:3]):
+        await callback.answer("Некорректные параметры изменения роли.", show_alert=True)
+        return
+    target_user_id = int(parts[0])
+    preset_idx = int(parts[1])
+    page = int(parts[2])
+
+    data = await state.get_data()
+    preferred_org_id = int(data.get("managed_org_id") or 0)
+    org = await _get_managed_org_for_user(callback.from_user.id, preferred_org_id if preferred_org_id > 0 else None)
+    if not org:
+        await callback.answer("Доступно только руководству организации.", show_alert=True)
+        return
+
+    presets = _org_member_role_presets(org)
+    if preset_idx < 0 or preset_idx >= len(presets):
+        await callback.answer("Некорректный пресет роли.", show_alert=True)
+        return
+    new_role = presets[preset_idx]
+
+    ok, msg, _ = await db.set_organization_member_profile(
+        actor_id=callback.from_user.id,
+        org_id=int(org["id"]),
+        target_user_id=target_user_id,
+        role=new_role,
+        salary=None,
+    )
+    members = await db.get_organization_members(int(org["id"]), limit=300)
+    member = next((row for row in members if int(row.get("user_id") or 0) == target_user_id), None)
+    if not member:
+        await _render_manage_members_panel(callback, org, page=page, notice=("✅ " if ok else "❌ ") + msg)
+        return
+    await _render_member_actions(callback, org, member, page=page, notice=("✅ " if ok else "❌ ") + msg)
+
+
+@router.callback_query(F.data.startswith("fp_org_member_salary_"))
+async def feature_manage_member_salary(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    tail = (callback.data or "").replace("fp_org_member_salary_", "", 1)
+    parts = tail.split("_")
+    if len(parts) < 3 or not all(part.isdigit() for part in parts[:3]):
+        await callback.answer("Некорректные параметры зарплаты.", show_alert=True)
+        return
+    target_user_id = int(parts[0])
+    amount = float(parts[1])
+    page = int(parts[2])
+
+    data = await state.get_data()
+    preferred_org_id = int(data.get("managed_org_id") or 0)
+    org = await _get_managed_org_for_user(callback.from_user.id, preferred_org_id if preferred_org_id > 0 else None)
+    if not org:
+        await callback.answer("Доступно только руководству организации.", show_alert=True)
+        return
+
+    ok, msg, _ = await db.set_organization_member_profile(
+        actor_id=callback.from_user.id,
+        org_id=int(org["id"]),
+        target_user_id=target_user_id,
+        role=None,
+        salary=amount,
+    )
+    members = await db.get_organization_members(int(org["id"]), limit=300)
+    member = next((row for row in members if int(row.get("user_id") or 0) == target_user_id), None)
+    if not member:
+        await _render_manage_members_panel(callback, org, page=page, notice=("✅ " if ok else "❌ ") + msg)
+        return
+    await _render_member_actions(callback, org, member, page=page, notice=("✅ " if ok else "❌ ") + msg)
+
+
+@router.callback_query(F.data.startswith("fp_org_member_remove_"))
+async def feature_manage_member_remove(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    tail = (callback.data or "").replace("fp_org_member_remove_", "", 1)
+    parts = tail.split("_")
+    if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        await callback.answer("Некорректные параметры увольнения.", show_alert=True)
+        return
+    target_user_id = int(parts[0])
+    page = int(parts[1])
+
+    data = await state.get_data()
+    preferred_org_id = int(data.get("managed_org_id") or 0)
+    org = await _get_managed_org_for_user(callback.from_user.id, preferred_org_id if preferred_org_id > 0 else None)
+    if not org:
+        await callback.answer("Доступно только руководству организации.", show_alert=True)
+        return
+    if target_user_id == int(callback.from_user.id):
+        await callback.answer("Нельзя снять с должности самого себя из этой панели.", show_alert=True)
+        return
+
+    ok, msg, _ = await db.remove_organization_member(
+        actor_id=callback.from_user.id,
+        org_id=int(org["id"]),
+        target_user_id=target_user_id,
+        reason="Кадровое решение руководства",
+    )
+    updated_org = await db.get_organization_by_id(int(org["id"])) or org
+    await _render_manage_members_panel(
+        callback,
+        updated_org,
+        page=page,
+        notice=("✅ " if ok else "❌ ") + msg,
     )
 
 
@@ -6199,7 +10188,7 @@ async def feature_org_finances(callback: CallbackQuery, state: FSMContext):
         "━━━━━━━━━━━━━━━━━━━━",
         f"Бюджет: ${float(org.get('budget') or 0):,.2f}",
         f"Сотрудников: {len(members)}",
-        f"ФОТ (день): ${payroll:,.2f}",
+        f"ФОТ (час): ${payroll:,.2f}",
         f"Средняя зарплата: ${avg_salary:,.2f}",
         "",
         "Налоговые параметры:",

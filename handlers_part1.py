@@ -4,6 +4,7 @@ aiogram 3.x асинхронные обработчики
 """
 
 import aiosqlite
+import logging
 import random
 import re
 from aiogram import Router, F
@@ -22,9 +23,11 @@ from keyboards import (
     ElectionCallback,
     PartyCallback,
 )
+from ui_media import send_section_screen
 
 # Создаем роутер для основных обработчиков
 router = Router()
+logger = logging.getLogger(__name__)
 INVISIBLE_NAME_CHARS = ("\u200b", "\u200c", "\u200d", "\ufeff", "\u2060", "\u00ad")
 MESSAGE_PICK_PAGE_SIZE = 10
 
@@ -67,6 +70,32 @@ def _gov_authority_label(authority: str | None) -> str:
     return mapping.get(str(authority or "").strip().lower(), "Нет")
 
 
+def _lum(amount: float) -> str:
+    return f"{float(amount or 0):,.2f} люмов"
+
+
+def _parse_money_amount(raw_text: str) -> float | None:
+    raw = str(raw_text or "").strip().replace("$", "").replace(" ", "").replace(",", ".")
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    return round(value, 2)
+
+
+def _normalize_reply_token(text: str) -> str:
+    token = (text or "").strip().split(" ", 1)[0].lower()
+    if token.startswith("/"):
+        token = token.lstrip("/")
+    if "@" in token:
+        token = token.split("@", 1)[0]
+    return token.strip(".,!?;:()[]{}<>\"'`«»")
+
+
 def _extract_start_arg(raw_text: str | None) -> str:
     text = str(raw_text or "").strip()
     if not text:
@@ -92,14 +121,9 @@ async def _main_flag_block() -> str:
     flag_text = (flag.get("state_flag_text") or "").strip()
     has_image = bool(flag.get("state_flag_file_id"))
     if flag_text:
-        if has_image:
-            return (
-                f"🏳️ **Госфлаг:** {_escape_markdown(flag_text)}\n"
-                "Откройте кнопку **🏳️ Флаг страны**, чтобы увидеть изображение.\n\n"
-            )
         return f"🏳️ **Госфлаг:** {_escape_markdown(flag_text)}\n\n"
     if has_image:
-        return "🏳️ **Госфлаг:** изображение загружено президентом (кнопка ниже).\n\n"
+        return "🏳️ **Госфлаг:** загружен президентом.\n\n"
     return ""
 
 
@@ -108,16 +132,7 @@ def _main_menu_with_flag_button(
     has_elections: bool,
     election_id: int,
 ) -> InlineKeyboardMarkup:
-    base = get_main_menu_keyboard(is_new_player, has_elections, election_id)
-    rows = [list(row) for row in (base.inline_keyboard or [])]
-    has_flag_button = any(
-        (button.callback_data or "") == "state_flag_view"
-        for row in rows
-        for button in row
-    )
-    if not has_flag_button:
-        rows.append([InlineKeyboardButton(text="🏳️ Флаг страны", callback_data="state_flag_view")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return get_main_menu_keyboard(is_new_player, has_elections, election_id)
 
 
 async def _main_info_block(user_id: int) -> str:
@@ -175,7 +190,7 @@ async def _get_tutorial_progress(user_id: int) -> dict:
     has_pvp_or_casino_activity = bool(recent_casino)
     if not has_pvp_or_casino_activity:
         try:
-            async with aiosqlite.connect(db.db_path) as conn:
+            async with db._connect() as conn:
                 async with conn.execute(
                     """
                     SELECT 1
@@ -322,6 +337,7 @@ SECTION_MENUS: dict[str, dict[str, object]] = {
             ("🎓 Обучение", "edu_menu"),
             ("🏢 Частные организации", "private_org_list"),
             ("🕶️ Банды", "gang_list"),
+            ("👨‍👩‍👧 Семья", "family_menu"),
         ],
     },
     "economy": {
@@ -331,7 +347,9 @@ SECTION_MENUS: dict[str, dict[str, object]] = {
             ("🏢 Компании", "biz_menu"),
             ("📈 Биржа", "stock_exchange_menu"),
             ("🏠 Недвижимость", "prop_menu"),
+            ("🎟️ Промокоды", "promo_menu"),
             ("🧾 Налоги", "daily_tax_status"),
+            ("🤝 Charity", "charity_menu"),
             ("📣 Городская площадка", "market_menu"),
             ("👥 Рефералы", "referral_menu"),
             ("🏗️ Застройщик", "developer_menu"),
@@ -354,21 +372,35 @@ GROUP_CASINO_ALIASES = {
     "кость": "dice",
     "кубик": "dice",
     "dice": "dice",
-    "автомат": "slots",
-    "слот": "slots",
-    "слоты": "slots",
-    "slot": "slots",
-    "slots": "slots",
+    "автомат": "slots3",
+    "автомат3": "slots3",
+    "слот": "slots3",
+    "слоты": "slots3",
+    "slot": "slots3",
+    "slots": "slots3",
+    "slot3": "slots3",
+    "slots3": "slots3",
     "баскет": "basketball",
     "баскетбол": "basketball",
     "basket": "basketball",
     "basketball": "basketball",
+    "рулетка": "roulette",
+    "roulette": "roulette",
+    "redblack": "roulette",
+    "rb": "roulette",
+    "red": "roulette_red",
+    "black": "roulette_black",
+    "красное": "roulette_red",
+    "черное": "roulette_black",
+    "чёрное": "roulette_black",
 }
 
 GROUP_CASINO_CFG = {
     "dice": {"title": "Кости", "emoji": "🎲", "min": 1, "max": 6},
-    "slots": {"title": "Автомат", "emoji": "🎰", "min": 1, "max": 64},
+    "slots": {"title": "Автомат x3", "emoji": "🎰", "min": 0, "max": 0},
+    "slots3": {"title": "Автомат x3", "emoji": "🎰", "min": 0, "max": 0},
     "basketball": {"title": "Баскетбол", "emoji": "🏀", "min": 1, "max": 5},
+    "roulette": {"title": "Red / Black", "emoji": "🎯", "min": 1, "max": 2},
 }
 
 
@@ -398,30 +430,58 @@ def _parse_group_casino_command(text: str) -> tuple[str, int, float] | None:
     if len(parts) < 2:
         return None
 
-    game = GROUP_CASINO_ALIASES.get(parts[0].lower())
-    if not game:
+    first_token = parts[0].lower()
+    game_alias = GROUP_CASINO_ALIASES.get(first_token)
+    if not game_alias:
         return None
 
-    if game == "dice":
+    game = game_alias
+    target = 0
+    bet_part = ""
+
+    if game_alias == "dice":
         # Поддержка двух форм:
         #   кости [ставка]
         #   кости [число] [ставка]  (число для совместимости)
         if len(parts) >= 3:
-            target_part = parts[1]
+            try:
+                target = int(parts[1])
+            except ValueError:
+                target = 0
             bet_part = parts[2]
         else:
-            target_part = "0"
             bet_part = parts[1]
+    elif game_alias in {"slots", "slots3"}:
+        game = "slots3"
+        if len(parts) >= 3:
+            bet_part = parts[2]
+        else:
+            bet_part = parts[1]
+        target = 0
+    elif game_alias in {"roulette_red", "roulette_black"}:
+        game = "roulette"
+        target = 1 if game_alias == "roulette_red" else 2
+        bet_part = parts[1] if len(parts) >= 2 else ""
+    elif game_alias == "roulette":
+        game = "roulette"
+        if len(parts) < 3:
+            return None
+        color_alias = GROUP_CASINO_ALIASES.get(parts[1].lower(), "")
+        if color_alias == "roulette_red":
+            target = 1
+        elif color_alias == "roulette_black":
+            target = 2
+        else:
+            return None
+        bet_part = parts[2]
     else:
         if len(parts) < 3:
             return None
-        target_part = parts[1]
+        try:
+            target = int(parts[1])
+        except ValueError:
+            return None
         bet_part = parts[2]
-
-    try:
-        target = int(target_part)
-    except ValueError:
-        return None
 
     bet_raw = re.sub(r"[^0-9.,]", "", bet_part)
     try:
@@ -475,10 +535,13 @@ async def _render_section_menu(callback: CallbackQuery, section: str):
         text_lines.append(f"• {label}")
         keyboard_rows.append([InlineKeyboardButton(text=label, callback_data=f"menu:{target}")])
     keyboard_rows.append([InlineKeyboardButton(text="🔙 В главное меню", callback_data="back_to_main")])
-    await callback.message.edit_text(
-        "\n".join(text_lines),
+    await send_section_screen(
+        callback,
+        text="\n".join(text_lines),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
         parse_mode="Markdown",
+        section_key=None,
+        add_back_to_menu=False,
     )
 
 
@@ -554,6 +617,11 @@ async def _dispatch_menu_action(callback: CallbackQuery, state: FSMContext, acti
         await feature_casino_menu(callback, state)
         return
 
+    if target == "promo_menu":
+        from feature_pack import promo_menu
+        await promo_menu(callback, state)
+        return
+
     if target == "fun_hub":
         from feature_pack import feature_fun_hub_menu
         await feature_fun_hub_menu(callback, state)
@@ -607,6 +675,18 @@ async def _dispatch_menu_action(callback: CallbackQuery, state: FSMContext, acti
 
     if target == "daily_tax_status":
         await daily_tax_status(callback, state)
+        return
+
+    if target == "charity_menu":
+        await charity_menu(callback, state)
+        return
+
+    if target == "family_menu":
+        await family_menu(callback, state)
+        return
+
+    if target == "pet_menu":
+        await pet_menu(callback, state)
         return
 
     if target == "help_menu":
@@ -720,6 +800,100 @@ async def tutorial_command(message: Message):
     )
 
 
+@router.message(Command("tour"))
+async def quick_tour_command(message: Message):
+    """Короткий анимированный тур по ключевым механикам игры."""
+    try:
+        intro = await message.answer("🚀 Добро пожаловать в тур по Мирнастану...", parse_mode=None)
+        await _text_animation(
+            intro,
+            [
+                "🚀 Добро пожаловать в тур по Мирнастану...",
+                "🏛️ Управляйте государством, вступайте в организации...",
+                "💼 Устраивайтесь на работу и отрабатывайте смены...",
+                "🎮 Развлекайтесь: казино, дуэли и события!",
+            ],
+            delay=0.5,
+        )
+    except Exception:
+        pass
+
+    lines = [
+        "🏁 КРАТКИЙ ТУР ПО ИГРЕ",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "1) Профиль: отслеживайте финансы и статус.",
+        "2) Работа: подавайте заявки и отрабатывайте смены.",
+        "3) Экономика: банк, кредиты, промокоды и донат-пакеты.",
+        "4) Соц. механики: организации, партии, взаимодействия между игроками.",
+    ]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_main")]])
+    await send_section_screen(message, text="\n".join(lines), reply_markup=keyboard, parse_mode=None, section_key="bnr")
+
+
+@router.message(Command("gift"))
+async def gift_command(message: Message):
+    """Подарить деньги другому игроку.
+
+    Форматы:
+    - В ответе на сообщение игрока: `/gift <сумма> [примечание]`
+    - По id: `/gift <user_id> <сумма>`
+    """
+    parts = str(message.text or "").strip().split(maxsplit=2)
+    target_id = None
+    note = ""
+    amount = None
+
+    if message.reply_to_message and message.reply_to_message.from_user:
+        # Формат: /gift <сумма> (в ответе на сообщение получателя)
+        if len(parts) < 2:
+            await message.answer("❌ Формат: /gift <сумма> (в ответе на сообщение получателя) или /gift <user_id> <сумма>", parse_mode=None)
+            return
+        target_id = int(message.reply_to_message.from_user.id)
+        amount = _parse_money_amount(parts[1]) if len(parts) >= 2 else None
+        note = parts[2].strip() if len(parts) >= 3 else ""
+    else:
+        # Формат: /gift <user_id> <сумма>
+        if len(parts) < 3:
+            await message.answer("❌ Формат: /gift <user_id> <сумма>", parse_mode=None)
+            return
+        if not parts[1].isdigit():
+            await message.answer("❌ Укажите числовой user_id или используйте reply на сообщение игрока.", parse_mode=None)
+            return
+        target_id = int(parts[1])
+        amount = _parse_money_amount(parts[2])
+
+    if amount is None:
+        await message.answer("❌ Неверная сумма.", parse_mode=None)
+        return
+    if target_id == message.from_user.id:
+        await message.answer("❌ Нельзя дарить самому себе.", parse_mode=None)
+        return
+
+    # Используем запись взаимодействия, чтобы корректно логировать и изменять балансы
+    ok, msg, payload = await db.record_player_interaction(
+        actor_id=message.from_user.id,
+        target_id=target_id,
+        action_key="gift",
+        action_title="Подарок",
+        public_text=str(note or "")[:500],
+        cost=amount,
+        target_reward=amount,
+        actor_reputation_delta=0.0,
+        target_reputation_delta=0.0,
+        target_happiness_delta=2.0,
+    )
+
+    if not ok:
+        await message.answer(f"❌ {msg}", parse_mode=None)
+        return
+
+    await message.answer(f"✅ Подарок отправлен игроку {target_id}: ${amount:,.2f}\n{msg}", parse_mode=None)
+    try:
+        await message.bot.send_message(target_id, f"🎁 Вам прислали подарок ${amount:,.2f} от игрока {message.from_user.id}.\n{note}", parse_mode=None)
+    except Exception:
+        pass
+
+
 @router.callback_query(F.data == "tutorial_complete")
 async def tutorial_complete(callback: CallbackQuery):
     """Завершение обучения только после прохождения всех шагов."""
@@ -825,21 +999,28 @@ async def back_to_main(callback: CallbackQuery, state: FSMContext):
             f"{info_block}"
             "Выберите категорию:\n"
         )
-        
-        await callback.message.edit_text(
-            text,
+        flag = await db.get_state_flag()
+        await send_section_screen(
+            callback,
+            text=text,
             reply_markup=_main_menu_with_flag_button(is_new, has_elections, election_id),
-            parse_mode='Markdown'
+            parse_mode="Markdown",
+            flag_file_id=str(flag.get("state_flag_file_id") or ""),
         )
     except Exception:
         # Если edit_text не сработал, отправляем новое сообщение
         try:
-            await callback.message.answer(
-                "🏛️ **Государство Онлайн**\n"
-                "━━━━━━━━━━━━━━━━━━━━\n\n"
-                "Добро пожаловать! Выберите категорию:",
+            flag = await db.get_state_flag()
+            await send_section_screen(
+                callback,
+                text=(
+                    "🏛️ **Государство Онлайн**\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "Добро пожаловать! Выберите категорию:"
+                ),
                 reply_markup=_main_menu_with_flag_button(False, False, -1),
-                parse_mode='Markdown'
+                parse_mode="Markdown",
+                flag_file_id=str(flag.get("state_flag_file_id") or ""),
             )
         except Exception:
             pass
@@ -933,9 +1114,13 @@ async def start_command(message: Message, state: FSMContext):
             "Выберите категорию:"
         )
         
-        await message.answer(
-            greeting,
-            reply_markup=_main_menu_with_flag_button(is_new, has_elections, -1)
+        flag = await db.get_state_flag()
+        await send_section_screen(
+            message,
+            text=greeting,
+            reply_markup=_main_menu_with_flag_button(is_new, has_elections, -1),
+            parse_mode="Markdown",
+            flag_file_id=str(flag.get("state_flag_file_id") or ""),
         )
 
 
@@ -978,10 +1163,13 @@ async def menu_command(message: Message, state: FSMContext):
         f"{info_block}"
         "Выберите категорию:"
     )
-    await message.answer(
-        text,
+    flag = await db.get_state_flag()
+    await send_section_screen(
+        message,
+        text=text,
         reply_markup=_main_menu_with_flag_button(not bool(user.get("tutorial_completed")), False, -1),
         parse_mode="Markdown",
+        flag_file_id=str(flag.get("state_flag_file_id") or ""),
     )
 
 
@@ -1022,6 +1210,7 @@ async def help_command(message: Message):
         "/loan — заявка на кредит\n"
         "/bank — меню банка\n"
         "/tax — ежедневные налоги\n"
+        "/charity — пожертвования в городской фонд\n"
         "/daily — бонус дня\n\n"
         
         "⚖️ **ПРАВОСУДИЕ:**\n"
@@ -1034,6 +1223,13 @@ async def help_command(message: Message):
         "🏠 **ИМУЩЕСТВО:**\n"
         "/prop — недвижимость\n"
         "/gang — банды и криминал\n\n"
+
+        "👨‍👩‍👧 **СЕМЬЯ И ПИТОМЦЫ:**\n"
+        "/marry — предложение брака (reply в группе)\n"
+        "/divorce — развод (добавьте 'тихо' для скрытого режима)\n"
+        "/family — семейная панель\n"
+        "/pet — управление питомцем\n"
+        "/petname Имя — переименовать питомца\n\n"
         
         "📣 **ПОЛИТИКА:**\n"
         "/government — система правления\n"
@@ -1046,14 +1242,19 @@ async def help_command(message: Message):
         "/ref — реферальная система и маркетинг\n"
         "/builder — проекты застройщика\n"
         "/casino — одиночное казино\n"
-        "В группе (reply): кости 6 1000 | автомат 40 5000 | баскетбол 4 2000\n"
+        "/donate — донат и поддержка проекта\n"
+        "/promo — промокоды и бонусы\n"
+        "В группе (reply): кости 1000 | автомат 5000 | рулетка red 2000 | баскетбол 4 2000\n"
         "Для костей правило: у кого больше выпало, тот победил.\n"
+        "Для автомата: тройка > пара > разные.\n"
         "Комиссия групповой дуэли: 1% с выигрыша.\n"
-        "Если privacy mode включен: /duel кости 6 1000 (в ответ на сообщение игрока)\n"
+        "Семейные reply-команды (без privacy mode): брак | обнять | поцеловать | погладить\n"
+        "+ (reply) — +1 репутация\n"
+        "Если privacy mode включен: используйте /marry и /duel кости 6 1000 (reply)\n"
         "/id — узнать ID игрока (reply на сообщение)\n\n"
         
         "ℹ️ **ИНФОРМАЦИЯ:**\n"
-        "В группах бот отвечает только на команды.\n"
+        "В группах при privacy mode бот видит только команды.\n"
         "Для полного доступа напишите в личные сообщения боту.\n"
     )
     
@@ -1182,52 +1383,80 @@ async def id_command(message: Message):
 
 # ==================== РЕПУТАЦИЯ ПО ПЛЮСАМ ====================
 
-@router.message(F.text.startswith("+"), F.reply_to_message, F.chat.type.in_({"group", "supergroup"}))
-async def plus_reputation(message: Message):
+def _humanize_minutes(total_minutes: int) -> str:
+    safe_total = max(0, int(total_minutes or 0))
+    hours, minutes = divmod(safe_total, 60)
+    if hours and minutes:
+        return f"{hours}ч {minutes}м"
+    if hours:
+        return f"{hours}ч"
+    return f"{minutes}м"
+
+
+async def _apply_plus_reputation(message: Message):
     """
-    Выдать репутацию за ответ с плюсом.
-    Человек, которому ответили с "+", получает +1 репутацию и 35-минутный кулдаун.
+    Выдать репутацию по reply-команде: "+" или /plus.
     """
     try:
-        # Проверяем, что это ответ на сообщение от пользователя
         if not message.reply_to_message or not message.reply_to_message.from_user:
+            await message.reply("❌ Ответьте на сообщение игрока.", parse_mode=None)
             return
-        
-        # ID человека, которому ответили
-        target_user_id = message.reply_to_message.from_user.id
-        
-        # Не давать репутацию за ответ на сообщение бота
-        if message.reply_to_message.from_user.is_bot:
+
+        target_tg_user = message.reply_to_message.from_user
+        target_user_id = int(target_tg_user.id)
+
+        if target_tg_user.is_bot:
+            await message.reply("❌ Нельзя выдавать репутацию боту.", parse_mode=None)
             return
-        
-        # Не давать репутацию самому себе
-        if message.from_user.id == target_user_id:
+        if int(message.from_user.id) == target_user_id:
+            await message.reply("❌ Нельзя выдавать репутацию самому себе.", parse_mode=None)
             return
-        
-        # Получаем пользователя, которому ответили
-        target_user = await db.get_user(target_user_id)
-        if not target_user:
-            return
-        
-        # Проверяем кулдаун: максимум 1 репутация в 35 минут
+
+        # Цель может не иметь профиля, если еще не писала боту в ЛС.
+        await db.create_or_update_user(
+            target_user_id,
+            target_tg_user.username or "",
+            f"{target_tg_user.first_name or ''} {target_tg_user.last_name or ''}".strip(),
+        )
+        target_user = await db.get_user(target_user_id) or {}
+
         cooldown_key = f"reputation_plus_{target_user_id}"
-        ok, remain = await db.check_and_set_user_cooldown(target_user_id, cooldown_key, 35)
-        
+        ok, remain = await db.check_and_set_user_cooldown(int(message.from_user.id), cooldown_key, 1440)
         if not ok:
-            # Кулдаун активен, ничего не делаем
+            await message.reply(
+                "⏳ Этому игроку уже ставили + сегодня.\n"
+                f"Попробуйте через {_humanize_minutes(remain)}.",
+                parse_mode=None,
+            )
             return
-        
-        # Выдаем репутацию
+
         current_rep = float(target_user.get("reputation", 50) or 50)
         new_rep = round(min(100.0, current_rep + 1.0), 2)
-        
         await db.update_user(target_user_id, reputation=new_rep)
-        
-    except Exception as e:
-        # Молча игнорируем ошибки для не нарушения потока сообщений
-        logger_debug = __name__
-        import logging
-        logging.getLogger(logger_debug).debug(f"Error in plus_reputation: {e}")
+
+        target_name = _display_user_name(target_user, fallback_id=target_user_id)
+        await message.reply(
+            f"✅ {target_name}: +1 репутации (теперь {new_rep:.1f}/100).",
+            parse_mode=None,
+        )
+    except Exception:
+        logger.exception(
+            "Ошибка выдачи репутации по reply-команде: actor=%s chat=%s",
+            int((message.from_user.id if message.from_user else 0) or 0),
+            int((message.chat.id if message.chat else 0) or 0),
+        )
+        await message.reply("⚠️ Не удалось выдать репутацию. Попробуйте еще раз.", parse_mode=None)
+
+
+@router.message(F.text.regexp(r"^\s*\+\s*$"), F.reply_to_message, F.chat.type.in_({"group", "supergroup"}))
+@router.message(F.text.regexp(r"(?iu)^\s*плюс\s*[.!?]?\s*$"), F.reply_to_message, F.chat.type.in_({"group", "supergroup"}))
+async def plus_reputation(message: Message):
+    await _apply_plus_reputation(message)
+
+
+@router.message(Command("plus", "rep"), F.reply_to_message, F.chat.type.in_({"group", "supergroup"}))
+async def plus_reputation_command(message: Message):
+    await _apply_plus_reputation(message)
 
 
 # ==================== ПРОФИЛЬ ====================
@@ -1249,6 +1478,15 @@ async def profile_menu(update, state: FSMContext):
         if message is None:
             await callback.answer("❌ Сообщение недоступно.", show_alert=True)
             return
+        # Небольшая анимация загрузки профиля
+        try:
+            await _text_animation(
+                message,
+                ["👤 Загружаю профиль...", "🔎 Собираю данные...", "📋 Готово!"],
+                delay=0.18,
+            )
+        except Exception:
+            pass
     
     if not user:
         await message.answer("❌ Профиль не найден")
@@ -1264,6 +1502,9 @@ async def profile_menu(update, state: FSMContext):
     citizen_job = _clean_name(user.get("citizen_job"), 60) or "нет"
     life_state = _clean_name(user.get("life_state"), 24) or "alive"
     injury = _clean_name(user.get("injury_severity"), 24) or "нет"
+    family = await db.get_active_marriage(int(user.get("user_id") or 0))
+    family_account = await db.get_family_account(int(user.get("user_id") or 0))
+    pet = await db.get_user_pet(int(user.get("user_id") or 0))
     balance = float(user.get("balance", 0) or 0)
     bank_balance = float(user.get("bank", 0) or 0)
     cash_balance = float(user.get("cash", 0) or 0)
@@ -1280,13 +1521,14 @@ async def profile_menu(update, state: FSMContext):
         f"🕒 **Активность:** {_escape_markdown(last_activity)}\n"
         f"🏛️ **Гос.полномочия:** {_escape_markdown(_gov_authority_label(authority))}\n\n"
         "💰 **ФИНАНСЫ:**\n"
-        f"• Баланс: ${balance:,.0f}\n"
-        f"• Банк: ${bank_balance:,.0f}\n"
-        f"• Наличные: ${cash_balance:,.0f}\n"
-        f"• Теневой баланс: ${shadow_balance:,.0f}\n"
-        f"• Капитал: ${net_worth:,.0f}\n"
-        f"• Налоговый долг: ${float(user.get('tax_debt', 0) or 0):,.0f}\n"
-        f"• Всего налогов начислено: ${await db.get_user_total_tax_charged(int(user.get('user_id') or 0)):,.2f}\n\n"
+        f"• Баланс: {_lum(balance)}\n"
+        f"• Банк: {_lum(bank_balance)}\n"
+        f"• Наличные: {_lum(cash_balance)}\n"
+        f"• Теневой баланс: {_lum(shadow_balance)}\n"
+        f"• Капитал: {_lum(net_worth)}\n"
+        f"• Налоговый долг: {_lum(float(user.get('tax_debt', 0) or 0))}\n"
+        f"• Всего налогов начислено: {_lum(await db.get_user_total_tax_charged(int(user.get('user_id') or 0)))}\n"
+        f"• Всего налогов оплачено: {_lum(await db.get_user_total_tax_paid(int(user.get('user_id') or 0)))}\n\n"
         "📊 **СТАТИСТИКА:**\n"
         f"• Уровень: {int(user.get('level', 1) or 1)}\n"
         f"• Образование: {int(user.get('education', 1) or 1)}\n"
@@ -1300,7 +1542,7 @@ async def profile_menu(update, state: FSMContext):
         profile_text += (
             f"• Организация: {_escape_markdown(org_name)}\n"
             f"• Должность: {_escape_markdown(role_name)}\n"
-            f"• Зарплата: ${float(user.get('salary', 0) or 0):,.0f}/день\n\n"
+            f"• Зарплата: {_lum(float(user.get('salary', 0) or 0))}/час\n\n"
         )
     else:
         profile_text += "• Не состоит в организации\n\n"
@@ -1308,11 +1550,35 @@ async def profile_menu(update, state: FSMContext):
     profile_text += (
         "👨‍💼 **ГРАЖДАНСКАЯ РАБОТА:**\n"
         f"• Должность: {_escape_markdown(citizen_job)}\n"
-        f"• Зарплата: ${float(user.get('citizen_salary', 0) or 0):,.0f}/день\n\n"
+        f"• Зарплата: {_lum(float(user.get('citizen_salary', 0) or 0))}/час\n\n"
         "🏥 **ЗДОРОВЬЕ:**\n"
         f"• Состояние: {_escape_markdown(life_state)}\n"
         f"• Травма: {_escape_markdown(injury)}\n"
     )
+
+    if family:
+        spouse_id = int(family.get("spouse_id") or 0)
+        spouse_name = _display_user_name(await db.get_user(spouse_id), fallback_id=spouse_id)
+        relation_level = int(family.get("relationship_level") or 1)
+        relation_points = int(family.get("relationship_points") or 0)
+        profile_text += (
+            "\n👨‍👩‍👧 **СЕМЬЯ:**\n"
+            f"• Статус: в браке с {_escape_markdown(spouse_name)}\n"
+            f"• Вместе: {int(family.get('days_together') or 0)} дн.\n"
+            f"• Уровень отношений: {relation_level}/25 ({relation_points} очк.)\n"
+            f"• Семейный долг: {_lum(float(family_account.get('family_debt') or 0))}\n"
+        )
+    else:
+        profile_text += "\n👨‍👩‍👧 **СЕМЬЯ:**\n• Статус: не в браке\n"
+    if pet:
+        pet_title = PET_TYPE_LABELS.get(str(pet.get("pet_type") or "").lower(), "Питомец")
+        profile_text += (
+            f"• Питомец: {_escape_markdown(pet_title)} "
+            f"'{_escape_markdown(str(pet.get('pet_name') or ''))}' "
+            f"(ур. {int(pet.get('level') or 1)})\n"
+        )
+    else:
+        profile_text += "• Питомец: нет\n"
 
     keyboard = [
         [
@@ -1320,9 +1586,16 @@ async def profile_menu(update, state: FSMContext):
             InlineKeyboardButton(text="📊 Статистика", callback_data="profile_stats"),
         ],
         [
+            InlineKeyboardButton(text="🎁 Подарить", callback_data="bank_transfer_start"),
+        ],
+        [
             InlineKeyboardButton(text="💌 Письма", callback_data="profile_messages"),
             InlineKeyboardButton(text="✏️ Ник", callback_data="set_nick_start"),
         ],
+        [
+            InlineKeyboardButton(text="🤝 Взаимодействия", callback_data="profile_interactions"),
+        ],
+        [InlineKeyboardButton(text="👨‍👩‍👧 Семья", callback_data="family_menu")],
         [
             InlineKeyboardButton(text="🤖 AI-помощник", callback_data="ai_menu"),
             InlineKeyboardButton(text="📡 Гос-рация", callback_data="gov_radio_menu"),
@@ -1332,10 +1605,13 @@ async def profile_menu(update, state: FSMContext):
     
     reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
     
-    if isinstance(update, Message):
-        await update.answer(profile_text, reply_markup=reply_markup, parse_mode='Markdown')
-    else:
-        await update.message.edit_text(profile_text, reply_markup=reply_markup, parse_mode='Markdown')
+    await send_section_screen(
+        update,
+        text=profile_text,
+        reply_markup=reply_markup,
+        parse_mode="Markdown",
+        section_key="profile",
+    )
 
 
 @router.callback_query(F.data == "profile_finance")
@@ -1348,19 +1624,63 @@ async def profile_finance(callback: CallbackQuery):
         return
 
     total_tax_charged = await db.get_user_total_tax_charged(callback.from_user.id)
+    total_tax_paid = await db.get_user_total_tax_paid(callback.from_user.id)
     text = (
         "💰 **ФИНАНСОВЫЙ ОТЧЕТ**\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"• Баланс: ${user.get('balance', 0):,.2f}\n"
-        f"• Налоговый долг: ${user.get('tax_debt', 0):,.2f}\n"
-        f"• Всего налогов начислено: ${total_tax_charged:,.2f}\n"
-        f"• Штрафы оплачены: ${user.get('fines_paid', 0):,.2f}\n"
+        f"• Баланс: {_lum(float(user.get('balance', 0) or 0))}\n"
+        f"• Налоговый долг: {_lum(float(user.get('tax_debt', 0) or 0))}\n"
+        f"• Всего налогов начислено: {_lum(total_tax_charged)}\n"
+        f"• Всего налогов оплачено: {_lum(total_tax_paid)}\n"
+        f"• Штрафы оплачены: {_lum(float(user.get('fines_paid', 0) or 0))}\n"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 В профиль", callback_data="profile_menu")],
         [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_main")],
     ])
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode='Markdown')
+    await send_section_screen(
+        callback,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+        section_key="profile",
+    )
+
+
+@router.callback_query(F.data == "profile_interactions")
+async def profile_interactions(callback: CallbackQuery):
+    """Показать недавние взаимодействия игрока (последние 10)."""
+    await callback.answer()
+    user_id = callback.from_user.id
+    rows = await db.get_recent_player_interactions(user_id=user_id, limit=12)
+    if not rows:
+        await callback.message.edit_text(
+            "🤝 Взаимодействий пока нет.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В профиль", callback_data="profile_menu")]]),
+            parse_mode=None,
+        )
+        return
+
+    lines = ["🤝 **ПОСЛЕДНИЕ ВЗАИМОДЕЙСТВИЯ**", "━━━━━━━━━━━━━━━━━━━━", ""]
+    for r in rows[:12]:
+        created = str(r.get("created_date") or "")[:16]
+        actor = str(r.get("actor_name") or r.get("actor_id") or "?")
+        target = str(r.get("target_name") or r.get("target_id") or "?")
+        title = str(r.get("action_title") or "Действие")
+        value = float(r.get("value") or 0)
+        lines.append(f"• {created} | {title}: {actor} → {target} | ${value:,.2f}")
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 В профиль", callback_data="profile_menu")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_main")],
+    ])
+    await send_section_screen(
+        callback,
+        text="\n".join(lines),
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+        section_key="profile",
+    )
 
 
 @router.callback_query(F.data == "profile_stats")
@@ -1387,7 +1707,13 @@ async def profile_stats(callback: CallbackQuery):
         [InlineKeyboardButton(text="🔙 В профиль", callback_data="profile_menu")],
         [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_main")],
     ])
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode='Markdown')
+    await send_section_screen(
+        callback,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+        section_key="profile",
+    )
 
 
 @router.callback_query(F.data == "profile_messages")
@@ -1425,7 +1751,7 @@ async def profile_messages(callback: CallbackQuery):
     rows = []
     unread = 0
     try:
-        async with aiosqlite.connect(db.db_path) as conn:
+        async with db._connect() as conn:
             conn.row_factory = aiosqlite.Row
             async with conn.execute(query, (int(user_id), int(user_id))) as cur:
                 rows = await cur.fetchall()
@@ -1467,7 +1793,13 @@ async def profile_messages(callback: CallbackQuery):
         [InlineKeyboardButton(text="🔙 В профиль", callback_data="profile_menu")],
         [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_main")],
     ])
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode='Markdown')
+    await send_section_screen(
+        callback,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+        section_key="pismo",
+    )
 
 
 async def _render_message_recipient_picker(callback: CallbackQuery, offset: int = 0) -> None:
@@ -2314,7 +2646,13 @@ async def president_appeal_decision(callback: CallbackQuery, state: FSMContext):
 
 # ==================== ГРУППОВОЕ PVP-КАЗИНО ====================
 
-@router.message(F.reply_to_message, F.chat.type.in_({"group", "supergroup"}))
+@router.message(
+    F.reply_to_message,
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.regexp(
+        r"(?i)^/?(?:duel|casino_duel|pvp|кости|кость|кубик|dice|автомат|автомат3|слот|слоты|slot|slots|slot3|slots3|баскет|баскетбол|basket|basketball|рулетка|roulette|redblack|rb|red|black|красное|черное|чёрное)(?:@\w+)?(?:\s+.*)?$"
+    ),
+)
 @router.message(Command("duel"), F.reply_to_message, F.chat.type.in_({"group", "supergroup"}))
 @router.message(Command("casino_duel"), F.reply_to_message, F.chat.type.in_({"group", "supergroup"}))
 @router.message(Command("pvp"), F.reply_to_message, F.chat.type.in_({"group", "supergroup"}))
@@ -2337,7 +2675,9 @@ async def group_casino_duel_start(message: Message, state: FSMContext):
 
     game, target, bet = parsed
     cfg = GROUP_CASINO_CFG.get(game, {})
-    if game != "dice" and (target < int(cfg.get("min", 1)) or target > int(cfg.get("max", 1))):
+    target_min = int(cfg.get("min", 0))
+    target_max = int(cfg.get("max", 0))
+    if game not in {"dice", "slots3", "slots"} and (target < target_min or target > target_max):
         await message.reply(
             f"❌ Для игры '{cfg.get('title', game)}' число должно быть от {cfg.get('min')} до {cfg.get('max')}."
         )
@@ -2369,6 +2709,11 @@ async def group_casino_duel_start(message: Message, state: FSMContext):
     opponent_name = _display_user_name(await db.get_user(opponent_id), fallback_id=opponent_id)
     if game == "dice":
         condition_text = "Правило: у кого больше число на кости — тот победил."
+    elif game in {"slots3", "slots"}:
+        condition_text = "Правило: у кого сильнее комбинация в автомате (тройка > пара > разные) — тот победил."
+    elif game == "roulette":
+        color_name = "красное" if target == 1 else "черное"
+        condition_text = f"Условие: ставка инициатора на {color_name}. Выпадает {color_name} — побеждает инициатор."
     else:
         condition_text = f"Условие: выпадает число {target}"
     await message.reply(
@@ -2480,6 +2825,47 @@ async def group_casino_duel_accept(callback: CallbackQuery, state: FSMContext):
             challenger_roll=challenger_roll,
             opponent_roll=opponent_roll,
         )
+    elif game_type in {"slots3", "slots"}:
+        challenger_name = _display_user_name(
+            await db.get_user(int(duel.get("challenger_id") or 0)),
+            fallback_id=int(duel.get("challenger_id") or 0),
+        )
+        opponent_name = _display_user_name(
+            await db.get_user(int(duel.get("opponent_id") or 0)),
+            fallback_id=int(duel.get("opponent_id") or 0),
+        )
+        round_no = 1
+        while True:
+            await callback.message.answer(f"🎰 Раунд {round_no}: вращение {challenger_name}", parse_mode=None)
+            ch_msg = await callback.message.answer_dice(emoji="🎰")
+            challenger_roll = int((ch_msg.dice.value if ch_msg and ch_msg.dice else 0) or 0)
+
+            await callback.message.answer(f"🎰 Раунд {round_no}: вращение {opponent_name}", parse_mode=None)
+            op_msg = await callback.message.answer_dice(emoji="🎰")
+            opponent_roll = int((op_msg.dice.value if op_msg and op_msg.dice else 0) or 0)
+
+            ok, msg, payload = await db.resolve_group_casino_duel(
+                duel_id=int(raw),
+                accepter_id=callback.from_user.id,
+                challenger_roll=challenger_roll,
+                opponent_roll=opponent_roll,
+            )
+            if ok:
+                break
+            if "ничья" in str(msg).lower():
+                round_no += 1
+                await callback.message.answer("🤝 Равные комбинации. Крутим еще раз!", parse_mode=None)
+                continue
+            await callback.message.answer(f"❌ {msg}", parse_mode=None)
+            return
+    elif game_type == "roulette":
+        roll_value = random.randint(1, 36)
+        await callback.message.answer(f"🎯 Рулетка крутится... Выпало число: {roll_value}", parse_mode=None)
+        ok, msg, payload = await db.resolve_group_casino_duel(
+            duel_id=int(raw),
+            accepter_id=callback.from_user.id,
+            roll_value=roll_value,
+        )
     else:
         dice_msg = await callback.message.answer_dice(emoji=str(cfg.get("emoji")))
         roll_value = int((dice_msg.dice.value if dice_msg and dice_msg.dice else 0) or 0)
@@ -2515,6 +2901,42 @@ async def group_casino_duel_accept(callback: CallbackQuery, state: FSMContext):
             f"Комиссия (1%): ${house_fee:,.2f}\n"
             f"Победитель получил: ${winner_gain:,.2f}"
         )
+    elif game_type in {"slots3", "slots"}:
+        c_slots = str(payload.get("challenger_slots") or payload.get("challenger_roll") or "-")
+        o_slots = str(payload.get("opponent_slots") or payload.get("opponent_roll") or "-")
+        combo_labels = {"triple": "тройка", "pair": "пара", "none": "разные"}
+        c_combo = combo_labels.get(str(payload.get("challenger_slots_combo") or ""), "разные")
+        o_combo = combo_labels.get(str(payload.get("opponent_slots_combo") or ""), "разные")
+        result_text = (
+            "🏁 Дуэль завершена\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"Игра: {cfg.get('title')}\n"
+            "Правило: тройка > пара > разные\n"
+            f"Инициатор: {c_slots} ({c_combo})\n"
+            f"Соперник: {o_slots} ({o_combo})\n"
+            f"Победитель: {winner_name}\n"
+            f"Проиграл: {loser_name}\n"
+            f"Ставка: ${bet_amount:,.2f}\n"
+            f"Комиссия (1%): ${house_fee:,.2f}\n"
+            f"Победитель получил: ${winner_gain:,.2f}"
+        )
+    elif game_type == "roulette":
+        target_value = int(payload.get("target_value") or 0)
+        target_color = "red" if target_value == 1 else "black"
+        spin_number = int(payload.get("roll_value") or 0)
+        spin_color = str(payload.get("roulette_color") or "unknown")
+        result_text = (
+            "🏁 Дуэль завершена\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"Игра: {cfg.get('title')}\n"
+            f"Ставка инициатора: {target_color}\n"
+            f"Выпало: {spin_number} ({spin_color})\n"
+            f"Победитель: {winner_name}\n"
+            f"Проиграл: {loser_name}\n"
+            f"Ставка: ${bet_amount:,.2f}\n"
+            f"Комиссия (1%): ${house_fee:,.2f}\n"
+            f"Победитель получил: ${winner_gain:,.2f}"
+        )
     else:
         target_value = int(payload.get("target_value") or 0)
         result_text = (
@@ -2530,6 +2952,687 @@ async def group_casino_duel_accept(callback: CallbackQuery, state: FSMContext):
             f"Победитель получил: ${winner_gain:,.2f}"
         )
     await callback.message.answer(result_text, parse_mode=None)
+
+
+# ==================== СЕМЬЯ, БРАКИ, ПИТОМЦЫ ====================
+
+PET_TYPE_LABELS = {
+    "cat": "Кот",
+    "dog": "Пес",
+    "rabbit": "Кролик",
+    "parrot": "Попугай",
+    "fox": "Лис",
+}
+
+SOCIAL_ACTIONS = {
+    "обнять": "обнял(а)",
+    "поцеловать": "поцеловал(а)",
+    "погладить": "погладил(а)",
+    "укусить": "укусил(а)",
+}
+
+RELATIONSHIP_SPEND_BUTTONS = [
+    ("gift_small", "🎁 Подарок · 4 000"),
+    ("date_night", "🍽 Свидание · 18 000"),
+    ("weekend_trip", "✈️ Поездка · 60 000"),
+    ("resort_vacation", "🏝 Курорт · 140 000"),
+]
+RELATIONSHIP_REPLY_SPEND_MAP = {
+    "подарок": "gift_small",
+    "свидание": "date_night",
+    "поездка": "weekend_trip",
+    "курорт": "resort_vacation",
+    "gift": "gift_small",
+    "date": "date_night",
+    "trip": "weekend_trip",
+    "resort": "resort_vacation",
+}
+
+
+async def _render_family_menu(update, answer_query: bool = True):
+    if isinstance(update, CallbackQuery):
+        callback = update
+        if answer_query:
+            await callback.answer()
+        message = callback.message
+        if message is None:
+            return
+        user_id = int(callback.from_user.id)
+    else:
+        message = update
+        user_id = int(message.from_user.id)
+
+    marriage = await db.get_active_marriage(user_id)
+    account = await db.get_family_account(user_id)
+    estimate = await db.estimate_daily_family_expense(user_id)
+    pet = await db.get_user_pet(user_id)
+    relation_actions = sorted(db.list_relationship_actions(), key=lambda item: float(item.get("cost") or 0.0))
+
+    lines = [
+        "👨‍👩‍👧 СЕМЬЯ",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    if marriage:
+        spouse_id = int(marriage.get("spouse_id") or 0)
+        spouse_user = await db.get_user(spouse_id)
+        spouse_name = _display_user_name(spouse_user, fallback_id=spouse_id)
+        relation_level = int(marriage.get("relationship_level") or 1)
+        relation_points = int(marriage.get("relationship_points") or 0)
+        points_to_next = int(marriage.get("relationship_points_to_next") or 0)
+        upkeep_multiplier = float(marriage.get("relationship_upkeep_multiplier") or 1.0)
+        lines.extend(
+            [
+                f"Статус: в браке с {spouse_name}",
+                f"Вместе дней: {int(marriage.get('days_together') or 0)}",
+                f"Уровень отношений: {relation_level}/25 ({relation_points} очков)",
+                (
+                    f"До следующего уровня: {points_to_next} очк."
+                    if points_to_next > 0
+                    else "Достигнут максимальный уровень отношений."
+                ),
+                f"Коэффициент семейных расходов: x{upkeep_multiplier:.2f}",
+            ]
+        )
+    else:
+        lines.append("Статус: не в браке")
+
+    if pet:
+        pet_title = PET_TYPE_LABELS.get(str(pet.get("pet_type") or "").lower(), "Питомец")
+        lines.extend(
+            [
+                f"Питомец: {pet_title} '{pet.get('pet_name')}'",
+                (
+                    f"Показатели: сытость {int(pet.get('hunger') or 0)}/100, "
+                    f"настроение {int(pet.get('mood') or 0)}/100, "
+                    f"энергия {int(pet.get('energy') or 0)}/100"
+                ),
+            ]
+        )
+    else:
+        lines.append("Питомец: нет")
+
+    lines.extend(
+        [
+            "",
+            f"Ежедневные семейные расходы: {_lum(float(estimate.get('daily_total') or 0))}",
+            (
+                f"Базовое содержание семьи: {_lum(float(estimate.get('base_expense') or 0))}"
+                if marriage
+                else "Базовое содержание семьи: 0.00 люмов"
+            ),
+            f"Семейный долг: {_lum(float(account.get('family_debt') or 0))}",
+            f"Всего начислено: {_lum(float(account.get('total_family_charged') or 0))}",
+            f"Всего оплачено: {_lum(float(account.get('total_family_paid') or 0))}",
+            "",
+            "Групповые команды (reply): брак, обнять, поцеловать, погладить, подарок, свидание, поездка, курорт",
+        ]
+    )
+    if marriage and relation_actions:
+        lines.append("")
+        lines.append("Семейные дела для роста отношений:")
+        for action in relation_actions[:5]:
+            lines.append(
+                f"• {action.get('title')}: {_lum(float(action.get('cost') or 0))} "
+                f"(+{int(action.get('points') or 0)} очк.)"
+            )
+
+    keyboard_rows = []
+    if float(account.get("family_debt") or 0) > 0:
+        keyboard_rows.append([InlineKeyboardButton(text="💸 Погасить семейный долг", callback_data="family_pay_debt")])
+    if marriage:
+        for action in relation_actions[:5]:
+            action_key = str(action.get("key") or "").strip()
+            if not action_key:
+                continue
+            label = f"💞 {str(action.get('title') or 'Действие')} · {int(float(action.get('cost') or 0)):,.0f}"
+            keyboard_rows.append(
+                [InlineKeyboardButton(text=label, callback_data=f"family_rel_spend_{action_key}")]
+            )
+    keyboard_rows.append([InlineKeyboardButton(text="🐾 Питомец", callback_data="pet_menu")])
+    keyboard_rows.append([InlineKeyboardButton(text="🏆 Топ браков", callback_data="family_top")])
+    keyboard_rows.append([InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_main")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+
+    if isinstance(update, CallbackQuery):
+        await message.edit_text("\n".join(lines), reply_markup=keyboard, parse_mode=None)
+    else:
+        await message.answer("\n".join(lines), reply_markup=keyboard, parse_mode=None)
+
+
+async def _render_pet_menu(update, answer_query: bool = True):
+    if isinstance(update, CallbackQuery):
+        callback = update
+        if answer_query:
+            await callback.answer()
+        message = callback.message
+        if message is None:
+            return
+        user_id = int(callback.from_user.id)
+    else:
+        message = update
+        user_id = int(message.from_user.id)
+
+    pet = await db.get_user_pet(user_id)
+    if not pet:
+        text = (
+            "🐾 ПИТОМЕЦ\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "У вас пока нет питомца.\n"
+            "Стоимость усыновления: 1,500.00 люмов."
+        )
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🐱 Взять кота", callback_data="pet_adopt_cat")],
+                [InlineKeyboardButton(text="🐶 Взять пса", callback_data="pet_adopt_dog")],
+                [InlineKeyboardButton(text="🐰 Взять кролика", callback_data="pet_adopt_rabbit")],
+                [InlineKeyboardButton(text="🦜 Взять попугая", callback_data="pet_adopt_parrot")],
+                [InlineKeyboardButton(text="🦊 Взять лиса", callback_data="pet_adopt_fox")],
+                [InlineKeyboardButton(text="🎁 Ящики питомцев", callback_data="pet_loot_menu")],
+                [InlineKeyboardButton(text="🔙 К семье", callback_data="family_menu")],
+            ]
+        )
+        if isinstance(update, CallbackQuery):
+            await message.edit_text(text, reply_markup=keyboard, parse_mode=None)
+        else:
+            await message.answer(text, reply_markup=keyboard, parse_mode=None)
+        return
+
+    pet_title = PET_TYPE_LABELS.get(str(pet.get("pet_type") or "").lower(), "Питомец")
+    rarity = str(pet.get("rarity") or "обычный")
+    bonus_type = str(pet.get("bonus_type") or "").strip().lower()
+    bonus_value = float(pet.get("bonus_value") or 0.0)
+    bonus_line = ""
+    if bonus_type == "family_discount_pct" and bonus_value > 0:
+        bonus_line = f"Бонус: -{bonus_value * 100:.0f}% к семейным расходам\n"
+
+    text = (
+        "🐾 ПИТОМЕЦ\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"{pet_title}: {pet.get('pet_name')}\n"
+        f"Редкость: {rarity}\n"
+        f"Уровень: {int(pet.get('level') or 1)} (XP: {int(pet.get('xp') or 0)})\n"
+        f"Сытость: {int(pet.get('hunger') or 0)}/100\n"
+        f"Настроение: {int(pet.get('mood') or 0)}/100\n"
+        f"Энергия: {int(pet.get('energy') or 0)}/100\n"
+        f"Здоровье: {int(pet.get('health') or 0)}/100\n\n"
+        f"{bonus_line}"
+        "Команды:\n"
+        "/petname <имя> — переименовать питомца"
+    )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🍖 Покормить", callback_data="pet_action_feed")],
+            [InlineKeyboardButton(text="🎾 Поиграть", callback_data="pet_action_play")],
+            [InlineKeyboardButton(text="🎓 Тренировка", callback_data="pet_action_train")],
+            [InlineKeyboardButton(text="🎁 Ящики питомцев", callback_data="pet_loot_menu")],
+            [InlineKeyboardButton(text="🕊️ Отпустить", callback_data="pet_release")],
+            [InlineKeyboardButton(text="🔙 К семье", callback_data="family_menu")],
+        ]
+    )
+    if isinstance(update, CallbackQuery):
+        await message.edit_text(text, reply_markup=keyboard, parse_mode=None)
+    else:
+        await message.answer(text, reply_markup=keyboard, parse_mode=None)
+
+
+async def _start_marriage_from_reply(message: Message):
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.reply("❌ Ответьте на сообщение игрока, которому хотите сделать предложение.")
+        return
+
+    proposer_id = int(message.from_user.id)
+    target_user = message.reply_to_message.from_user
+    target_id = int(target_user.id)
+    if target_user.is_bot:
+        await message.reply("❌ Нельзя предложить брак боту.")
+        return
+    if proposer_id == target_id:
+        await message.reply("❌ Нельзя создать брак с самим собой.")
+        return
+
+    await db.create_or_update_user(
+        target_id,
+        target_user.username or "",
+        f"{target_user.first_name or ''} {target_user.last_name or ''}".strip(),
+    )
+    ok, msg, payload = await db.create_marriage_proposal(
+        proposer_id=proposer_id,
+        target_id=target_id,
+        source_chat_id=int(message.chat.id),
+    )
+    if not ok or not payload:
+        await message.reply(f"❌ {msg}", parse_mode=None)
+        return
+
+    proposal_id = int(payload.get("proposal_id") or 0)
+    proposer_name = _display_user_name(await db.get_user(proposer_id), fallback_id=proposer_id)
+    target_name = _display_user_name(await db.get_user(target_id), fallback_id=target_id)
+    await message.reply(
+        "💍 ПРЕДЛОЖЕНИЕ БРАКА\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"Инициатор: {proposer_name}\n"
+        f"Партнер: {target_name}\n"
+        "⏳ Действует 5 минут.\n\n"
+        "Партнеру нужно нажать кнопку ниже:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Принять", callback_data=f"fm_marry_accept_{proposal_id}"),
+                    InlineKeyboardButton(text="❌ Отказать", callback_data=f"fm_marry_reject_{proposal_id}"),
+                ]
+            ]
+        ),
+        parse_mode=None,
+    )
+
+
+@router.message(Command("marry", "брак"), F.reply_to_message, F.chat.type.in_({"group", "supergroup"}))
+@router.message(
+    F.reply_to_message,
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.regexp(r"^/(?:marry|брак)(?:@\w+)?(?:\s.*)?$"),
+)
+async def family_marry_command(message: Message, state: FSMContext):
+    await _start_marriage_from_reply(message)
+
+
+@router.message(Command("marry", "брак"))
+async def family_marry_usage(message: Message, state: FSMContext):
+    await message.answer(
+        "Использование: ответьте на сообщение человека в группе и напишите /marry\n"
+        "Также поддерживается /брак или reply-команда «брак» (если в группе выключен privacy mode).",
+        parse_mode=None,
+    )
+
+
+@router.callback_query(F.data.startswith("fm_marry_accept_"))
+@router.callback_query(F.data.startswith("fm_marry_reject_"))
+async def family_marry_decision(callback: CallbackQuery, state: FSMContext):
+    data = callback.data or ""
+    accept = data.startswith("fm_marry_accept_")
+    raw = data.replace("fm_marry_accept_", "").replace("fm_marry_reject_", "")
+    if not raw.isdigit():
+        await callback.answer("Некорректное предложение.", show_alert=True)
+        return
+    ok, msg, payload = await db.respond_marriage_proposal(
+        target_user_id=callback.from_user.id,
+        proposal_id=int(raw),
+        accept=accept,
+    )
+    if not ok:
+        if callback.message and "истек" in str(msg or "").lower():
+            await callback.message.edit_text(
+                "⌛ ПРЕДЛОЖЕНИЕ ИСТЕКЛО\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "На ответ было 5 минут. Отправьте новое предложение.",
+                parse_mode=None,
+            )
+        await callback.answer(msg, show_alert=True)
+        return
+
+    await callback.answer("Готово.")
+    proposal = payload or {}
+    proposer_id = int(proposal.get("proposer_id") or 0)
+    target_id = int(proposal.get("target_id") or 0)
+    proposer_name = _display_user_name(await db.get_user(proposer_id), fallback_id=proposer_id)
+    target_name = _display_user_name(await db.get_user(target_id), fallback_id=target_id)
+    if callback.message:
+        if accept:
+            await callback.message.edit_text(
+                "💒 БРАК ЗАРЕГИСТРИРОВАН\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"{proposer_name} ❤️ {target_name}\n"
+                "Теперь у вас общий семейный статус.\n"
+                "Команда: /family",
+                parse_mode=None,
+            )
+        else:
+            await callback.message.edit_text(
+                "💔 ПРЕДЛОЖЕНИЕ ОТКЛОНЕНО\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"{target_name} отклонил(а) предложение от {proposer_name}.",
+                parse_mode=None,
+            )
+
+
+@router.message(Command("divorce"))
+async def family_divorce_command(message: Message, state: FSMContext):
+    lowered = (message.text or "").lower()
+    mode = "silent" if ("тихо" in lowered or "silent" in lowered) else "public"
+    ok, msg, payload = await db.divorce_marriage(message.from_user.id, mode=mode)
+    if not ok or not payload:
+        await message.answer(f"❌ {msg}", parse_mode=None)
+        return
+    data = payload or {}
+    spouse_id = int(data.get("spouse_id") or 0)
+    spouse_name = _display_user_name(await db.get_user(spouse_id), fallback_id=spouse_id)
+    days = int(data.get("days_together") or 0)
+    if mode == "public" and message.chat.type in {"group", "supergroup"}:
+        await message.answer(
+            "⚖️ СЕМЕЙНЫЙ СТАТУС ОБНОВЛЕН\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"Развод оформлен с {spouse_name}.\n"
+            f"Стаж брака: {days} дн.",
+            parse_mode=None,
+        )
+    else:
+        await message.answer(
+            f"✅ Развод оформлен. Стаж брака: {days} дн.\nПартнер: {spouse_name}",
+            parse_mode=None,
+        )
+
+
+@router.message(Command("family"))
+@router.callback_query(F.data == "family_menu")
+async def family_menu(update, state: FSMContext):
+    await _render_family_menu(update)
+
+
+@router.callback_query(F.data == "family_pay_debt")
+async def family_pay_debt(callback: CallbackQuery, state: FSMContext):
+    ok, msg, payload = await db.pay_family_debt(callback.from_user.id, amount=None)
+    await callback.answer(("✅ " if ok else "❌ ") + msg, show_alert=not ok)
+    if ok and callback.message and payload:
+        await callback.message.answer(
+            "💸 СЕМЕЙНЫЙ ДОЛГ ОПЛАЧЕН\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"Оплачено: {_lum(float(payload.get('paid_total') or 0))}\n"
+            f"Остаток долга: {_lum(float(payload.get('debt_after') or 0))}",
+            parse_mode=None,
+        )
+    await _render_family_menu(callback, answer_query=False)
+
+
+@router.callback_query(F.data.startswith("family_rel_spend_"))
+async def family_relationship_spend(callback: CallbackQuery, state: FSMContext):
+    action_key = (callback.data or "").replace("family_rel_spend_", "", 1).strip()
+    ok, msg, payload = await db.spend_on_partner(callback.from_user.id, action_key)
+    await callback.answer(("✅ " if ok else "❌ ") + msg, show_alert=not ok)
+    if ok and callback.message and payload:
+        spouse_id = int(payload.get("partner_id") or 0)
+        spouse_name = _display_user_name(await db.get_user(spouse_id), fallback_id=spouse_id)
+        level_up = int(payload.get("level_up") or 0)
+        level_after = int(payload.get("relationship_level") or 1)
+        points_after = int(payload.get("relationship_points") or 0)
+        next_points = int(payload.get("relationship_points_to_next") or 0)
+        message_lines = [
+            "💞 СЕМЕЙНАЯ ТРАТА",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"Действие: {payload.get('action_title')}",
+            f"Партнер: {spouse_name}",
+            f"Списано: {_lum(float(payload.get('cost') or 0))}",
+            f"Бонус отношений: +{int(payload.get('points_added') or 0)} очк.",
+            f"Бонус репутации (обоим): +{float(payload.get('reputation_bonus') or 0):.2f}",
+            f"Уровень отношений: {level_after}/25 ({points_after} очк.)",
+        ]
+        if next_points > 0:
+            message_lines.append(f"До следующего уровня: {next_points} очк.")
+        else:
+            message_lines.append("Максимальный уровень отношений достигнут.")
+        if level_up > 0:
+            message_lines.append(f"🎉 Повышение: +{level_up} ур.")
+        await callback.message.answer("\n".join(message_lines), parse_mode=None)
+    await _render_family_menu(callback, answer_query=False)
+
+
+@router.message(Command("familytop"))
+@router.callback_query(F.data == "family_top")
+async def family_top(update, state: FSMContext):
+    if isinstance(update, CallbackQuery):
+        await update.answer()
+        message = update.message
+        if message is None:
+            return
+    else:
+        message = update
+
+    rows = await db.list_marriage_top(limit=10)
+    lines = ["🏆 ТОП БРАКОВ", "━━━━━━━━━━━━━━━━━━━━", ""]
+    if not rows:
+        lines.append("Пока нет активных браков.")
+    else:
+        for idx, row in enumerate(rows, start=1):
+            lines.append(
+                f"{idx}. {row.get('user1_name')} ❤️ {row.get('user2_name')} — "
+                f"{int(row.get('days_together') or 0)} дн. | "
+                f"ур. {int(row.get('relationship_level') or 1)}/25"
+            )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 К семье", callback_data="family_menu")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="back_to_main")],
+        ]
+    )
+    if isinstance(update, CallbackQuery):
+        await message.edit_text("\n".join(lines), reply_markup=keyboard, parse_mode=None)
+    else:
+        await message.answer("\n".join(lines), reply_markup=keyboard, parse_mode=None)
+
+
+@router.message(Command("pet"))
+@router.callback_query(F.data == "pet_menu")
+async def pet_menu(update, state: FSMContext):
+    await _render_pet_menu(update)
+
+
+@router.callback_query(F.data.startswith("pet_adopt_"))
+async def pet_adopt(callback: CallbackQuery, state: FSMContext):
+    pet_type = (callback.data or "").replace("pet_adopt_", "")
+    ok, msg, payload = await db.adopt_pet(callback.from_user.id, pet_type, pet_name=PET_TYPE_LABELS.get(pet_type, "Питомец"))
+    await callback.answer(("✅ " if ok else "❌ ") + msg, show_alert=not ok)
+    if ok and callback.message and payload:
+        await callback.message.answer(
+            "🐾 Новый член семьи!\n"
+            f"{payload.get('pet_title')} по имени {payload.get('pet_name')} теперь с вами.",
+            parse_mode=None,
+        )
+    await _render_pet_menu(callback, answer_query=False)
+
+
+@router.callback_query(F.data.startswith("pet_action_"))
+async def pet_action(callback: CallbackQuery, state: FSMContext):
+    action = (callback.data or "").replace("pet_action_", "")
+    ok, msg, payload = await db.interact_with_pet(callback.from_user.id, action)
+    await callback.answer(("✅ " if ok else "❌ ") + msg, show_alert=not ok)
+    if ok and callback.message and payload:
+        add = ""
+        if int(payload.get("level_up") or 0) > 0:
+            add = f"\n🎉 Уровень питомца повышен на {int(payload.get('level_up') or 0)}!"
+        await callback.message.answer(
+            f"🐾 {payload.get('pet_name')}: действие выполнено."
+            f"\nСытость: {int(payload.get('hunger') or 0)}/100"
+            f"\nНастроение: {int(payload.get('mood') or 0)}/100"
+            f"\nЭнергия: {int(payload.get('energy') or 0)}/100"
+            f"{add}",
+            parse_mode=None,
+        )
+    await _render_pet_menu(callback, answer_query=False)
+
+
+@router.callback_query(F.data == "pet_release")
+async def pet_release(callback: CallbackQuery, state: FSMContext):
+    ok, msg = await db.release_pet(callback.from_user.id)
+    await callback.answer(("✅ " if ok else "❌ ") + msg, show_alert=not ok)
+    await _render_pet_menu(callback, answer_query=False)
+
+
+@router.message(Command("petname"))
+async def pet_rename(message: Message, state: FSMContext):
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("❌ Использование: /petname НовоеИмя", parse_mode=None)
+        return
+    ok, msg, payload = await db.rename_pet(message.from_user.id, parts[1].strip())
+    if not ok:
+        await message.answer(f"❌ {msg}", parse_mode=None)
+        return
+    await message.answer(
+        f"✅ Питомец переименован: {payload.get('old_name')} -> {payload.get('new_name')}",
+        parse_mode=None,
+    )
+
+
+@router.callback_query(F.data == "pet_loot_menu")
+async def pet_loot_menu(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    text = (
+        "🎁 ЯЩИКИ ПИТОМЦЕВ\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Откройте ящик и получите питомца с редкостью и бонусами.\n"
+        "Важно: открыть можно только если у вас нет активного питомца.\n\n"
+        "Типы ящиков:\n"
+        "• Обычный — 5,000 люмов\n"
+        "• Редкий — 15,000 люмов\n"
+        "• Эпик — 40,000 люмов\n"
+        "• Мифический — 90,000 люмов\n"
+        "• Легендарный — 200,000 люмов"
+    )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📦 Обычный", callback_data="pet_loot_open_common")],
+            [InlineKeyboardButton(text="📦 Редкий", callback_data="pet_loot_open_rare")],
+            [InlineKeyboardButton(text="📦 Эпик", callback_data="pet_loot_open_epic")],
+            [InlineKeyboardButton(text="📦 Мифический", callback_data="pet_loot_open_myth")],
+            [InlineKeyboardButton(text="📦 Легендарный", callback_data="pet_loot_open_legend")],
+            [InlineKeyboardButton(text="🔙 К питомцу", callback_data="pet_menu")],
+        ]
+    )
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode=None)
+
+
+@router.callback_query(F.data.startswith("pet_loot_open_"))
+async def pet_loot_open(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    box_key = (callback.data or "").replace("pet_loot_open_", "").strip().lower()
+    ok, msg, payload = await db.open_pet_lootbox(callback.from_user.id, box_key)
+    if not ok:
+        await callback.message.answer(f"❌ {msg}", parse_mode=None)
+        await _render_pet_menu(callback, answer_query=False)
+        return
+    payload = payload or {}
+    bonus_value = float(payload.get("bonus_value") or 0.0)
+    await callback.message.answer(
+        "🎉 Питомец получен!\n"
+        f"Редкость: {payload.get('rarity')}\n"
+        f"Питомец: {payload.get('pet_title')} {payload.get('pet_name')}\n"
+        f"Бонус: -{bonus_value * 100:.0f}% к семейным расходам\n"
+        f"Списано: {float(payload.get('price') or 0):,.2f} люмов",
+        parse_mode=None,
+    )
+    await _render_pet_menu(callback, answer_query=False)
+
+
+@router.message(F.reply_to_message, F.chat.type.in_({"group", "supergroup"}))
+async def group_family_quick_actions(message: Message, state: FSMContext):
+    raw = str(message.text or "")
+    cmd = _normalize_reply_token(raw)
+    if not cmd:
+        return UNHANDLED
+    if cmd in {"+", "плюс"}:
+        await _apply_plus_reputation(message)
+        return
+    if cmd in {"брак", "marry"}:
+        await _start_marriage_from_reply(message)
+        return
+    if cmd in RELATIONSHIP_REPLY_SPEND_MAP:
+        target_user = message.reply_to_message.from_user if message.reply_to_message else None
+        if not target_user or target_user.is_bot:
+            await message.reply("❌ Ответьте на сообщение партнера по браку.", parse_mode=None)
+            return
+        ok, msg, payload = await db.spend_on_partner(
+            actor_id=message.from_user.id,
+            action_key=RELATIONSHIP_REPLY_SPEND_MAP[cmd],
+            target_partner_id=int(target_user.id),
+        )
+        if not ok or not payload:
+            await message.reply(f"❌ {msg}", parse_mode=None)
+            return
+        level_after = int(payload.get("relationship_level") or 1)
+        points_after = int(payload.get("relationship_points") or 0)
+        next_points = int(payload.get("relationship_points_to_next") or 0)
+        level_up = int(payload.get("level_up") or 0)
+        text = (
+            f"💞 {message.from_user.full_name} устроил(а) '{payload.get('action_title')}' для партнера.\n"
+            f"Списано: {_lum(float(payload.get('cost') or 0))}\n"
+            f"Бонус отношений: +{int(payload.get('points_added') or 0)} очк.\n"
+            f"Уровень отношений: {level_after}/25 ({points_after} очк.)"
+        )
+        if next_points > 0:
+            text += f"\nДо следующего уровня: {next_points} очк."
+        if level_up > 0:
+            text += f"\n🎉 Повышение: +{level_up} ур."
+        await message.reply(text, parse_mode=None)
+        return
+    if cmd in {"развод", "divorce"}:
+        ok, msg, payload = await db.divorce_marriage(message.from_user.id, mode="public")
+        if not ok:
+            await message.reply(f"❌ {msg}", parse_mode=None)
+            return
+        spouse_id = int((payload or {}).get("spouse_id") or 0)
+        spouse_name = _display_user_name(await db.get_user(spouse_id), fallback_id=spouse_id)
+        await message.reply(
+            f"⚖️ Развод оформлен публично. Партнер: {spouse_name}",
+            parse_mode=None,
+        )
+        return
+    if cmd not in SOCIAL_ACTIONS:
+        return UNHANDLED
+
+    target_user = message.reply_to_message.from_user if message.reply_to_message else None
+    if not target_user:
+        return UNHANDLED
+    if target_user.is_bot:
+        await message.reply("❌ С ботом взаимодействие недоступно.", parse_mode=None)
+        return
+    actor_id = int(message.from_user.id)
+    target_id = int(target_user.id)
+    if actor_id == target_id:
+        await message.reply("❌ Нельзя использовать это действие на себе.", parse_mode=None)
+        return
+
+    await db.create_or_update_user(
+        target_id,
+        target_user.username or "",
+        f"{target_user.first_name or ''} {target_user.last_name or ''}".strip(),
+    )
+    actor_name = _display_user_name(await db.get_user(actor_id), fallback_id=actor_id)
+    target_name = _display_user_name(await db.get_user(target_id), fallback_id=target_id)
+    verb = SOCIAL_ACTIONS[cmd]
+
+    marriage = await db.get_active_marriage(actor_id)
+    is_spouse = bool(marriage and int(marriage.get("spouse_id") or 0) == target_id)
+    rep_bonus = 0.0
+    if is_spouse and cmd in {"обнять", "поцеловать", "погладить"}:
+        rep_bonus = 0.2
+        target_user_data = await db.get_user(target_id) or {}
+        new_rep = round(min(100.0, float(target_user_data.get("reputation") or 50.0) + rep_bonus), 2)
+        await db.update_user(target_id, reputation=new_rep)
+        rel_ok, _, rel_payload = await db.add_marriage_relationship_points(
+            actor_id=actor_id,
+            partner_id=target_id,
+            points=4 if cmd == "поцеловать" else 3,
+            reason=f"social:{cmd}",
+        )
+        if rel_ok and rel_payload:
+            rel_level = int(rel_payload.get("relationship_level") or 1)
+            rel_left = int(rel_payload.get("relationship_points_to_next") or 0)
+            text_suffix = f"\n💞 Уровень отношений: {rel_level}/25."
+            if rel_left > 0:
+                text_suffix += f" До следующего: {rel_left} очк."
+            if int(rel_payload.get("level_up") or 0) > 0:
+                text_suffix += f" 🎉 +{int(rel_payload.get('level_up') or 0)} ур."
+        else:
+            text_suffix = ""
+    else:
+        text_suffix = ""
+
+    text = f"💬 {actor_name} {verb} {target_name}."
+    if is_spouse and rep_bonus > 0:
+        text += f"\n💞 Семейная близость: +{rep_bonus:.1f} репутации для {target_name}."
+        text += text_suffix
+    await message.reply(text, parse_mode=None)
 
 
 # ==================== ЕЖЕДНЕВНЫЕ НАЛОГИ ====================
@@ -2551,12 +3654,16 @@ async def daily_tax_status(update, state: FSMContext):
     status = await db.get_user_daily_tax_status(user_id)
     pending = status.get("pending") or {}
     latest = status.get("latest") or {}
+    total_tax_charged = await db.get_user_total_tax_charged(user_id)
+    total_tax_paid = await db.get_user_total_tax_paid(user_id)
 
     lines = [
         "🧾 ЕЖЕДНЕВНЫЕ НАЛОГИ",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"Баланс: ${float(user.get('balance') or 0):,.2f}",
-        f"Налоговый долг: ${float(user.get('tax_debt') or 0):,.2f}",
+        f"Баланс: {_lum(float(user.get('balance') or 0))}",
+        f"Налоговый долг: {_lum(float(user.get('tax_debt') or 0))}",
+        f"Всего начислено: {_lum(total_tax_charged)}",
+        f"Всего оплачено: {_lum(total_tax_paid)}",
         "",
     ]
     keyboard_rows: list[list[InlineKeyboardButton]] = []
@@ -2578,21 +3685,25 @@ async def daily_tax_status(update, state: FSMContext):
         lines.extend(
             [
                 f"Дата счета: {cycle_date}",
-                f"К оплате сегодня: ${due_total:,.2f}",
-                f"• Налог на проживание: ${living_tax:,.2f}",
-                f"• Налог на работу: ${work_tax:,.2f}",
-                f"• Налог на недвижимость: ${property_tax:,.2f}",
-                f"• Налог на бизнесы: ${business_tax:,.2f}",
-                f"• Налог на частные организации: ${private_org_tax:,.2f}",
-                f"• Проценты по долгу: ${debt_interest:,.2f}",
-                f"• Плановый платеж долга: ${scheduled_payment:,.2f}",
+                f"К оплате сегодня: {_lum(due_total)}",
+                f"• Налог на проживание: {_lum(living_tax)}",
+                f"• Налог на работу: {_lum(work_tax)}",
+                f"• Налог на недвижимость и капитал: {_lum(property_tax)}",
+                f"• Налог на бизнесы и банды: {_lum(business_tax)}",
+                f"• Налог на частные организации: {_lum(private_org_tax)}",
+                f"• Проценты по долгу: {_lum(debt_interest)}",
+                f"• Плановый платеж долга: {_lum(scheduled_payment)}",
+                "",
+                "Ставка налога:",
+                "• 15% от общего имущества (все активы игрока).",
                 "",
                 "Оплатите до следующего налогового цикла, иначе начисление уйдет в долг.",
+                "При просрочке дополнительно списывается штраф 1.5% от общего налогового долга.",
             ]
         )
         if token:
             keyboard_rows.append(
-                [InlineKeyboardButton(text=f"💳 Оплатить ${due_total:,.2f}", callback_data=f"daily_tax_pay_{token}")]
+                [InlineKeyboardButton(text=f"💳 Оплатить {_lum(due_total)}", callback_data=f"daily_tax_pay_{token}")]
             )
     else:
         lines.append("✅ На сегодня неоплаченных налогов нет.")
@@ -2603,10 +3714,13 @@ async def daily_tax_status(update, state: FSMContext):
     keyboard_rows.append([InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_main")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
 
-    if isinstance(update, Message):
-        await message.answer("\n".join(lines), reply_markup=keyboard, parse_mode=None)
-    else:
-        await message.edit_text("\n".join(lines), reply_markup=keyboard, parse_mode=None)
+    await send_section_screen(
+        update,
+        text="\n".join(lines),
+        reply_markup=keyboard,
+        parse_mode=None,
+        section_key="nalog",
+    )
 
 
 @router.callback_query(F.data.startswith("daily_tax_pay_"))
@@ -2632,17 +3746,17 @@ async def daily_tax_pay(callback: CallbackQuery, state: FSMContext):
             "━━━━━━━━━━━━━━━━━━━━\n"
             "Президент освобожден от ежедневного налога.\n"
             f"Дата счета: {details.get('cycle_date')}\n"
-            f"Баланс: ${balance_after:,.2f}\n"
-            f"Налоговый долг: ${debt_after:,.2f}"
+            f"Баланс: {_lum(balance_after)}\n"
+            f"Налоговый долг: {_lum(debt_after)}"
         )
     else:
         text = (
             "✅ Налог за день оплачен\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             f"Дата: {details.get('cycle_date')}\n"
-            f"Оплачено: ${paid_total:,.2f}\n"
-            f"Баланс после оплаты: ${balance_after:,.2f}\n"
-            f"Налоговый долг: ${debt_after:,.2f}"
+            f"Оплачено: {_lum(paid_total)}\n"
+            f"Баланс после оплаты: {_lum(balance_after)}\n"
+            f"Налоговый долг: {_lum(debt_after)}"
         )
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -2652,6 +3766,145 @@ async def daily_tax_pay(callback: CallbackQuery, state: FSMContext):
     )
     if callback.message is not None:
         await callback.message.answer(text, reply_markup=keyboard, parse_mode=None)
+
+
+# ==================== CHARITY ====================
+
+@router.callback_query(F.data == "charity_menu")
+@router.message(Command("charity"))
+async def charity_menu(update, state: FSMContext):
+    await state.set_state(MainStates.main_menu)
+    if isinstance(update, Message):
+        user_id = update.from_user.id
+        message = update
+    else:
+        user_id = update.from_user.id
+        await update.answer()
+        message = update.message
+        if message is None:
+            return
+
+    user = await db.get_user(user_id) or {}
+    lines = [
+        "🤝 CHARITY-ФОНД МИРНАСТАНА",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Ваш баланс: {_lum(float(user.get('balance') or 0))}",
+        "",
+        "Пожертвования не исчезают из игры:",
+        "• 70% идет в госбюджет",
+        "• 30% идет в налоговую службу",
+        "",
+        "За пожертвование растет репутация.",
+    ]
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💝 Пожертвовать 1 000", callback_data="charity_donate_1000")],
+            [InlineKeyboardButton(text="💝 Пожертвовать 5 000", callback_data="charity_donate_5000")],
+            [InlineKeyboardButton(text="💝 Пожертвовать 20 000", callback_data="charity_donate_20000")],
+            [InlineKeyboardButton(text="💝 Пожертвовать 100 000", callback_data="charity_donate_100000")],
+            [InlineKeyboardButton(text="✍️ Ввести свою сумму", callback_data="charity_donate_custom")],
+            [InlineKeyboardButton(text="🔙 В экономику", callback_data="menu_section_economy")],
+        ]
+    )
+    await send_section_screen(
+        update,
+        text="\n".join(lines),
+        reply_markup=keyboard,
+        parse_mode=None,
+        section_key="charity",
+    )
+
+
+@router.callback_query(F.data == "charity_donate_custom")
+async def charity_donate_custom_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(MainStates.charity_custom_amount)
+    if callback.message is not None:
+        await callback.message.answer(
+            "Введите сумму пожертвования (например: 7500):",
+            reply_markup=get_back_button("🔙 Отмена", "charity_menu"),
+            parse_mode=None,
+        )
+
+
+@router.callback_query(F.data.startswith("charity_donate_"))
+async def charity_donate(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(MainStates.main_menu)
+    raw = (callback.data or "").replace("charity_donate_", "", 1)
+    if not raw.isdigit():
+        await callback.answer("Некорректная сумма.", show_alert=True)
+        return
+    amount = float(raw)
+    ok, msg, payload = await db.donate_to_charity(callback.from_user.id, amount)
+    if not ok:
+        await callback.answer(msg, show_alert=True)
+        return
+    payload = payload or {}
+    await callback.answer("Пожертвование отправлено.")
+    if callback.message is not None:
+        await callback.message.answer(
+            "✅ Charity выполнен\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"Пожертвовано: {_lum(float(payload.get('amount') or 0))}\n"
+            f"Бонус репутации: +{float(payload.get('rep_bonus') or 0):.2f}\n"
+            f"В госбюджет: {_lum(float(payload.get('government_credit') or 0))}\n"
+            f"В налоговую: {_lum(float(payload.get('tax_service_credit') or 0))}\n"
+            f"Новый баланс: {_lum(float(payload.get('balance_after') or 0))}",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🤝 Еще donation", callback_data="charity_menu")],
+                    [InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_main")],
+                ]
+            ),
+            parse_mode=None,
+        )
+
+
+@router.message(MainStates.charity_custom_amount, F.text, ~F.text.startswith("/"))
+async def charity_donate_custom_amount_input(message: Message, state: FSMContext):
+    amount = _parse_money_amount(message.text or "")
+    if amount is None:
+        await message.answer(
+            "❌ Некорректная сумма. Введите число больше нуля.",
+            reply_markup=get_back_button("🔙 Отмена", "charity_menu"),
+            parse_mode=None,
+        )
+        return
+    ok, msg, payload = await db.donate_to_charity(message.from_user.id, amount)
+    if not ok:
+        await message.answer(
+            f"❌ {msg}",
+            reply_markup=get_back_button("🔙 К charity", "charity_menu"),
+            parse_mode=None,
+        )
+        return
+    await state.set_state(MainStates.main_menu)
+    payload = payload or {}
+    await message.answer(
+        "✅ Charity выполнен\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"Пожертвовано: {_lum(float(payload.get('amount') or 0))}\n"
+        f"Бонус репутации: +{float(payload.get('rep_bonus') or 0):.2f}\n"
+        f"В госбюджет: {_lum(float(payload.get('government_credit') or 0))}\n"
+        f"В налоговую: {_lum(float(payload.get('tax_service_credit') or 0))}\n"
+        f"Новый баланс: {_lum(float(payload.get('balance_after') or 0))}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🤝 Еще donation", callback_data="charity_menu")],
+                [InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_main")],
+            ]
+        ),
+        parse_mode=None,
+    )
+
+
+@router.message(MainStates.charity_custom_amount)
+async def charity_donate_custom_amount_invalid(message: Message):
+    await message.answer(
+        "❌ Отправьте сумму обычным текстом (например: 10000).",
+        reply_markup=get_back_button("🔙 Отмена", "charity_menu"),
+        parse_mode=None,
+    )
 
 
 # ==================== ЕЖЕДНЕВНЫЙ БОНУС ====================
@@ -2688,9 +3941,9 @@ async def daily_bonus(update, state: FSMContext):
         )
         return
     
-    # Выдаем бонус (случайное значение от 500 до 2000)
+    # Выдаем бонус (случайное значение от 250 до 900)
     import random
-    bonus = random.randint(500, 2000)
+    bonus = random.randint(250, 900)
     
     new_balance = float(user.get('balance', 0) or 0) + bonus
     await db.update_user(user_id, balance=new_balance, last_daily_bonus=datetime.now().isoformat())
@@ -2897,7 +4150,7 @@ async def _send_party_invitation(
     """Создать приглашение в БД и попытаться отправить уведомление игроку."""
     party_id = int(party.get("id") or -1)
     now = datetime.now().isoformat()
-    async with aiosqlite.connect(db.db_path) as conn:
+    async with db._connect() as conn:
         await conn.execute(
             '''INSERT INTO party_invitations (party_id, invited_user_id, invited_by_id, created_date, status)
                VALUES (?, ?, ?, ?, 'pending')
@@ -3543,7 +4796,7 @@ async def party_request_join(callback: CallbackQuery, callback_data: PartyCallba
         switch_note = f"{left_msg}\n"
 
     now = datetime.now().isoformat()
-    async with aiosqlite.connect(db.db_path) as conn:
+    async with db._connect() as conn:
         await conn.execute(
             '''INSERT INTO party_invitations (party_id, invited_user_id, invited_by_id, created_date, status)
                VALUES (?, ?, ?, ?, 'request')
@@ -3664,7 +4917,7 @@ async def party_handle_request(callback: CallbackQuery, callback_data: PartyCall
         await callback.answer("❌ Только лидер партии может обрабатывать заявки.", show_alert=True)
         return
 
-    async with aiosqlite.connect(db.db_path) as conn:
+    async with db._connect() as conn:
         conn.row_factory = aiosqlite.Row
         cur = await conn.execute(
             "SELECT status FROM party_invitations WHERE party_id = ? AND invited_user_id = ?",
@@ -3685,7 +4938,7 @@ async def party_handle_request(callback: CallbackQuery, callback_data: PartyCall
             await _safe_edit(callback, f"❌ Не удалось принять в партию: {msg}", _election_back_markup(election_id))
             return
 
-        async with aiosqlite.connect(db.db_path) as conn:
+        async with db._connect() as conn:
             await conn.execute(
                 "UPDATE party_invitations SET status = ?, created_date = ? WHERE party_id = ? AND invited_user_id = ?",
                 (new_status, now, party_id, invited_user_id),
@@ -3703,7 +4956,7 @@ async def party_handle_request(callback: CallbackQuery, callback_data: PartyCall
 
         await _safe_edit(callback, "✅ Игрок принят в партию.", _election_back_markup(election_id))
     else:
-        async with aiosqlite.connect(db.db_path) as conn:
+        async with db._connect() as conn:
             await conn.execute(
                 "UPDATE party_invitations SET status = ?, created_date = ? WHERE party_id = ? AND invited_user_id = ?",
                 (new_status, now, party_id, invited_user_id),
@@ -3924,7 +5177,7 @@ async def party_answer_invite(callback: CallbackQuery, callback_data: PartyCallb
 
     election_id = party_election_id
 
-    async with aiosqlite.connect(db.db_path) as conn:
+    async with db._connect() as conn:
         conn.row_factory = aiosqlite.Row
         cur = await conn.execute(
             "SELECT status FROM party_invitations WHERE party_id = ? AND invited_user_id = ?",
@@ -3954,7 +5207,7 @@ async def party_answer_invite(callback: CallbackQuery, callback_data: PartyCallb
             await _safe_edit(callback, f"❌ Не удалось вступить в партию: {msg}", _election_back_markup(election_id))
             return
 
-        async with aiosqlite.connect(db.db_path) as conn:
+        async with db._connect() as conn:
             await conn.execute(
                 "UPDATE party_invitations SET status = ?, created_date = ? WHERE party_id = ? AND invited_user_id = ?",
                 ('accepted', now, party_id, user_id),
@@ -3969,7 +5222,7 @@ async def party_answer_invite(callback: CallbackQuery, callback_data: PartyCallb
 
         await _safe_edit(callback, f"{switch_note}✅ Вы вступили в партию '{party.get('name')}'.", _election_back_markup(election_id))
     else:
-        async with aiosqlite.connect(db.db_path) as conn:
+        async with db._connect() as conn:
             await conn.execute(
                 "UPDATE party_invitations SET status = ?, created_date = ? WHERE party_id = ? AND invited_user_id = ?",
                 ('rejected', now, party_id, user_id),
@@ -3983,3 +5236,4 @@ async def party_answer_invite(callback: CallbackQuery, callback_data: PartyCallb
                 pass
 
         await _safe_edit(callback, "❌ Вы отклонили приглашение.", _election_back_markup(election_id))
+

@@ -74,8 +74,10 @@ def get_main_menu_keyboard(
                 InlineKeyboardButton(text="👤 Профиль", callback_data="profile_menu"),
             ],
             [
-                InlineKeyboardButton(text="❓ Помощь", callback_data="help_menu"),
+                InlineKeyboardButton(text="💎 Донат", callback_data="donation_menu"),
+                InlineKeyboardButton(text="🎟️ Промокоды", callback_data="promo_menu"),
             ],
+            [InlineKeyboardButton(text="❓ Помощь", callback_data="help_menu")],
         ]
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -134,7 +136,7 @@ def get_organization_view_keyboard(org_id: int, is_member: bool = False, can_app
             [
                 [InlineKeyboardButton(text="👥 Управление", callback_data="manage_organization")],
                 [InlineKeyboardButton(text="💬 Панель/чат", callback_data=f"org_chat_{org_id}")],
-                [InlineKeyboardButton(text="🚪 Покинуть", callback_data="orgs_main")],
+                [InlineKeyboardButton(text="🚪 Покинуть", callback_data=f"leave_org_{org_id}")],
             ]
         )
     elif can_apply:

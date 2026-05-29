@@ -6,14 +6,12 @@ fbi_intercept.py - Система перехвата ФБР
 import logging
 import re
 from collections import Counter
-from datetime import datetime
 from aiogram import Router, F
-from aiogram.types import CallbackQuery, Message, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from database import db
-from keyboards import get_back_button
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -109,6 +107,112 @@ async def _ensure_fbi_access(callback: CallbackQuery) -> bool:
     return True
 
 
+async def _render_fbi_investigation_gate(
+    callback: CallbackQuery,
+    target_id: int,
+    *,
+    note: str = "",
+) -> None:
+    status = await db.get_security_investigation_status(
+        actor_id=callback.from_user.id,
+        target_id=int(target_id),
+        agency="fbi",
+    )
+    state_code = str(status.get("status") or "none")
+    lines = [
+        f"🔒 ДОСЬЕ НА ИГРОКА #{int(target_id)} ЗАКРЫТО",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "ФБР не видит криминальную/теневую активность без расследования.",
+    ]
+    if note:
+        lines.append("")
+        lines.append(note)
+    lines.append("")
+
+    keyboard_rows: list[list[InlineKeyboardButton]] = []
+    if state_code == "pending":
+        remaining = max(0, int(status.get("remaining_seconds") or 0))
+        hours, rem = divmod(remaining, 3600)
+        minutes = rem // 60
+        if hours > 0:
+            wait_text = f"{hours}ч {minutes:02d}м"
+        else:
+            wait_text = f"{minutes}м"
+        lines.append(f"Статус: ⏳ расследование в работе ({wait_text})")
+        lines.append(f"Откроется примерно: {str(status.get('ready_at') or '')[:16]}")
+        keyboard_rows.append([InlineKeyboardButton(text="🔄 Проверить статус", callback_data=f"fbi_invest_check_{int(target_id)}")])
+    else:
+        cost = float(status.get("cost") or 0.0)
+        lines.append(f"Статус: 🔐 требуется расследование (стоимость от ${cost:,.0f})")
+        keyboard_rows.append([InlineKeyboardButton(text="🕵️ Запустить расследование", callback_data=f"fbi_invest_start_{int(target_id)}")])
+
+    keyboard_rows.append([InlineKeyboardButton(text="🔙 К списку целей", callback_data="fbi_track_player")])
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+        parse_mode=None,
+    )
+
+
+async def _ensure_fbi_target_access(callback: CallbackQuery, target_id: int) -> bool:
+    status = await db.get_security_investigation_status(
+        actor_id=callback.from_user.id,
+        target_id=int(target_id),
+        agency="fbi",
+    )
+    if bool(status.get("access_granted")):
+        return True
+    await _render_fbi_investigation_gate(callback, int(target_id))
+    return False
+
+
+@router.callback_query(F.data.startswith("fbi_invest_start_"))
+async def fbi_start_investigation(callback: CallbackQuery, state: FSMContext):
+    if not await _ensure_fbi_access(callback):
+        return
+    await callback.answer()
+    raw = str(callback.data or "").replace("fbi_invest_start_", "")
+    if not raw.isdigit():
+        await callback.answer("❌ Некорректный ID игрока.", show_alert=True)
+        return
+    target_id = int(raw)
+    ok, msg, payload = await db.start_security_investigation(
+        actor_id=callback.from_user.id,
+        target_id=target_id,
+        agency="fbi",
+    )
+    info = payload or {}
+    if ok:
+        ready_at = str(info.get("ready_at") or "")[:16]
+        await callback.message.answer(f"✅ {msg}\nГотово примерно в: {ready_at}", parse_mode=None)
+    else:
+        if int(info.get("remaining_seconds") or 0) > 0:
+            remaining = int(info.get("remaining_seconds") or 0)
+            hours, rem = divmod(remaining, 3600)
+            minutes = rem // 60
+            wait_text = f"{hours}ч {minutes:02d}м" if hours > 0 else f"{minutes}м"
+            await callback.message.answer(f"⏳ {msg}\nОсталось: {wait_text}", parse_mode=None)
+        else:
+            await callback.message.answer(f"❌ {msg}", parse_mode=None)
+    if await _ensure_fbi_target_access(callback, target_id):
+        await _render_fbi_monitor_profile(callback, state, target_id)
+
+
+@router.callback_query(F.data.startswith("fbi_invest_check_"))
+async def fbi_check_investigation(callback: CallbackQuery, state: FSMContext):
+    if not await _ensure_fbi_access(callback):
+        return
+    await callback.answer()
+    raw = str(callback.data or "").replace("fbi_invest_check_", "")
+    if not raw.isdigit():
+        await callback.answer("❌ Некорректный ID игрока.", show_alert=True)
+        return
+    target_id = int(raw)
+    if await _ensure_fbi_target_access(callback, target_id):
+        await _render_fbi_monitor_profile(callback, state, target_id)
+
+
 # ============================================================================
 # РЕГИСТРАЦИЯ ПЕРЕХВАЧЕННЫХ СООБЩЕНИЙ
 # ============================================================================
@@ -119,17 +223,8 @@ async def intercept_message(user_id: int, username: str, message_text: str, reci
     Вызывается из middleware или других обработчиков.
     """
     try:
-        # В реальной системе это будет сохранено в БД
-        intercepted_data = {
-            'timestamp': datetime.now().isoformat(),
-            'user_id': user_id,
-            'username': username,
-            'message': message_text[:500],  # Ограничиваем до 500 символов
-            'recipient_id': recipient_id,
-        }
-        
         logger.info(f"[FBI INTERCEPT] User {user_id} ({username}): {message_text[:100]}")
-        # await db.save_intercepted_message(**intercepted_data)
+        # TODO: при необходимости включить сохранение в БД.
         
     except Exception as e:
         logger.error(f"Error intercepting message: {e}")
@@ -198,30 +293,73 @@ async def fbi_track_player(callback: CallbackQuery, state: FSMContext):
     """Выбор игрока для отслеживания"""
     if not await _ensure_fbi_access(callback):
         return
+    await _render_fbi_track_player_page(callback, state, page=0)
 
-    players = await db.get_players_page(limit=12, offset=0)
 
-    text = (
-        "🎯 **ВЫБОР ЦЕЛИ**\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Выберите игрока для детального мониторинга:\n"
+async def _render_fbi_track_player_page(callback: CallbackQuery, state: FSMContext, page: int) -> None:
+    page_size = 12
+    total = await db.count_players(exclude_user_id=callback.from_user.id)
+    max_page = (total - 1) // page_size if total > 0 else 0
+    safe_page = max(0, min(int(page or 0), max_page))
+    offset = safe_page * page_size
+
+    players = await db.get_players_page(
+        limit=page_size,
+        offset=offset,
+        exclude_user_id=callback.from_user.id,
     )
 
-    keyboard = []
-    for player in players:
-        player_id = int(player.get("user_id") or 0)
-        if player_id <= 0:
-            continue
-        display = _display_user_name(player, fallback_id=player_id)
-        if len(display) > 30:
-            display = display[:27] + "..."
-        keyboard.append([InlineKeyboardButton(text=f"👤 {display}", callback_data=f"fbi_monitor_{player_id}")])
+    text_lines = [
+        "🎯 ВЫБОР ЦЕЛИ",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        f"Игроков: {total} | Страница: {safe_page + 1}/{max_page + 1}",
+        "",
+        "Выберите игрока для детального мониторинга:",
+    ]
 
+    keyboard: list[list[InlineKeyboardButton]] = []
+    if not players:
+        text_lines.append("Игроки не найдены.")
+    else:
+        for player in players:
+            player_id = int(player.get("user_id") or 0)
+            if player_id <= 0:
+                continue
+            display = _display_user_name(player, fallback_id=player_id)
+            if len(display) > 30:
+                display = display[:27] + "..."
+            keyboard.append([InlineKeyboardButton(text=f"👤 {display}", callback_data=f"fbi_monitor_{player_id}")])
+
+    nav: list[InlineKeyboardButton] = []
+    if safe_page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"fbi_track_page_{safe_page - 1}"))
+    if safe_page < max_page:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"fbi_track_page_{safe_page + 1}"))
+    if nav:
+        keyboard.append(nav)
+
+    keyboard.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"fbi_track_page_{safe_page}")])
     keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="fbi_intercept_messages")])
-    
+
     await state.set_state(FBIStates.selecting_target)
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode=None)
+    await callback.message.edit_text(
+        "\n".join(text_lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+        parse_mode=None,
+    )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("fbi_track_page_"))
+async def fbi_track_player_page(callback: CallbackQuery, state: FSMContext):
+    if not await _ensure_fbi_access(callback):
+        return
+    raw = (callback.data or "").replace("fbi_track_page_", "", 1)
+    if not raw.lstrip("-").isdigit():
+        await callback.answer("❌ Некорректная страница.", show_alert=True)
+        return
+    await _render_fbi_track_player_page(callback, state, page=int(raw))
 
 
 @router.callback_query(F.data.startswith("fbi_monitor_"))
@@ -230,15 +368,25 @@ async def fbi_monitor_player_details(callback: CallbackQuery, state: FSMContext)
     if not await _ensure_fbi_access(callback):
         return
 
-    player_id_str = callback.data.replace("fbi_monitor_", "")
+    player_id_str = str(callback.data or "").replace("fbi_monitor_", "")
     if not player_id_str.isdigit():
         await callback.answer("❌ Некорректный ID игрока.", show_alert=True)
         return
 
-    player_id = int(player_id_str)
+    await _render_fbi_monitor_profile(callback, state, int(player_id_str))
+
+
+async def _render_fbi_monitor_profile(callback: CallbackQuery, state: FSMContext, player_id: int) -> None:
+    player_id = int(player_id or 0)
+    if player_id <= 0:
+        await callback.answer("❌ Некорректный ID игрока.", show_alert=True)
+        return
     target = await db.get_user(player_id)
     if not target:
         await callback.answer("❌ Игрок не найден.", show_alert=True)
+        return
+    has_access = await _ensure_fbi_target_access(callback, player_id)
+    if not has_access:
         return
 
     authority = await db.get_government_authority(player_id)
@@ -253,9 +401,9 @@ async def fbi_monitor_player_details(callback: CallbackQuery, state: FSMContext)
         threat = "🟡 СРЕДНИЙ"
 
     text = (
-        f"📊 **ФАЙЛ НА ИГРОКА #{player_id_str}**\n"
+        f"📊 **ФАЙЛ НА ИГРОКА #{player_id}**\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"**ID:** {player_id_str}\n"
+        f"**ID:** {player_id}\n"
         f"**Имя:** {_display_user_name(target, fallback_id=player_id)}\n"
         f"**Статус:** Активен\n"
         f"**Организация:** {target.get('organization') or 'Нет'}\n"
@@ -274,10 +422,10 @@ async def fbi_monitor_player_details(callback: CallbackQuery, state: FSMContext)
     )
     
     keyboard = [
-        [InlineKeyboardButton(text="💬 История сообщений", callback_data=f"fbi_message_history_{player_id_str}")],
-        [InlineKeyboardButton(text="🗺️ Маршрут передвижения", callback_data=f"fbi_location_history_{player_id_str}")],
-        [InlineKeyboardButton(text="👥 Контакты", callback_data=f"fbi_contacts_{player_id_str}")],
-        [InlineKeyboardButton(text="⚔️ Операция", callback_data=f"fbi_operation_{player_id_str}")],
+        [InlineKeyboardButton(text="💬 История сообщений", callback_data=f"fbi_message_history_{player_id}")],
+        [InlineKeyboardButton(text="🗺️ Маршрут передвижения", callback_data=f"fbi_location_history_{player_id}")],
+        [InlineKeyboardButton(text="👥 Контакты", callback_data=f"fbi_contacts_{player_id}")],
+        [InlineKeyboardButton(text="⚔️ Операция", callback_data=f"fbi_operation_{player_id}")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="fbi_track_player")]
     ]
     
@@ -298,6 +446,8 @@ async def fbi_message_history(callback: CallbackQuery, state: FSMContext):
     player_id = callback.data.replace("fbi_message_history_", "")
     if not player_id.isdigit():
         await callback.answer("❌ Некорректный ID игрока.", show_alert=True)
+        return
+    if not await _ensure_fbi_target_access(callback, int(player_id)):
         return
 
     feed = await db.get_player_surveillance_feed(int(player_id), limit=25)
@@ -348,6 +498,8 @@ async def fbi_search_messages(callback: CallbackQuery, state: FSMContext):
     player_id = callback.data.replace("fbi_search_messages_", "")
     if not player_id.isdigit():
         await callback.answer("❌ Некорректный ID игрока.", show_alert=True)
+        return
+    if not await _ensure_fbi_target_access(callback, int(player_id)):
         return
     feed = await db.get_player_surveillance_feed(int(player_id), limit=120)
 
@@ -434,6 +586,8 @@ async def fbi_contacts(callback: CallbackQuery, state: FSMContext):
     if not player_id.isdigit():
         await callback.answer("❌ Некорректный ID игрока.", show_alert=True)
         return
+    if not await _ensure_fbi_target_access(callback, int(player_id)):
+        return
 
     contacts = await db.get_player_contact_stats(int(player_id), limit=12)
     lines = [
@@ -474,6 +628,8 @@ async def fbi_contact_graph(callback: CallbackQuery, state: FSMContext):
     if not player_id.isdigit():
         await callback.answer("❌ Некорректный ID игрока.", show_alert=True)
         return
+    if not await _ensure_fbi_target_access(callback, int(player_id)):
+        return
     contacts = await db.get_player_contact_stats(int(player_id), limit=12)
     lines = [
         f"🔗 **ГРАФ КОНТАКТОВ #{player_id}**",
@@ -508,9 +664,9 @@ async def fbi_suspicious_contacts(callback: CallbackQuery, state: FSMContext):
     if not player_id.isdigit():
         await callback.answer("❌ Некорректный ID игрока.", show_alert=True)
         return
+    if not await _ensure_fbi_target_access(callback, int(player_id)):
+        return
     contacts = await db.get_player_contact_stats(int(player_id), limit=20)
-    suspects = await db.get_police_suspects(limit=120)
-    suspect_map = {int(s.get("user_id") or 0): s for s in suspects}
 
     lines = [
         f"⚠️ **ПОДОЗРИТЕЛЬНЫЕ КОНТАКТЫ #{player_id}**",
@@ -519,14 +675,10 @@ async def fbi_suspicious_contacts(callback: CallbackQuery, state: FSMContext):
     ]
     flagged = []
     for row in contacts:
-        uid = int(row.get("user_id") or 0)
         msg_count = int(row.get("msg_count") or 0)
         reasons = []
         if msg_count >= 20:
             reasons.append("частые контакты")
-        if uid in suspect_map:
-            risk = float(suspect_map[uid].get("risk_score") or 0)
-            reasons.append(f"риск {risk:.1f}")
         if reasons:
             flagged.append((row, reasons))
 
@@ -563,6 +715,8 @@ async def fbi_location_history(callback: CallbackQuery, state: FSMContext):
     if not player_id.isdigit():
         await callback.answer("❌ Некорректный ID игрока.", show_alert=True)
         return
+    if not await _ensure_fbi_target_access(callback, int(player_id)):
+        return
     
     text = (
         f"🗺️ **МАРШРУТ ПЕРЕДВИЖЕНИЯ #{player_id}**\n"
@@ -598,6 +752,8 @@ async def fbi_current_location(callback: CallbackQuery, state: FSMContext):
     player_id = callback.data.replace("fbi_current_location_", "")
     if not player_id.isdigit():
         await callback.answer("❌ Некорректный ID игрока.", show_alert=True)
+        return
+    if not await _ensure_fbi_target_access(callback, int(player_id)):
         return
     feed = await db.get_player_surveillance_feed(int(player_id), limit=40)
     hints = {
@@ -649,6 +805,8 @@ async def fbi_special_operation(callback: CallbackQuery, state: FSMContext):
     if not player_id.isdigit():
         await callback.answer("❌ Некорректный ID игрока.", show_alert=True)
         return
+    if not await _ensure_fbi_target_access(callback, int(player_id)):
+        return
     
     text = (
         f"⚔️ **СПЕЦИАЛЬНАЯ ОПЕРАЦИЯ**\n"
@@ -694,6 +852,8 @@ async def fbi_confirm_operation(callback: CallbackQuery, state: FSMContext):
     player_id = parts[3]
     if not player_id.isdigit():
         await callback.answer("❌ Некорректный ID игрока.", show_alert=True)
+        return
+    if not await _ensure_fbi_target_access(callback, int(player_id)):
         return
 
     ok, msg, payload = await db.execute_fbi_operation(

@@ -22,14 +22,14 @@ except ZoneInfoNotFoundError:
     UZBEKISTAN_TZ = timezone(timedelta(hours=5), name="UTC+5")
 
 # Экономические параметры (дневные ставки)
-DAILY_CITIZEN_TAX_RATE = 0.0035  # 0.35% дневного налога
+DAILY_CITIZEN_TAX_RATE = 0.004  # 0.40% дневного налога
 DAILY_MIN_CITIZEN_TAX = 3.0  # Минимум $3/день
 DAILY_PROPERTY_TAX_RATE = 0.00025  # 0.025% от стоимости имущества
 DAILY_BUSINESS_TAX_RATE = 0.001  # 0.1% дневного налога на бизнес
 DAILY_PRIVATE_ORG_TAX_RATE = 0.0015  # 0.15% дневного налога
-DAILY_LOAN_PENALTY_RATE = 0.01  # 1% штрафа за просрочку кредита
-DAILY_REPUTATION_PENALTY = 0.1  # -0.1 репутации в день за неуплаченные налоги
-BUSINESS_EQUIP_BASE_COST = 2500.0  # Базовая стоимость оборудования
+DAILY_LOAN_PENALTY_RATE = 0.007  # 0.7% штрафа за просрочку кредита
+DAILY_REPUTATION_PENALTY = 0.05  # мягче штраф по репутации за налоги
+BUSINESS_EQUIP_BASE_COST = 3800.0  # Базовая стоимость оборудования
 
 
 async def apply_daily_taxes(bot: Bot = None):
@@ -106,7 +106,7 @@ async def calculate_business_tax(business_id: int) -> float:
             WHERE id = ?
             LIMIT 1
         """
-        async with aiosqlite.connect(db.db_path) as conn:
+        async with db._connect() as conn:
             conn.row_factory = aiosqlite.Row
             async with conn.execute(query, (int(business_id),)) as cur:
                 business = await cur.fetchone()
@@ -182,7 +182,7 @@ async def process_loan_payments(user_id: int) -> dict:
         total_paid = 0.0
         total_penalty = 0.0
 
-        async with aiosqlite.connect(db.db_path) as conn:
+        async with db._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await conn.execute("BEGIN IMMEDIATE")
             async with conn.execute(
@@ -284,7 +284,7 @@ async def process_all_daily_loan_payments(cycle_date: str | None = None) -> dict
                 "defaults": 0,
             }
 
-        async with aiosqlite.connect(db.db_path) as conn:
+        async with db._connect() as conn:
             async with conn.execute(
                 """
                 SELECT DISTINCT applicant_id
@@ -372,7 +372,7 @@ async def distribute_government_salaries(org_id: int) -> dict:
         paid_total = 0.0
         paid_members = 0
 
-        async with aiosqlite.connect(db.db_path) as conn:
+        async with db._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await conn.execute("BEGIN IMMEDIATE")
             for member in members:
@@ -459,7 +459,7 @@ async def apply_business_income(business_id: int) -> dict:
             WHERE id = ?
             LIMIT 1
         """
-        async with aiosqlite.connect(db.db_path) as conn:
+        async with db._connect() as conn:
             conn.row_factory = aiosqlite.Row
             async with conn.execute(query, (int(business_id),)) as cur:
                 business = await cur.fetchone()
@@ -481,7 +481,7 @@ async def apply_business_income(business_id: int) -> dict:
         business_budget = round(float(business["budget"] or 0) + net_income, 2)
         await db.update_user(owner_id, balance=max(0.0, owner_balance))
 
-        async with aiosqlite.connect(db.db_path) as conn:
+        async with db._connect() as conn:
             await conn.execute(
                 "UPDATE businesses SET budget = ?, last_income_date = ? WHERE id = ?",
                 (business_budget, datetime.now().isoformat(), int(business_id)),
@@ -513,7 +513,7 @@ async def check_and_freeze_businesses():
         frozen_count = 0
         unfrozen_count = 0
 
-        async with aiosqlite.connect(db.db_path) as conn:
+        async with db._connect() as conn:
             await conn.execute("BEGIN IMMEDIATE")
             for business in active:
                 bid = int(business.get("id") or 0)
@@ -551,7 +551,7 @@ async def process_loan_defaults():
         now = datetime.now()
         defaults = 0
 
-        async with aiosqlite.connect(db.db_path) as conn:
+        async with db._connect() as conn:
             conn.row_factory = aiosqlite.Row
             await conn.execute("BEGIN IMMEDIATE")
             async with conn.execute(
@@ -619,7 +619,7 @@ async def update_government_budget(org_id: int = None):
         if not gov_org:
             return {"status": "no_government_org", "added": 0.0}
 
-        async with aiosqlite.connect(db.db_path) as conn:
+        async with db._connect() as conn:
             conn.row_factory = aiosqlite.Row
             async with conn.execute(
                 """
@@ -680,8 +680,94 @@ async def run_daily_economy_cycle(bot: Bot = None):
         try:
             now_uz = datetime.now(UZBEKISTAN_TZ)
             cycle_date = now_uz.date().isoformat()
+            hour_slot = now_uz.strftime("%Y-%m-%d %H")
+
+            salary_hourly = await db.process_hourly_salary_to_bank(hour_slot=hour_slot)
+            if salary_hourly.get("status") == "processed":
+                logger.info(
+                    "Hourly salary: paid_users=%s total=$%.2f org_paid=$%.2f citizen_paid=$%.2f partial_org=%s slot=%s",
+                    int(salary_hourly.get("paid_users", 0)),
+                    float(salary_hourly.get("total_paid", 0)),
+                    float(salary_hourly.get("total_org_paid", 0)),
+                    float(salary_hourly.get("total_citizen_paid", 0)),
+                    int(salary_hourly.get("partial_org_payments", 0)),
+                    salary_hourly.get("slot"),
+                )
+                if bot:
+                    salary_notify = await notify_hourly_salary_credits(
+                        bot=bot,
+                        hour_slot=str(salary_hourly.get("slot") or hour_slot),
+                        payments=list(salary_hourly.get("payments") or []),
+                    )
+                    if int(salary_notify.get("sent", 0)) > 0:
+                        logger.info(
+                            "Hourly salary notifications: sent=%s total=%s",
+                            int(salary_notify.get("sent", 0)),
+                            int(salary_notify.get("total", 0)),
+                        )
+
+            interest_hourly = await db.apply_hourly_bank_interest(hour_slot=hour_slot)
+            if interest_hourly.get("status") == "processed":
+                logger.info(
+                    "Hourly bank interest: users=%s total=$%.2f slot=%s",
+                    int(interest_hourly.get("credited_users", 0)),
+                    float(interest_hourly.get("total_interest", 0)),
+                    interest_hourly.get("slot"),
+                )
+                if bot:
+                    interest_notify = await notify_hourly_bank_interest_credits(
+                        bot=bot,
+                        hour_slot=str(interest_hourly.get("slot") or hour_slot),
+                        credits=list(interest_hourly.get("credits") or []),
+                    )
+                    if int(interest_notify.get("sent", 0)) > 0:
+                        logger.info(
+                            "Hourly bank interest notifications: sent=%s total=%s",
+                            int(interest_notify.get("sent", 0)),
+                            int(interest_notify.get("total", 0)),
+                        )
+
+            enterprise_hourly = await db.run_hourly_enterprise_income(hour_slot=hour_slot)
+            if enterprise_hourly.get("status") == "processed":
+                logger.info(
+                    "Hourly enterprise income: businesses=%s net=$%.2f owner_bonus=$%.2f private_orgs=%s net=$%.2f leader_bonus=$%.2f slot=%s",
+                    int(enterprise_hourly.get("businesses_processed", 0)),
+                    float(enterprise_hourly.get("business_total_net", 0)),
+                    float(enterprise_hourly.get("owner_dividend_total", 0)),
+                    int(enterprise_hourly.get("private_orgs_processed", 0)),
+                    float(enterprise_hourly.get("private_org_total_net", 0)),
+                    float(enterprise_hourly.get("leader_bonus_total", 0)),
+                    enterprise_hourly.get("slot"),
+                )
+                if bot:
+                    passive_notify = await notify_hourly_enterprise_credits(
+                        bot=bot,
+                        hour_slot=str(enterprise_hourly.get("slot") or hour_slot),
+                        owner_credits=list(enterprise_hourly.get("owner_credits") or []),
+                        leader_credits=list(enterprise_hourly.get("leader_credits") or []),
+                    )
+                    if int(passive_notify.get("sent", 0)) > 0:
+                        logger.info(
+                            "Hourly enterprise income notifications: sent=%s total=%s",
+                            int(passive_notify.get("sent", 0)),
+                            int(passive_notify.get("total", 0)),
+                        )
+
+            penalty_window = now_uz.hour == 20 and now_uz.minute >= 50
+
             last_cycle_date = await db.get_system_state("economy_last_cycle_date")
             if last_cycle_date == cycle_date:
+                if penalty_window:
+                    penalty_summary = await db.apply_daily_tax_nonpayment_penalty(cycle_date=cycle_date)
+                    if penalty_summary.get("status") == "applied":
+                        logger.info(
+                            "Tax nonpayment penalty applied: debtors=%s penalized=%s due=$%.2f charged=$%.2f cycle=%s",
+                            int(penalty_summary.get("processed_debtors", 0)),
+                            int(penalty_summary.get("penalized_users", 0)),
+                            float(penalty_summary.get("total_penalty_due", 0)),
+                            float(penalty_summary.get("total_balance_penalty", 0)),
+                            penalty_summary.get("cycle_date"),
+                        )
                 loan_retry_summary = await process_all_daily_loan_payments(cycle_date)
                 if loan_retry_summary.get("status") == "processed":
                     logger.info(
@@ -713,12 +799,16 @@ async def run_daily_economy_cycle(bot: Bot = None):
             business_summary = await db.generate_business_tax_reports()
             loan_summary = await process_all_daily_loan_payments(cycle_date)
             inflation_summary = await db.apply_daily_inflation()
+            education_decay = await db.apply_daily_education_decay(max_drop_per_cycle=1)
+            family_summary = await db.process_daily_family_expenses(cycle_date=cycle_date)
             stability = await calculate_government_stability()
 
             logger.info(
-                "Налоговый цикл: users=%s debtors=%s invoices=%s due=$%.2f collected=$%.2f new_debt=$%.2f stability=%.2f",
+                "Налоговый цикл: users=%s debtors=%s penalties=%s penalty_total=$%.2f invoices=%s due=$%.2f collected=$%.2f new_debt=$%.2f stability=%.2f",
                 summary.get("processed_users", 0),
                 summary.get("debtors", 0),
+                summary.get("penalized_users", 0),
+                float(summary.get("total_balance_penalty", 0)),
                 summary.get("created_invoices", 0),
                 float(summary.get("total_due_created", 0)),
                 float(summary.get("total_collected", 0)),
@@ -753,6 +843,20 @@ async def run_daily_economy_cycle(bot: Bot = None):
                     "Inflation already applied today: index=%.6f",
                     float(inflation_summary.get("inflation_index", inflation_summary.get("inflation_index_after", 1))),
                 )
+            logger.info(
+                "Education control: status=%s reminded_users=%s decreased_users=%s",
+                education_decay.get("status"),
+                int(education_decay.get("reminded_users", 0)),
+                int(education_decay.get("decreased_users", 0)),
+            )
+            logger.info(
+                "Family expenses: status=%s users=%s charged=$%.2f paid=$%.2f debt_added=$%.2f",
+                family_summary.get("status"),
+                int(family_summary.get("processed_users", 0)),
+                float(family_summary.get("total_charged", 0)),
+                float(family_summary.get("total_paid", 0)),
+                float(family_summary.get("total_debt_added", 0)),
+            )
 
             if bot:
                 notify_stats = await notify_daily_tax_invoices(bot, cycle_date)
@@ -761,6 +865,24 @@ async def run_daily_economy_cycle(bot: Bot = None):
                     int(notify_stats.get("sent", 0)),
                     int(notify_stats.get("total", 0)),
                 )
+                family_notify = await notify_daily_family_expenses(
+                    bot=bot,
+                    cycle_date=cycle_date,
+                    charges=list(family_summary.get("charges") or []),
+                )
+                if int(family_notify.get("sent", 0)) > 0:
+                    logger.info(
+                        "Family expense notifications: sent=%s total=%s",
+                        int(family_notify.get("sent", 0)),
+                        int(family_notify.get("total", 0)),
+                    )
+                education_notify = await notify_education_discipline(bot, education_decay)
+                if int(education_notify.get("sent", 0)) > 0:
+                    logger.info(
+                        "Education discipline notifications: sent=%s total=%s",
+                        int(education_notify.get("sent", 0)),
+                        int(education_notify.get("total", 0)),
+                    )
                 tax_users = await db.get_tax_service_user_ids()
                 if tax_users:
                     tax_text = (
@@ -775,11 +897,33 @@ async def run_daily_economy_cycle(bot: Bot = None):
                         f"Индекс инфляции: {float(inflation_summary.get('inflation_index_after', inflation_summary.get('inflation_index', 1))):.4f}\n"
                         f"Дата цикла: {business_summary.get('cycle_date')}"
                     )
+                    tax_summary_sent = 0
+                    tax_summary_failed = 0
                     for uid in tax_users:
                         try:
                             await bot.send_message(uid, tax_text, parse_mode=None)
+                            tax_summary_sent += 1
                         except Exception:
-                            logger.warning("Could not send tax summary to user %s", uid)
+                            tax_summary_failed += 1
+                            logger.debug("Could not send tax summary to user %s", uid)
+                    if tax_summary_failed > 0:
+                        logger.info(
+                            "Tax summary notifications: sent=%s failed=%s",
+                            tax_summary_sent,
+                            tax_summary_failed,
+                        )
+
+            if penalty_window:
+                penalty_summary = await db.apply_daily_tax_nonpayment_penalty(cycle_date=cycle_date)
+                if penalty_summary.get("status") == "applied":
+                    logger.info(
+                        "Tax nonpayment penalty applied: debtors=%s penalized=%s due=$%.2f charged=$%.2f cycle=%s",
+                        int(penalty_summary.get("processed_debtors", 0)),
+                        int(penalty_summary.get("penalized_users", 0)),
+                        float(penalty_summary.get("total_penalty_due", 0)),
+                        float(penalty_summary.get("total_balance_penalty", 0)),
+                        penalty_summary.get("cycle_date"),
+                    )
 
             await db.set_system_state("economy_last_cycle_date", cycle_date)
             logger.info("ЭКОНОМИЧЕСКИЙ ЦИКЛ ЗАВЕРШЕН")
@@ -805,8 +949,11 @@ async def run_state_money_print_processor(bot: Bot = None):
                     gov_budget,
                 )
         except Exception as e:
-            logger.error(f"Error in money print processor: {e}")
-        await asyncio.sleep(30)
+            if "database is locked" in str(e).lower():
+                logger.warning("Money print processor skipped: database is locked")
+            else:
+                logger.error(f"Error in money print processor: {e}")
+        await asyncio.sleep(90)
 
 
 async def give_daily_bonus(user_id: int, amount: float = 1000) -> bool:
@@ -870,20 +1017,21 @@ async def notify_daily_tax_invoices(bot: Bot, cycle_date: str) -> dict:
             "🧾 НАЛОГОВОЕ УВЕДОМЛЕНИЕ\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             f"📅 Дата счета: {safe_cycle}\n"
-            f"💳 К оплате сейчас: ${total_due:,.2f}\n\n"
+            f"💳 К оплате сейчас: {total_due:,.2f} люмов\n\n"
             "Состав платежа:\n"
-            f"• Налог на проживание: ${living_tax:,.2f}\n"
-            f"• Налог на работу: ${work_tax:,.2f}\n"
-            f"• Налог на недвижимость: ${property_tax:,.2f}\n"
-            f"• Налог на бизнесы: ${business_tax:,.2f}\n"
-            f"• Налог на частные организации: ${private_org_tax:,.2f}\n"
-            f"• Проценты по долгу: ${debt_interest:,.2f}\n"
-            f"• Плановый платеж: ${scheduled_payment:,.2f}\n\n"
-            "Оплатите счет кнопкой ниже, чтобы не накапливать долг."
+            f"• Налог на проживание: {living_tax:,.2f} люмов\n"
+            f"• Налог на работу: {work_tax:,.2f} люмов\n"
+            f"• Налог на недвижимость и капитал: {property_tax:,.2f} люмов\n"
+            f"• Налог на бизнесы и банды: {business_tax:,.2f} люмов\n"
+            f"• Налог на частные организации: {private_org_tax:,.2f} люмов\n"
+            f"• Проценты по долгу: {debt_interest:,.2f} люмов\n"
+            f"• Плановый платеж: {scheduled_payment:,.2f} люмов\n\n"
+            "Оплатите счет кнопкой ниже, чтобы не накапливать долг.\n"
+            "⚠️ При просрочке списывается штраф 1.5% от общего налогового долга."
         )
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text=f"✅ Оплатить сейчас ${total_due:,.2f}", callback_data=f"daily_tax_pay_{token}")],
+                [InlineKeyboardButton(text=f"✅ Оплатить сейчас {total_due:,.2f} люмов", callback_data=f"daily_tax_pay_{token}")],
             ]
         )
         try:
@@ -901,9 +1049,266 @@ async def notify_daily_tax_invoices(bot: Bot, cycle_date: str) -> dict:
             sent += 1
         except Exception:
             failed += 1
-            logger.warning("Could not send daily tax invoice to user %s", user_id)
+            logger.debug("Could not send daily tax invoice to user %s", user_id)
 
     return {"cycle_date": safe_cycle, "total": len(invoices), "sent": sent, "failed": failed}
+
+
+async def notify_hourly_salary_credits(bot: Bot, hour_slot: str, payments: list[dict]) -> dict:
+    """Разослать игрокам уведомления о почасовом зачислении зарплаты."""
+    safe_slot = str(hour_slot or "").strip()[:13] or datetime.now(UZBEKISTAN_TZ).strftime("%Y-%m-%d %H")
+    sent = 0
+    failed = 0
+    for row in payments or []:
+        user_id = int(row.get("user_id") or 0)
+        payout_total = float(row.get("payout_total") or 0)
+        if user_id <= 0 or payout_total <= 0:
+            continue
+        citizen_part = float(row.get("citizen_part") or 0)
+        citizen_job_title = str(row.get("citizen_job_title") or "").strip()
+        org_part = float(row.get("org_part") or 0)
+        org_expected = float(row.get("org_expected") or 0)
+        org_name = str(row.get("org_name") or "").strip()
+        bank_after = float(row.get("bank_after") or 0)
+        org_line = ""
+        if org_part > 0:
+            org_line = f"\n• Организация{f' ({org_name})' if org_name else ''}: {org_part:,.2f} люмов"
+            if org_expected > org_part:
+                org_line += " (частично)"
+
+        citizen_line = f"• Гражданская работа: {citizen_part:,.2f} люмов"
+        if citizen_part > 0 and citizen_job_title:
+            citizen_line += f" ({citizen_job_title})"
+
+        text = (
+            "💼 ПОЧАСОВАЯ ЗАРПЛАТА\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🕐 Час начисления: {safe_slot}:00\n"
+            f"{citizen_line}"
+            f"{org_line}\n"
+            f"✅ Итого зачислено: {payout_total:,.2f} люмов\n"
+            f"🏦 Баланс банковского счета: {bank_after:,.2f} люмов"
+        )
+        try:
+            await bot.send_message(user_id, text, parse_mode=None)
+            sent += 1
+        except Exception:
+            failed += 1
+            logger.debug("Could not send hourly salary notification to user %s", user_id)
+
+    return {"hour_slot": safe_slot, "total": len(payments or []), "sent": sent, "failed": failed}
+
+
+async def notify_hourly_bank_interest_credits(bot: Bot, hour_slot: str, credits: list[dict]) -> dict:
+    """Разослать уведомления о почасовых процентах по банковскому счету."""
+    safe_slot = str(hour_slot or "").strip()[:13] or datetime.now(UZBEKISTAN_TZ).strftime("%Y-%m-%d %H")
+    sent = 0
+    failed = 0
+    total = 0
+    for row in credits or []:
+        user_id = int(row.get("user_id") or 0)
+        amount = float(row.get("amount") or 0)
+        if user_id <= 0 or amount <= 0:
+            continue
+        total += 1
+        rate = float(row.get("rate") or 0)
+        bank_after = float(row.get("bank_after") or 0)
+        text = (
+            "🏦 ПОЧАСОВОЙ БАНКОВСКИЙ ДОХОД\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🕐 Час начисления: {safe_slot}:00\n"
+            f"• Ставка: {rate * 100:.4f}%/ч\n"
+            f"✅ Начислено: {amount:,.2f} люмов\n"
+            f"🏦 Банк после начисления: {bank_after:,.2f} люмов"
+        )
+        try:
+            await bot.send_message(user_id, text, parse_mode=None)
+            sent += 1
+        except Exception:
+            failed += 1
+            logger.debug("Could not send hourly bank interest notification to user %s", user_id)
+    return {"hour_slot": safe_slot, "total": total, "sent": sent, "failed": failed}
+
+
+async def notify_hourly_enterprise_credits(
+    bot: Bot,
+    hour_slot: str,
+    owner_credits: list[dict],
+    leader_credits: list[dict],
+) -> dict:
+    """Разослать уведомления о пассивном доходе с бизнеса и частных организаций."""
+    safe_slot = str(hour_slot or "").strip()[:13] or datetime.now(UZBEKISTAN_TZ).strftime("%Y-%m-%d %H")
+    aggregate: dict[int, dict] = {}
+
+    for row in owner_credits or []:
+        user_id = int(row.get("user_id") or 0)
+        amount = float(row.get("amount") or 0)
+        if user_id <= 0 or amount <= 0:
+            continue
+        state = aggregate.setdefault(
+            user_id,
+            {"owner_total": 0.0, "owner_count": 0, "leader_total": 0.0, "leader_count": 0},
+        )
+        state["owner_total"] = round(float(state["owner_total"]) + amount, 2)
+        state["owner_count"] = int(state["owner_count"]) + 1
+
+    for row in leader_credits or []:
+        user_id = int(row.get("user_id") or 0)
+        amount = float(row.get("amount") or 0)
+        if user_id <= 0 or amount <= 0:
+            continue
+        state = aggregate.setdefault(
+            user_id,
+            {"owner_total": 0.0, "owner_count": 0, "leader_total": 0.0, "leader_count": 0},
+        )
+        state["leader_total"] = round(float(state["leader_total"]) + amount, 2)
+        state["leader_count"] = int(state["leader_count"]) + 1
+
+    sent = 0
+    failed = 0
+    total = len(aggregate)
+    for user_id, payload in aggregate.items():
+        owner_total = round(float(payload.get("owner_total") or 0), 2)
+        leader_total = round(float(payload.get("leader_total") or 0), 2)
+        owner_count = int(payload.get("owner_count") or 0)
+        leader_count = int(payload.get("leader_count") or 0)
+        total_income = round(owner_total + leader_total, 2)
+        if total_income <= 0:
+            continue
+
+        parts = []
+        if owner_total > 0:
+            parts.append(f"• Бизнес-дивиденды ({owner_count}): {owner_total:,.2f} люмов")
+        if leader_total > 0:
+            parts.append(f"• Бонусы лидера частной орг. ({leader_count}): {leader_total:,.2f} люмов")
+        parts_text = "\n".join(parts) if parts else "• Начислений нет"
+        text = (
+            "💹 ПАССИВНЫЙ ДОХОД\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🕐 Час начисления: {safe_slot}:00\n"
+            f"{parts_text}\n"
+            f"✅ Итого начислено: {total_income:,.2f} люмов"
+        )
+        try:
+            await bot.send_message(int(user_id), text, parse_mode=None)
+            sent += 1
+        except Exception:
+            failed += 1
+            logger.debug("Could not send hourly enterprise income notification to user %s", user_id)
+    return {"hour_slot": safe_slot, "total": total, "sent": sent, "failed": failed}
+
+
+async def notify_daily_family_expenses(bot: Bot, cycle_date: str, charges: list[dict]) -> dict:
+    """Разослать игрокам уведомления о ежедневных семейных расходах."""
+    safe_cycle = str(cycle_date or "").strip() or datetime.now(UZBEKISTAN_TZ).date().isoformat()
+    sent = 0
+    failed = 0
+    total = 0
+
+    for row in charges or []:
+        user_id = int(row.get("user_id") or 0)
+        if user_id <= 0:
+            continue
+        total += 1
+        expense_total = float(row.get("expense_total") or 0)
+        base_expense = float(row.get("base_expense") or 0)
+        pet_expense = float(row.get("pet_expense") or 0)
+        paid_total = float(row.get("paid_total") or 0)
+        debt_added = float(row.get("debt_added") or 0)
+        pet_count = int(row.get("pet_count") or 0)
+        partner_id = int(row.get("partner_id") or 0)
+        relation_level = int(row.get("relationship_level") or 0)
+        relation_multiplier = float(row.get("relationship_multiplier") or 1.0)
+
+        spouse_line = (
+            f"• Семейный быт: {base_expense:,.2f} люмов (ур. {relation_level}/25, x{relation_multiplier:.2f})"
+            if partner_id > 0
+            else ""
+        )
+        pet_line = f"• Уход за питомцами ({pet_count}): {pet_expense:,.2f} люмов" if pet_count > 0 else ""
+        details = [line for line in (spouse_line, pet_line) if line]
+        details_text = "\n".join(details) if details else "• Дополнительных расходов нет"
+        debt_line = (
+            f"\n⚠️ В семейный долг добавлено: {debt_added:,.2f} люмов"
+            if debt_added > 0
+            else "\n✅ Полностью оплачено без долга."
+        )
+        text = (
+            "🏠 ЕЖЕДНЕВНЫЕ СЕМЕЙНЫЕ РАСХОДЫ\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"📅 Цикл: {safe_cycle}\n"
+            f"{details_text}\n"
+            f"💸 Начислено: {expense_total:,.2f} люмов\n"
+            f"✅ Списано сейчас: {paid_total:,.2f} люмов"
+            f"{debt_line}"
+        )
+        try:
+            await bot.send_message(user_id, text, parse_mode=None)
+            sent += 1
+        except Exception:
+            failed += 1
+            logger.debug("Could not send family expense notification to user %s", user_id)
+
+    return {"cycle_date": safe_cycle, "total": total, "sent": sent, "failed": failed}
+
+
+async def notify_education_discipline(bot: Bot, decay_result: dict) -> dict:
+    """Уведомления по ежедневной дисциплине обучения."""
+    payload = decay_result or {}
+    reminded_raw = payload.get("reminder_user_ids") or []
+    decreased_raw = payload.get("decreased_user_ids") or []
+    reminded_ids = []
+    for uid in reminded_raw:
+        try:
+            safe_uid = int(uid)
+        except Exception:
+            safe_uid = 0
+        if safe_uid > 0 and safe_uid not in reminded_ids:
+            reminded_ids.append(safe_uid)
+
+    decreased_ids = set()
+    for uid in decreased_raw:
+        try:
+            safe_uid = int(uid)
+        except Exception:
+            safe_uid = 0
+        if safe_uid > 0:
+            decreased_ids.add(safe_uid)
+
+    sent = 0
+    failed = 0
+    total = len(reminded_ids)
+    for user_id in reminded_ids:
+        dropped = user_id in decreased_ids
+        if dropped:
+            text = (
+                "🎓 КОНТРОЛЬ ОБРАЗОВАНИЯ\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "Вы пропустили обучение после вчерашнего напоминания.\n"
+                "⚠️ Уровень образования снижен на 1.\n"
+                "Зайдите в раздел «Образование» и выполните занятие сегодня, чтобы избежать следующего штрафа."
+            )
+        else:
+            text = (
+                "🎓 НАПОМИНАНИЕ ОБ ОБРАЗОВАНИИ\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "Сегодня вы еще не занимались обучением.\n"
+                "Зайдите в раздел «Образование» и пройдите тест или учебную сессию.\n"
+                "Если проигнорировать напоминание, завтра уровень образования снизится на 1."
+            )
+        try:
+            await bot.send_message(user_id, text, parse_mode=None)
+            sent += 1
+        except Exception:
+            failed += 1
+            logger.debug("Could not send education discipline notification to user %s", user_id)
+
+    return {
+        "total": total,
+        "sent": sent,
+        "failed": failed,
+        "decreased_notified": len([uid for uid in reminded_ids if uid in decreased_ids]),
+    }
 
 
 async def transfer_money(from_user_id: int, to_user_id: int, amount: float) -> bool:
@@ -929,3 +1334,4 @@ async def transfer_money(from_user_id: int, to_user_id: int, amount: float) -> b
     except Exception as e:
         logger.error(f"Error transferring money: {e}")
         return False
+
